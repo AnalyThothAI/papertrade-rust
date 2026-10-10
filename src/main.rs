@@ -14,7 +14,7 @@ use papertrade::protocol::client::Client;
 use papertrade::protocol::intents::{
     register_session_key_document, register_session_key_from_document, seal_register_session_key,
 };
-use papertrade::store::Store;
+use papertrade::store::{Store, now_ms};
 use papertrade::strategy::decide::{Mode, Side};
 use papertrade::{bot, session_keys, tui};
 use tokio::signal::unix::{Signal, SignalKind, signal};
@@ -46,6 +46,9 @@ enum Command {
     Resume,
     /// Close every position now and open nothing until resumed.
     Flatten,
+    /// Close every position, then end the running bot once nothing is open.
+    /// `resume` calls it off.
+    Stop,
     /// Register a session key by hand: the wallet signs elsewhere, this submits.
     #[command(subcommand)]
     SessionKey(SessionKeyCommand),
@@ -107,6 +110,9 @@ async fn main() -> Result<()> {
                 .init();
             let store = Store::open(&config.database()).await?;
             let _only_one = lock_data_dir(&config)?;
+            if store.drop_unfinished_stop().await? {
+                warn!("a stop asked of an earlier run was never finished; it is dropped and this run runs");
+            }
             // Listening for Ctrl-C from here, before the password is asked for: one
             // pressed at the prompt or while the bot is still starting is not lost.
             let stop = shutdown_signal(interrupts()?).shared();
@@ -119,6 +125,7 @@ async fn main() -> Result<()> {
         Command::Pause => set_mode(&config, Mode::Pause).await,
         Command::Resume => set_mode(&config, Mode::Run).await,
         Command::Flatten => set_mode(&config, Mode::Flatten).await,
+        Command::Stop => stop(&config).await,
         Command::SessionKey(SessionKeyCommand::New { side, valid_for_minutes }) => {
             require_terminal()?;
             new_session_key(&config, side, valid_for_minutes, &mut Terminal)
@@ -182,6 +189,21 @@ fn interrupts() -> Result<Signal> {
 async fn set_mode(config: &Config, mode: Mode) -> Result<()> {
     Store::open(&config.database()).await?.set_mode(mode).await?;
     println!("mode set to {}", mode.as_str());
+    Ok(())
+}
+
+/// Asks the running bot to close everything and then end. Refused when no bot
+/// is running: the request would lie in wait for the next start.
+async fn stop(config: &Config) -> Result<()> {
+    let store = Store::open(&config.database()).await?;
+    let running = store.read_status().await?.is_some_and(|status| status.is_live(now_ms()));
+    ensure!(running, "no bot is running on {}: there is nothing to stop", config.data_dir.display());
+    store.set_mode(Mode::Stop).await?;
+    println!("mode set to {}", Mode::Stop.as_str());
+    println!(
+        "The bot closes both sides and ends once nothing is open. `papertrade status` shows where it \
+         is; `papertrade resume` calls it off."
+    );
     Ok(())
 }
 

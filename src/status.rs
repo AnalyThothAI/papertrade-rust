@@ -41,7 +41,16 @@ pub struct Snapshot {
     pub transfer: Option<TransferSnapshot>,
 }
 
+/// A bot that is running rewrites its status about once a second. One this old
+/// was left by a bot that is not running any more.
+pub const STALE_MS: i64 = 5_000;
+
 impl Snapshot {
+    /// Whether the bot that wrote this is still running, as far as its status tells.
+    pub fn is_live(&self, now_ms: i64) -> bool {
+        now_ms - self.at_ms <= STALE_MS
+    }
+
     /// When the oldest open position was opened, unix milliseconds, if the accounts say.
     pub fn held_since_ms(&self) -> Option<u64> {
         let positions = self.legs.iter().filter_map(|leg| leg.account.as_ref()).flat_map(|a| &a.positions);

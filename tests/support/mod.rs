@@ -1216,6 +1216,11 @@ impl Harness {
         self.bot = Some((stop, bot));
     }
 
+    /// Whether the bot has ended, by whatever cause.
+    pub fn bot_has_ended(&self) -> bool {
+        self.bot.as_ref().is_none_or(|(_, bot)| bot.is_finished())
+    }
+
     /// Waits for the bot to end by its own doing, without asking it to stop,
     /// and returns how it ended.
     pub async fn bot_ended(&mut self) -> Result<()> {

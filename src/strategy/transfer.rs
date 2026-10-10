@@ -31,6 +31,16 @@ use crate::protocol::deployment::usd;
 /// credit may fall this much short of the amount sent.
 const CREDIT_TOLERANCE_USDC: u64 = 1;
 
+/// Whether a run the operator asked to stop goes on for this transfer's sake.
+///
+/// A transfer that is moving is seen through first: the funds are in neither
+/// account until it ends. One that is stuck waits for the operator, not the
+/// other way round. A dry run does not carry a transfer on, so it has nothing
+/// to wait for.
+pub fn holds_exit(unfinished: Option<Stage>, dry_run: bool) -> bool {
+    !dry_run && matches!(unfinished, Some(Stage::Withdraw | Stage::Send | Stage::Credit))
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Stage {
     Withdraw,
@@ -547,6 +557,19 @@ mod tests {
     const STUCK_AFTER: i64 = 600_000;
     /// Long has too much: 850 USDC go from long to short.
     const AMOUNT: u64 = 850;
+
+    #[test]
+    fn a_run_asked_to_stop_goes_on_only_for_a_transfer_that_is_moving() {
+        for moving in [Stage::Withdraw, Stage::Send, Stage::Credit] {
+            assert!(holds_exit(Some(moving), false), "{moving:?}");
+            // A dry run does not carry a transfer on: there is nothing to wait for.
+            assert!(!holds_exit(Some(moving), true), "{moving:?}");
+        }
+        // A stuck transfer waits for the operator; the operator does not wait for it.
+        assert!(!holds_exit(Some(Stage::Stuck), false));
+        assert!(!holds_exit(Some(Stage::Done), false));
+        assert!(!holds_exit(None, false));
+    }
 
     fn limits() -> Limits {
         Limits::default()

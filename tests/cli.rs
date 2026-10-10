@@ -62,6 +62,18 @@ fn watching_and_steering_need_no_key_no_password_and_no_terminal() {
         assert!(!stderr(&output).contains("assword"), "{command}: {}", stderr(&output));
     }
     assert_eq!(std::fs::read_to_string(dir.path().join("secrets")).unwrap(), "not a directory");
+
+    // `stop` is asked of a running bot. With none running it is refused, so that
+    // it cannot lie in wait and end the next start instead.
+    let output = papertrade(dir.path(), &["stop"]);
+    assert!(!output.status.success());
+    assert!(
+        stderr(&output).contains("no bot is running on ./data: there is nothing to stop"),
+        "{}",
+        stderr(&output)
+    );
+    let status = stdout(&papertrade(dir.path(), &["status"]));
+    assert!(!status.to_lowercase().contains("stop"), "{status}");
 }
 
 #[test]

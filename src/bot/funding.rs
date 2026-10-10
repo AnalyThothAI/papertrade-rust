@@ -32,7 +32,7 @@ use crate::strategy::decide::{Side, has_queued_trade, session_key_needs_registra
 use crate::strategy::inflight::{Inflight, Kind};
 use crate::strategy::rebalance::{Funds, Hold, Holding, Readiness, funds, hold, reserved, rounds_affordable};
 use crate::strategy::transfer::{
-    Limits, Observed, Reading, Stage, Step, Transfer, Withdrawal, next_step, wallet_guard,
+    Limits, Observed, Reading, Stage, Step, Transfer, Withdrawal, holds_exit, next_step, wallet_guard,
 };
 use crate::wallet::hypercore::HyperCore;
 use crate::wallet::{DepositSend, WalletSigner, Wallets};
@@ -287,6 +287,12 @@ impl Bot {
             .transfer
             .as_ref()
             .map_or(U256::ZERO, |transfer| reserved(transfer, self.legs.get(side).wallet))
+    }
+
+    /// Whether the transfer that is under way keeps a run the operator asked to
+    /// stop from ending yet.
+    pub(super) fn transfer_holds_exit(&self) -> bool {
+        holds_exit(self.funding.transfer.as_ref().map(|transfer| transfer.stage), self.dry_run)
     }
 
     /// Both wallets' own keys are here, so a transfer can be signed from either side.
