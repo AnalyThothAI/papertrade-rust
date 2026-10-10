@@ -10,6 +10,21 @@ use std::path::{Path, PathBuf};
 use alloy::primitives::Address;
 use alloy::signers::local::PrivateKeySigner;
 use anyhow::{Context, Result};
+use zeroize::Zeroizing;
+
+use crate::keystore::{self, KeyRole};
+
+/// A new random session key.
+fn generate() -> Zeroizing<[u8; 32]> {
+    Zeroizing::new(PrivateKeySigner::random().to_bytes().0)
+}
+
+/// Creates the owner's session key and stores it encrypted under `password`.
+/// Returns its address, which is what the owner registers. Creating it sends
+/// nothing: the key can sign for the owner only once the owner has registered it.
+pub fn create(keys_dir: &Path, owner: Address, password: &str) -> Result<Address> {
+    keystore::create(keys_dir, owner, KeyRole::Session, &generate(), password)
+}
 
 pub fn key_path(keys_dir: &Path, wallet: Address) -> PathBuf {
     keys_dir.join(format!("{wallet:#x}.key"))
@@ -32,7 +47,7 @@ pub fn ensure(keys_dir: &Path, wallet: Address) -> Result<PrivateKeySigner> {
         .with_context(|| format!("creating {}", keys_dir.display()))?;
     // `create_new` fails if the file exists, so an existing key is never overwritten.
     match fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(key_path(keys_dir, wallet)) {
-        Ok(mut file) => writeln!(file, "{:#x}", PrivateKeySigner::random().to_bytes())?,
+        Ok(mut file) => writeln!(file, "0x{}", alloy::primitives::hex::encode(generate()))?,
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
         Err(error) => return Err(error).context("creating the session key file"),
     }
