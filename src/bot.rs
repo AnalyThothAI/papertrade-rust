@@ -4,7 +4,7 @@ use std::future::Future;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use alloy::primitives::{Address, I256, U256};
+use alloy::primitives::{Address, U256};
 use alloy::signers::local::PrivateKeySigner;
 use anyhow::{Context, Result, bail};
 use serde_json::json;
@@ -14,6 +14,7 @@ use tokio::time::{MissedTickBehavior, interval};
 use tracing::{error, info, warn};
 
 use crate::config::Config;
+use crate::economics;
 use crate::market::{Quote, follow_price, format_price, price_decimals};
 use crate::protocol::account::AccountState;
 use crate::protocol::chain::Chain;
@@ -768,12 +769,11 @@ async fn follow_ledger(
 async fn sync_ledger(client: &Client, store: &Store, side: Side, wallet: Address) -> Result<()> {
     let trades = client.trades(wallet).await?;
     for trade in store.record_trades(wallet, side, &trades).await? {
-        let net = trade.adjusted_pnl_raw.0 - I256::try_from(trade.user_paid_fee_raw.0).unwrap_or_default();
         let summary = format!(
             "{side} position {} {}: net {} USD, {} PAPER",
             trade.position_id.0,
-            if trade.kind == "Liquidated" { "liquidated" } else { "closed" },
-            format_signed_amount(net),
+            if trade.is_liquidation() { "liquidated" } else { "closed" },
+            format_signed_amount(economics::net_result(&trade)),
             format_amount(trade.paper_minted_raw.0),
         );
         info!("{summary}");

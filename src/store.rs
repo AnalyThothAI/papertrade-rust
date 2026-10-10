@@ -527,6 +527,43 @@ mod tests {
         assert!((totals.cost_per_paper().unwrap() - 14.0 / 9_800.0).abs() < 1e-12);
     }
 
+    /// A liquidation as the trade history might report it: the PnL at the price
+    /// it fired at and a fee, neither of which is what the trader lost.
+    fn liquidation(position_id: u64) -> Trade {
+        let mut liquidated = trade(position_id, -480, 50_000);
+        liquidated.kind = "Liquidated".into();
+        liquidated.user_paid_fee_raw = Dec(usd(10));
+        liquidated
+    }
+
+    #[tokio::test]
+    async fn a_liquidation_is_booked_at_minus_its_whole_margin() {
+        let store = Store::in_memory().await.unwrap();
+        let (liquidated, closed) = (liquidation(1), trade(2, -100, 9_800));
+        store.record_trades(WALLET, Side::Long, &[liquidated.clone(), closed.clone()]).await.unwrap();
+        let totals = store.totals().await.unwrap();
+        assert!((totals.net_pnl_usd - -600.0).abs() < 1e-9, "{totals:?}");
+        // The view books each trade exactly as the bot's own rule does.
+        let by_rule = crate::economics::net_result(&liquidated) + crate::economics::net_result(&closed);
+        assert_eq!(crate::status::format_signed_amount(by_rule), "-600.00");
+    }
+
+    #[tokio::test]
+    async fn a_ledger_from_before_the_liquidation_rule_keeps_its_rows_and_is_rebooked() {
+        // A database as the first version left it: only the first migration applied.
+        let pool = SqlitePoolOptions::new().max_connections(1).connect("sqlite::memory:").await.unwrap();
+        sqlx::migrate!().run_to(1, &pool).await.unwrap();
+        let old = Store { pool: pool.clone() };
+        old.record_trades(WALLET, Side::Short, &[liquidation(1)]).await.unwrap();
+        assert!((old.totals().await.unwrap().net_pnl_usd - -490.0).abs() < 1e-9);
+
+        let upgraded = Store::connect(pool).await.unwrap();
+        let totals = upgraded.totals().await.unwrap();
+        assert_eq!(totals.trades, 1);
+        assert!((totals.net_pnl_usd - -500.0).abs() < 1e-9, "{totals:?}");
+        assert!((totals.paper_minted - 50_000.0).abs() < 1e-9, "{totals:?}");
+    }
+
     #[tokio::test]
     async fn the_win_fee_comes_off_the_winners_net_result() {
         let store = Store::in_memory().await.unwrap();

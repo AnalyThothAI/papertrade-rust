@@ -208,6 +208,26 @@ async fn a_liquidated_leg_gets_the_survivor_closed() {
     h.sim.liquidate(h.long);
     h.flat().await;
     assert_eq!((h.sim.count(h.long, "closePositions"), h.sim.count(h.short, "closePositions")), (0, 1));
+
+    // The liquidated long is booked at minus its whole margin, although its record
+    // carries the PnL at the price it was liquidated at (here none: the mid never
+    // moved). The short was closed where it was opened.
+    let booked = " liquidated: net -500.00 USD, 50000.00 PAPER";
+    eventually_stored("the liquidation is on the timeline", SOON, || async {
+        let timeline = h.store.recent_events(50).await.unwrap();
+        timeline.iter().any(|event| {
+            event.kind == "trade"
+                && event.summary.starts_with("long position ")
+                && event.summary.ends_with(booked)
+        })
+    })
+    .await;
+    eventually_stored("both settled positions are in the ledger", SOON, || async {
+        h.store.totals().await.unwrap().trades == 2
+    })
+    .await;
+    let totals = h.store.totals().await.unwrap();
+    assert!((totals.net_pnl_usd - -500.0).abs() < 1e-6, "{totals:?}");
 }
 
 #[tokio::test(flavor = "multi_thread")]

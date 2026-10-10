@@ -311,16 +311,18 @@ fn settle(wallet: Address, position: &Position, mid: u64, kind: &str) -> (U256, 
     let raw = notional * U256::from(mid.abs_diff(position.entry)) / U256::from(position.entry);
     let wins = (mid > position.entry) == position.is_long && mid != position.entry;
     let liquidated = kind == "Liquidated";
+    let loss = if wins { U256::ZERO } else { raw.min(position.margin) };
+    let lost = if loss.is_zero() { "0".to_owned() } else { format!("-{loss}") };
     let (credit, adjusted, fee, paper) = if liquidated {
-        (U256::ZERO, format!("-{}", position.margin), U256::ZERO, position.margin * U256::from(100))
+        // The whole margin is gone and all of it mints, but the record carries only
+        // the PnL at the price the liquidation fired at.
+        (U256::ZERO, lost, U256::ZERO, position.margin * U256::from(100))
     } else if wins {
         let adjusted = raw * U256::from(88) / U256::from(100);
         let fee = adjusted * U256::from(2) / U256::from(100);
         (position.margin + adjusted - fee, adjusted.to_string(), fee, U256::ZERO)
     } else {
-        let loss = raw.min(position.margin);
-        let adjusted = if loss.is_zero() { "0".to_owned() } else { format!("-{loss}") };
-        (position.margin - loss, adjusted, U256::ZERO, loss * U256::from(98))
+        (position.margin - loss, lost, U256::ZERO, loss * U256::from(98))
     };
     let trade = json!({
         "timestampMs": unix_millis(),
