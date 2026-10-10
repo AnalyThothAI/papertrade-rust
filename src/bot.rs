@@ -163,21 +163,62 @@ struct Bot {
     open_position_count: usize,
 }
 
-/// Runs the strategy against production until `shutdown` resolves.
-pub async fn run(config: &Config, store: Store, shutdown: impl Future<Output = ()>) -> Result<()> {
+/// A bot that has started: its feeds are running and its state is loaded.
+pub struct Running {
+    bot: Bot,
+    tasks: JoinSet<()>,
+}
+
+/// Starts the bot against production. Fails if it cannot start: a missing
+/// session key, an unlisted market, an unreachable relayer.
+pub async fn start(config: &Config, store: Store) -> Result<Running> {
     let coin = config.coin.clone();
     let price = move |price_decimals: u32, tasks: &mut JoinSet<()>| {
         let (sender, quote) = watch::channel(None);
         tasks.spawn(follow_price(coin, price_decimals, sender));
         quote
     };
-    run_with(config, store, Client::new()?, price, Timing::default(), shutdown).await
+    start_with(config, store, Client::new()?, price, Timing::default()).await
 }
 
-/// Runs the strategy against any relayer and price source. The current tick always finishes.
+/// Keeps a bot running until `stop` resolves.
 ///
-/// `price` is given the market's price decimals and returns the quote to follow;
-/// it may spawn its feed onto the task set so the feed is supervised with the rest.
+/// The first start has to succeed, so a wrong setting or a missing session key
+/// is reported at once instead of being retried forever. After that, whenever
+/// the bot cannot go on (a feed died, the relayer became unreachable) it is
+/// started again after `restart_delay`. The bot takes over from the account
+/// state and its journal on every start, so starting again is always safe; and
+/// doing it in the same process means a terminal that stays open is all it needs.
+pub async fn keep_running<S, Starting>(
+    mut start: S,
+    restart_delay: Duration,
+    stop: impl Future<Output = ()> + Clone,
+) -> Result<()>
+where
+    S: FnMut() -> Starting,
+    Starting: Future<Output = Result<Running>>,
+{
+    let mut running = start().await?;
+    loop {
+        match running.until(stop.clone()).await {
+            Ok(()) => return Ok(()),
+            Err(error) => error!("the bot stopped: {error:#}"),
+        }
+        running = loop {
+            info!("starting again in {restart_delay:?}");
+            tokio::select! {
+                () = stop.clone() => return Ok(()),
+                () = tokio::time::sleep(restart_delay) => {}
+            }
+            match start().await {
+                Ok(running) => break running,
+                Err(error) => error!("the bot could not start: {error:#}"),
+            }
+        };
+    }
+}
+
+/// Starts the bot and runs it until `shutdown` resolves or it cannot go on.
 pub async fn run_with(
     config: &Config,
     store: Store,
@@ -186,6 +227,20 @@ pub async fn run_with(
     timing: Timing,
     shutdown: impl Future<Output = ()>,
 ) -> Result<()> {
+    start_with(config, store, client, price, timing).await?.until(shutdown).await
+}
+
+/// Starts the bot against any relayer and price source.
+///
+/// `price` is given the market's price decimals and returns the quote to follow;
+/// it may spawn its feed onto the task set so the feed is supervised with the rest.
+pub async fn start_with(
+    config: &Config,
+    store: Store,
+    client: Client,
+    price: impl FnOnce(u32, &mut JoinSet<()>) -> watch::Receiver<Option<Quote>>,
+    timing: Timing,
+) -> Result<Running> {
     let trading_state = client.trading_state().await.context("fetching the trading state")?;
     let instrument = trading_state
         .instrument(&config.coin)
@@ -241,7 +296,7 @@ pub async fn run_with(
     tasks.spawn(follow_status(store.clone(), latest_status));
 
     let ttl_ms = i64::try_from(config.intent_ttl_seconds * 1000)?;
-    let mut bot = Bot {
+    let bot = Bot {
         dry_run: config.dry_run,
         coin: config.coin.clone(),
         params: config.strategy(),
@@ -277,22 +332,31 @@ pub async fn run_with(
         "bot started"
     );
 
-    let mut ticks = interval(timing.tick);
-    ticks.set_missed_tick_behavior(MissedTickBehavior::Delay);
-    tokio::pin!(shutdown);
-    loop {
-        tokio::select! {
-            () = &mut shutdown => break,
-            // Without its feeds the bot would wait forever on stale data. Better to
-            // stop loudly and let the supervisor start a healthy process.
-            Some(ended) = tasks.join_next() => bail!("a background task stopped: {ended:?}"),
-            _ = ticks.tick() => bot.tick().await,
+    Ok(Running { bot, tasks })
+}
+
+impl Running {
+    /// Runs until `shutdown` resolves (`Ok`) or the bot cannot go on (`Err`).
+    /// The tick in progress always finishes.
+    pub async fn until(self, shutdown: impl Future<Output = ()>) -> Result<()> {
+        let Running { mut bot, mut tasks } = self;
+        let mut ticks = interval(bot.timing.tick);
+        ticks.set_missed_tick_behavior(MissedTickBehavior::Delay);
+        tokio::pin!(shutdown);
+        loop {
+            tokio::select! {
+                () = &mut shutdown => break,
+                // Without its feeds the bot would wait forever on stale data. Better to
+                // stop loudly: the caller starts a fresh run.
+                Some(ended) = tasks.join_next() => bail!("a background task stopped: {ended:?}"),
+                _ = ticks.tick() => bot.tick().await,
+            }
         }
+        if bot.open_position_count > 0 {
+            warn!("stopping with open positions; nothing is watching them now");
+        }
+        Ok(())
     }
-    if bot.open_position_count > 0 {
-        warn!("stopping with open positions; nothing is watching them now");
-    }
-    Ok(())
 }
 
 impl Bot {

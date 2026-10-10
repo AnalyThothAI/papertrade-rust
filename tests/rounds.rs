@@ -328,3 +328,25 @@ async fn the_bot_stops_when_one_of_its_feeds_dies() {
     let error = ended.unwrap_err().to_string();
     assert!(error.contains("a background task stopped"), "{error}");
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_bot_whose_feed_dies_starts_itself_again_and_carries_on() {
+    let mut h = Harness::prepare().await;
+    // The first two runs lose their price feed straight away.
+    h.start_self_healing_bot(2);
+    h.hedged().await;
+    h.sim.set_mid(ENTRY + TARGET);
+    h.flat().await;
+    assert_eq!((h.opens(), h.closes()), (2, 2));
+    // Stopping it is a clean exit, not another restart.
+    h.stop_bot().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_bot_that_cannot_start_the_first_time_says_so_instead_of_retrying() {
+    let mut h = Harness::prepare().await;
+    h.forget_session_keys();
+    h.start_self_healing_bot(0);
+    let error = h.stop_bot().await.unwrap_err().to_string();
+    assert!(error.contains("no session key"), "{error}");
+}
