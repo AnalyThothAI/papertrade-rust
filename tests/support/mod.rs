@@ -27,6 +27,7 @@ use futures::stream::{self, Stream};
 use papertrade::bot::{self, Timing};
 use papertrade::config::Config;
 use papertrade::market::Quote;
+use papertrade::protocol::chain::Chain;
 use papertrade::protocol::client::Client;
 use papertrade::protocol::deployment::usd;
 use papertrade::protocol::intents::{Close, OpenPosition, exchange_domain};
@@ -463,6 +464,30 @@ async fn trades(State(world): State<Shared>, Path(wallet): Path<Address>) -> Jso
     Json(json!({ "items": items, "nextCursor": null }))
 }
 
+/// What a contract call returns, or `None` to revert. Add an arm per call the bot makes.
+fn eth_call(_world: &World, _to: Address, _data: &[u8]) -> Option<Vec<u8>> {
+    None
+}
+
+/// HyperEVM JSON-RPC, as far as the bot uses it: `eth_call` only.
+async fn rpc(State(world): State<Shared>, Json(request): Json<Value>) -> Json<Value> {
+    let call = &request["params"][0];
+    let to = call["to"].as_str().and_then(|to| to.parse::<Address>().ok());
+    let data = call["data"].as_str().and_then(|data| data.parse::<alloy::primitives::Bytes>().ok());
+    let returned = match (request["method"].as_str(), to, data) {
+        (Some("eth_call"), Some(to), Some(data)) => eth_call(&world.lock().unwrap(), to, &data),
+        _ => None,
+    };
+    Json(match returned {
+        Some(bytes) => {
+            json!({ "jsonrpc": "2.0", "id": request["id"], "result": alloy::primitives::Bytes::from(bytes) })
+        }
+        None => {
+            json!({ "jsonrpc": "2.0", "id": request["id"], "error": { "code": 3, "message": "execution reverted" } })
+        }
+    })
+}
+
 async fn live(State(world): State<Shared>, Query(query): Query<HashMap<String, String>>) -> Response {
     let Some(wallet) = query.get("wallet").and_then(|wallet| wallet.parse::<Address>().ok()) else {
         return StatusCode::BAD_REQUEST.into_response();
@@ -516,6 +541,7 @@ impl Sim {
             .route("/state/user/live", get(live))
             .route("/query/protocol/queue-summary", get(queue_summary))
             .route("/query/accounts/{wallet}/trades", get(trades))
+            .route("/rpc", post(rpc))
             .with_state(world.clone());
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
@@ -551,6 +577,11 @@ impl Sim {
             frames: broadcast::channel(256).0,
         };
         self.world().accounts.insert(wallet, account);
+    }
+
+    /// A chain reader pointed at the simulator's JSON-RPC.
+    pub fn chain(&self) -> Chain {
+        Chain::with_rpc(&format!("{}/rpc", self.url)).unwrap()
     }
 
     pub fn quote(&self) -> watch::Receiver<Option<Quote>> {
@@ -769,11 +800,12 @@ impl Harness {
         let (stop, stopped) = oneshot::channel::<()>();
         let (config, store, quote) = (self.config.clone(), self.store.clone(), self.sim.quote());
         let client = Client::with_origin(&self.sim.url).unwrap();
+        let chain = self.sim.chain();
         let bot = tokio::spawn(async move {
             let shutdown = async {
                 let _ = stopped.await;
             };
-            bot::run_with(&config, store, client, move |_, _| quote, fast(), shutdown).await
+            bot::run_with(&config, store, client, chain, move |_, _| quote, fast(), shutdown).await
         });
         self.bot = Some((stop, bot));
     }
@@ -785,7 +817,16 @@ impl Harness {
             tasks.spawn(async {});
             watch::channel(None).1
         };
-        bot::run_with(&self.config, self.store.clone(), client, price, fast(), std::future::pending()).await
+        bot::run_with(
+            &self.config,
+            self.store.clone(),
+            client,
+            self.sim.chain(),
+            price,
+            fast(),
+            std::future::pending(),
+        )
+        .await
     }
 
     /// Removes the session key files, as on a machine that was never set up.
@@ -806,7 +847,7 @@ impl Harness {
             let start = || {
                 starts += 1;
                 let dead = starts <= dead_feeds;
-                let (config, store, quote) = (config.clone(), store.clone(), sim.quote());
+                let (config, store, quote, chain) = (config.clone(), store.clone(), sim.quote(), sim.chain());
                 let client = Client::with_origin(&sim.url).unwrap();
                 async move {
                     let price = move |_, tasks: &mut tokio::task::JoinSet<()>| {
@@ -815,7 +856,7 @@ impl Harness {
                         }
                         quote
                     };
-                    bot::start_with(&config, store, client, price, fast()).await
+                    bot::start_with(&config, store, client, chain, price, fast()).await
                 }
             };
             bot::keep_running(start, Duration::from_millis(100), stop).await

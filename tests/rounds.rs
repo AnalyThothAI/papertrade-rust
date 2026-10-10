@@ -350,3 +350,11 @@ async fn a_bot_that_cannot_start_the_first_time_says_so_instead_of_retrying() {
     let error = h.stop_bot().await.unwrap_err().to_string();
     assert!(error.contains("no session key"), "{error}");
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_contract_call_that_reverts_is_an_error() {
+    let h = Harness::prepare().await;
+    let reply =
+        h.sim.chain().call(h.long, alloy::primitives::Bytes::from_static(&[0x12, 0x34, 0x56, 0x78])).await;
+    assert!(reply.unwrap_err().to_string().contains("execution reverted"));
+}

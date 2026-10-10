@@ -16,6 +16,7 @@ use tracing::{error, info, warn};
 use crate::config::Config;
 use crate::market::{Quote, follow_price, format_price, price_decimals};
 use crate::protocol::account::AccountState;
+use crate::protocol::chain::Chain;
 use crate::protocol::client::{Client, SubmitError};
 use crate::protocol::intents::{
     Close, NonceSequence, OpenPosition, SignedIntent, sign_close, sign_open_position,
@@ -178,7 +179,7 @@ pub async fn start(config: &Config, store: Store) -> Result<Running> {
         tasks.spawn(follow_price(coin, price_decimals, sender));
         quote
     };
-    start_with(config, store, Client::new()?, price, Timing::default()).await
+    start_with(config, store, Client::new()?, Chain::new()?, price, Timing::default()).await
 }
 
 /// Keeps a bot running until `stop` resolves.
@@ -223,11 +224,12 @@ pub async fn run_with(
     config: &Config,
     store: Store,
     client: Client,
+    chain: Chain,
     price: impl FnOnce(u32, &mut JoinSet<()>) -> watch::Receiver<Option<Quote>>,
     timing: Timing,
     shutdown: impl Future<Output = ()>,
 ) -> Result<()> {
-    start_with(config, store, client, price, timing).await?.until(shutdown).await
+    start_with(config, store, client, chain, price, timing).await?.until(shutdown).await
 }
 
 /// Starts the bot against any relayer and price source.
@@ -238,6 +240,9 @@ pub async fn start_with(
     config: &Config,
     store: Store,
     client: Client,
+    // Read-only contract calls. Nothing uses it yet: the estimate reads fee
+    // rates through it and rebalancing reads deposit addresses.
+    _chain: Chain,
     price: impl FnOnce(u32, &mut JoinSet<()>) -> watch::Receiver<Option<Quote>>,
     timing: Timing,
 ) -> Result<Running> {
