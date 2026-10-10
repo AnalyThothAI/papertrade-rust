@@ -1,4 +1,3 @@
-use std::fmt::Write as _;
 use std::fs;
 use std::io::{IsTerminal, Write as _};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -14,7 +13,7 @@ use papertrade::protocol::intents::{
     NonceSequence, RegisterSessionKey, register_session_key_document, register_session_key_from_document,
     seal_register_session_key,
 };
-use papertrade::store::{Store, now_ms};
+use papertrade::store::Store;
 use papertrade::strategy::decide::{Mode, Side};
 use papertrade::{bot, session_keys, tui};
 
@@ -129,114 +128,9 @@ async fn set_mode(config: &Config, mode: Mode) -> Result<()> {
 
 /// Prints the bot's latest status. A closed pipe (`status | head`) is not an error.
 async fn status(store: &Store) -> Result<()> {
-    let report = status_report(store).await?;
+    let report = tui::report(store).await?;
     let _ = std::io::stdout().write_all(report.as_bytes());
     Ok(())
-}
-
-async fn status_report(store: &Store) -> Result<String> {
-    let mut out = String::new();
-    let Some(status) = store.read_status().await? else {
-        return Ok("No status yet. Start the bot with `papertrade run`.\n".to_owned());
-    };
-    let age_ms = now_ms() - status.at_ms;
-    let _ = writeln!(
-        out,
-        "mode              {}{}",
-        store.mode().await?.as_str(),
-        if status.dry_run { " (dry run)" } else { "" }
-    );
-    let _ = writeln!(
-        out,
-        "bot               {}",
-        if age_ms > 5_000 {
-            format!("NOT RUNNING, last seen {} ago", tui::age(age_ms))
-        } else {
-            "live".into()
-        }
-    );
-    let _ = writeln!(out, "legs              {}", status.phase);
-    let _ = writeln!(out, "decision          {}: {}", status.decision, status.summary);
-    let _ =
-        writeln!(out, "{} mid           {}", status.coin, status.mid.as_deref().unwrap_or("no fresh quote"));
-    if let Some(bps) = status.move_bps {
-        let _ = writeln!(out, "move              {bps:+.1} bps of ±{} target", status.close_bps);
-    }
-    match &status.trading {
-        Some(trading) => {
-            let _ = writeln!(out, "trading paused    {}", trading.trading_paused);
-            let _ = writeln!(
-                out,
-                "relayer refuses   {}",
-                if trading.paused_actions.is_empty() {
-                    "nothing".into()
-                } else {
-                    trading.paused_actions.join(", ")
-                }
-            );
-        }
-        None => {
-            let _ = writeln!(out, "trading state     unavailable");
-        }
-    }
-    let _ = writeln!(
-        out,
-        "payout queue      {}",
-        status.queue_total_usd.as_ref().map_or("unknown".into(), |usd| format!("{usd} USD"))
-    );
-    for leg in &status.legs {
-        let _ = writeln!(out, "\n{} account     {}", leg.side, leg.wallet);
-        match &leg.account {
-            None => {
-                let _ = writeln!(out, "  state           unavailable");
-            }
-            Some(account) => {
-                let _ = writeln!(out, "  available       {} USD", account.available_usd);
-                let _ = writeln!(out, "  queued payout   {} USD", account.queued_usd);
-                let _ = writeln!(
-                    out,
-                    "  session key     {} ({})",
-                    leg.session_key,
-                    match account.session_key_expiry {
-                        Some(expiry) => format!(
-                            "valid for {}",
-                            tui::age(i64::try_from(expiry)?.saturating_mul(1000) - now_ms())
-                        ),
-                        None => "not registered".into(),
-                    }
-                );
-                for position in &account.positions {
-                    let _ = writeln!(
-                        out,
-                        "  position {}: {} {} USD × {} @ {}, bust {}",
-                        position.id,
-                        if position.is_long { "long" } else { "short" },
-                        position.margin_usd,
-                        position.leverage,
-                        position.entry,
-                        position.bust,
-                    );
-                }
-            }
-        }
-        if leg.pending_intents > 0 {
-            let _ = writeln!(out, "  in flight       {} intent(s)", leg.pending_intents);
-        }
-    }
-    let totals = store.totals().await?;
-    let _ = writeln!(
-        out,
-        "\nledger            {} settled, net {:+.2} USD, {:.0} PAPER, cost {}",
-        totals.trades,
-        totals.net_pnl_usd,
-        totals.paper_minted,
-        totals.cost_per_paper().map_or("n/a".into(), |cost| format!("{cost:.5} USD/PAPER")),
-    );
-    let _ = writeln!(out, "\nrecent events (UTC)");
-    for event in store.recent_events(10).await? {
-        let _ = writeln!(out, "  {} {:8} {}", tui::clock(event.at_ms), event.kind, event.summary);
-    }
-    Ok(out)
 }
 
 fn registration_path(config: &Config, wallet: Address) -> std::path::PathBuf {

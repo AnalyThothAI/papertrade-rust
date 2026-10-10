@@ -60,8 +60,8 @@ session key 文件格式与 TypeScript 版相同，两个仓库可以共用同�
 | 命令 | 作用 |
 |---|---|
 | `run` | 运行机器人；交易未开放时只会等待，开放后自动开始 |
-| `tui` | 终端面板：当前决策、行情与偏离、两个账户、台账、时间线；`p` 暂停/恢复，`q` 退出 |
-| `status` | 打印一次当前状态（机器人没在运行时显示最后一次状态和时间） |
+| `tui` | 终端面板，见[面板](#面板)；`p` 暂停/恢复，`q` 退出 |
+| `status` | 把面板的内容以纯文本打印一次（机器人没在运行时显示最后一次状态和时间） |
 | `pause` | 不再开新一轮；已开的一轮照常持有到目标 |
 | `resume` | 恢复开仓 |
 | `flatten` | 立刻平掉两个账户的所有仓位，之后不开仓，直到 `resume` |
@@ -150,6 +150,22 @@ uvx datasette data/papertrade.db      # http://127.0.0.1:8001，表 events / int
 - **没有计入的情况**：LP 现金不够时亏损费会被免除（铸造基数变成全额亏损）；一笔铸造跨过 `cliff` 时前后两段铸造率不同；`tail` 区公式在合约里的取整顺序未核对。
 - **一处文档没说清的地方**：`tailProgress` 只增不减。LP 被质押者提走、`trackedLp` 回落到 `cliff` 以下之后，铸造率是回到 `rate` 还是保持衰减后的值，文档两种说法都有。这里按"`trackedLp < cliff` 就是 `rate`"处理；目前 `trackedLp` 和 `tailProgress` 都是 0，两种读法结果相同。
 - **估值与链上结算是否逐位一致**，要等第一笔真实平仓来对比。铸造率和铸造基数来自官方文档，不是合约代码。
+
+## 面板
+
+`papertrade tui` 和 `papertrade status` 显示同样的内容，读的都是数据库里的状态快照、台账和时间线。110 列 × 40 行能完整显示。
+
+| 区域 | 内容 |
+|---|---|
+| 顶栏 | 模式（`RUN` / `PAUSE` / `FLATTEN`）、是否 dry-run、机器人是否在线（快照超过 5 秒没更新即视为没在运行）、两腿状态、当前决定及原因 |
+| Market | 中间价、开仓价（两腿均价）、这一轮已持有多久、偏离与进度条、两侧的平仓触发价、两条腿的强平价、派彩队列、交易是否暂停、中继拒收哪些动作 |
+| Estimate | 当前铸造率、三项费率、"到目标时"与"现在平仓"两组数字，见[预估](#预估) |
+| LONG / SHORT | 可用余额、排队款、session key 剩余时间、是否有钱包私钥、在途意图数、仓位 |
+| Funds | 两户合计与差额、按当前余额还能开几轮、资金结论、转账是自动还是人工；有转账时显示方向、金额、阶段、已用时间和说明（卡住时是原因） |
+| Ledger | 已结算笔数、净盈亏、已得 PAPER、实际每枚成本 |
+| Timeline | 决定变化、每个意图的提交结果、每笔结算、模式变更，新的在上 |
+
+不知道的值显示为 `—`、`unknown` 或一句说明（例如 `no fresh quote`、`account state unavailable`、`no estimate: an input is missing`），不会显示成 0。平仓触发价与 [`decide`](src/strategy/decide.rs) 用的是同一条规则：中间价到达或越过它就平仓。
 
 ## 异常场景
 
@@ -240,7 +256,7 @@ cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test
 | `src/store.rs`、`migrations/` | SQLite 存储与表结构 |
 | `src/status.rs` | 写入数据库的状态快照 |
 | `src/bot.rs` | 运行循环 |
-| `src/tui.rs` | 终端面板 |
+| `src/tui.rs` | 终端面板，以及 `status` 的纯文本输出 |
 | `tests/fixtures/` | 生产环境抓取的真实响应、TypeScript 版生成的签名金标准、官方估值函数的对照表 |
 | `tests/support/` | 模拟交易所：同样的接口，会校验签名、排队、执行，并能按脚本制造拒绝、无应答、延迟、强平、断流 |
 | `tests/rounds.rs` | 真实机器人对模拟交易所的端到端场景 |
