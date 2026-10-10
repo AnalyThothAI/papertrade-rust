@@ -14,6 +14,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use alloy::primitives::{Address, B256, Signature, U256, keccak256};
+use alloy::signers::local::PrivateKeySigner;
 use alloy::sol_types::SolStruct;
 use anyhow::Result;
 use axum::extract::{Path, Query, State};
@@ -26,13 +27,13 @@ use clap::Parser;
 use futures::stream::{self, Stream};
 use papertrade::bot::{self, Timing};
 use papertrade::config::Config;
+use papertrade::keystore::{AccountKeys, UnlockedKeys, WalletKey};
 use papertrade::market::Quote;
 use papertrade::protocol::chain::Chain;
 use papertrade::protocol::client::Client;
 use papertrade::protocol::deployment::{EXCHANGE, usd};
 use papertrade::protocol::intents::{Close, OpenPosition, exchange_domain};
 use papertrade::protocol::stream::StreamTiming;
-use papertrade::session_keys;
 use papertrade::store::Store;
 use serde_json::{Value, json};
 use tempfile::TempDir;
@@ -642,6 +643,15 @@ impl Sim {
         self.world().held = false;
     }
 
+    /// Makes `key` the wallet's one registered session key, or with `None`
+    /// leaves the wallet with none, and tells whoever follows the account.
+    pub fn set_session_key(&self, wallet: Address, key: Option<Address>) {
+        let mut world = self.world();
+        let account = world.accounts.get_mut(&wallet).unwrap();
+        account.session_keys = key.into_iter().map(|key| (key, unix_seconds() + 30 * 86_400)).collect();
+        account.publish(json!({}));
+    }
+
     /// Makes the wallet's new positions show up this long after their open left the queue.
     pub fn set_position_lag(&self, wallet: Address, lag: Duration) {
         self.world().accounts.get_mut(&wallet).unwrap().position_lag = lag;
@@ -774,13 +784,23 @@ pub fn fast() -> Timing {
     }
 }
 
+/// Keys as a run holds them once they are unlocked, made here in memory: new
+/// session keys, no wallet keys, no file and no password anywhere.
+pub fn session_keys(long: Address, short: Address) -> UnlockedKeys {
+    let account =
+        |owner| AccountKeys { owner, session: PrivateKeySigner::random(), wallet: WalletKey::Disabled };
+    UnlockedKeys { long: account(long), short: account(short) }
+}
+
 /// The simulator, two funded accounts with registered session keys, and the bot.
 pub struct Harness {
     pub sim: Sim,
     pub long: Address,
     pub short: Address,
     pub store: Store,
-    config: Config,
+    /// What the bot is started with; a scenario may change either before it starts the bot.
+    pub config: Config,
+    pub keys: Arc<UnlockedKeys>,
     dir: TempDir,
     bot: Option<(oneshot::Sender<()>, JoinHandle<Result<()>>)>,
 }
@@ -799,10 +819,9 @@ impl Harness {
         let dir = tempfile::tempdir().unwrap();
         let long = Address::with_last_byte(1);
         let short = Address::with_last_byte(2);
-        let keys = dir.path().join("secrets");
-        for wallet in [long, short] {
-            let key = session_keys::ensure(&keys, wallet).unwrap();
-            sim.add_account(wallet, key.address(), 2_000);
+        let keys = Arc::new(session_keys(long, short));
+        for account in [&keys.long, &keys.short] {
+            sim.add_account(account.owner, account.session.address(), 2_000);
         }
         let config = Args::try_parse_from([
             "papertrade",
@@ -810,8 +829,9 @@ impl Harness {
             &long.to_string(),
             "--short-account",
             &short.to_string(),
+            // The bot is handed its keys; nothing may go looking for them on disk.
             "--keys-dir",
-            keys.to_str().unwrap(),
+            dir.path().join("no-keys-here").to_str().unwrap(),
             "--data-dir",
             dir.path().join("data").to_str().unwrap(),
             "--dry-run",
@@ -822,7 +842,7 @@ impl Harness {
         .unwrap()
         .config;
         let store = Store::open(&config.database()).await.unwrap();
-        Self { sim, long, short, store, config, dir, bot: None }
+        Self { sim, long, short, store, config, keys, dir, bot: None }
     }
 
     /// The simulator, the accounts and a running bot.
@@ -836,12 +856,12 @@ impl Harness {
         let (stop, stopped) = oneshot::channel::<()>();
         let (config, store, quote) = (self.config.clone(), self.store.clone(), self.sim.quote());
         let client = Client::with_origin(&self.sim.url).unwrap();
-        let chain = self.sim.chain();
+        let (chain, keys) = (self.sim.chain(), self.keys.clone());
         let bot = tokio::spawn(async move {
             let shutdown = async {
                 let _ = stopped.await;
             };
-            bot::run_with(&config, store, client, chain, move |_, _| quote, fast(), shutdown).await
+            bot::run_with(&config, store, client, chain, move |_, _| quote, fast(), keys, shutdown).await
         });
         self.bot = Some((stop, bot));
     }
@@ -860,21 +880,19 @@ impl Harness {
             self.sim.chain(),
             price,
             fast(),
+            self.keys.clone(),
             std::future::pending(),
         )
         .await
     }
 
-    /// Removes the session key files, as on a machine that was never set up.
-    pub fn forget_session_keys(&self) {
-        std::fs::remove_dir_all(&self.config.keys_dir).unwrap();
-    }
-
-    /// Starts the bot the way the CLI does: restarted in-process when it cannot go on.
+    /// Starts the bot the way the CLI does: restarted in-process when it cannot go on,
+    /// every start with the keys that were unlocked once before the first.
     /// Its first `dead_feeds` starts get a price feed that ends at once.
     pub fn start_self_healing_bot(&mut self, dead_feeds: usize) {
         let (stop, stopped) = oneshot::channel::<()>();
         let (config, store, sim) = (self.config.clone(), self.store.clone(), self.sim.clone());
+        let keys = self.keys.clone();
         let bot = tokio::spawn(async move {
             let stop = futures::FutureExt::shared(async {
                 let _ = stopped.await;
@@ -885,6 +903,7 @@ impl Harness {
                 let dead = starts <= dead_feeds;
                 let (config, store, quote, chain) = (config.clone(), store.clone(), sim.quote(), sim.chain());
                 let client = Client::with_origin(&sim.url).unwrap();
+                let keys = keys.clone();
                 async move {
                     let price = move |_, tasks: &mut tokio::task::JoinSet<()>| {
                         if dead {
@@ -892,7 +911,7 @@ impl Harness {
                         }
                         quote
                     };
-                    bot::start_with(&config, store, client, chain, price, fast()).await
+                    bot::start_with(&config, store, client, chain, price, fast(), keys).await
                 }
             };
             bot::keep_running(start, Duration::from_millis(100), stop).await

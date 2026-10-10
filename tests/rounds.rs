@@ -3,9 +3,13 @@
 
 mod support;
 
+use std::sync::Arc;
 use std::time::Duration;
 
+use alloy::signers::local::PrivateKeySigner;
+use papertrade::keystore::{self, WalletKey};
 use papertrade::protocol::deployment::usd;
+use papertrade::session_keys;
 use papertrade::status::{EstimateSnapshot, FeesSnapshot, RoundEstimate, RoundSnapshot, Snapshot};
 use papertrade::strategy::decide::{Mode, Phase};
 use support::{Behavior, ENTRY, Harness, TARGET, TTL, eventually, eventually_stored, steadily};
@@ -379,10 +383,114 @@ async fn a_bot_whose_feed_dies_starts_itself_again_and_carries_on() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_bot_that_cannot_start_the_first_time_says_so_instead_of_retrying() {
     let mut h = Harness::prepare().await;
-    h.forget_session_keys();
+    h.config.coin = "NOPE".into();
     h.start_self_healing_bot(0);
     let error = h.stop_bot().await.unwrap_err().to_string();
-    assert!(error.contains("no session key"), "{error}");
+    assert!(error.contains("NOPE is not listed on Papertrade"), "{error}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn keys_unlocked_once_serve_every_restart_with_nothing_left_to_read() {
+    const PASSWORD: &str = "correct horse battery staple";
+    let mut h = Harness::prepare().await;
+    // The way `run` comes by its keys: files made by `keys init`, unlocked with
+    // the password once, before the first start.
+    let keys_dir = h.config.keys_dir.clone();
+    for wallet in [h.long, h.short] {
+        session_keys::create(&keys_dir, wallet, PASSWORD).unwrap();
+    }
+    h.keys = Arc::new(keystore::unlock(&h.config, PASSWORD).unwrap());
+    for account in [&h.keys.long, &h.keys.short] {
+        h.sim.set_session_key(account.owner, Some(account.session.address()));
+    }
+    // From here on there is no file to read again and nobody to ask.
+    std::fs::remove_dir_all(&keys_dir).unwrap();
+
+    // Two runs lose their feed and are started again in the same process.
+    h.start_self_healing_bot(2);
+    h.hedged().await;
+    h.sim.set_mid(ENTRY + TARGET);
+    h.flat().await;
+    // The exchange takes an intent from a registered session key only, so every
+    // one of these was signed with the keys unlocked at the start.
+    assert_eq!((h.opens(), h.closes()), (2, 2));
+    let status = h.store.read_status().await.unwrap().unwrap();
+    assert_eq!(status.legs[0].session_key, format!("{:#x}", h.keys.long.session.address()));
+    assert_eq!(status.legs[1].session_key, format!("{:#x}", h.keys.short.session.address()));
+    assert!(!keys_dir.exists(), "something wrote to the keys directory");
+    h.stop_bot().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_bot_handed_the_keys_of_other_accounts_does_not_start() {
+    let mut h = Harness::prepare().await;
+    h.keys = Arc::new(support::session_keys(h.short, h.long));
+    h.start_self_healing_bot(0);
+    let error = h.stop_bot().await.unwrap_err().to_string();
+    assert!(error.contains("but its keys were unlocked for"), "{error}");
+    assert!(h.sim.received().is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_wallet_key_that_did_not_load_is_reported_and_the_round_goes_on() {
+    let mut h = Harness::prepare().await;
+    // The wallet automation is on. The long wallet's key did not load; the short one's did.
+    let reason = "no encrypted wallet key at ./secrets/0x01.wallet.json; `papertrade keys init` sets it up";
+    let keys = Arc::get_mut(&mut h.keys).unwrap();
+    keys.long.wallet = WalletKey::Unavailable(reason.into());
+    keys.short.wallet = WalletKey::Loaded(PrivateKeySigner::random());
+    h.start_bot();
+
+    h.hedged().await;
+    let status = status_when(&h, "the open round", |status| status.phase == Phase::Hedged).await;
+    let wallet_keys: Vec<_> =
+        status.legs.iter().map(|leg| (leg.has_wallet_key, leg.wallet_key_problem.as_deref())).collect();
+    assert_eq!(wallet_keys, [(false, Some(reason)), (true, None)]);
+    // The session keys still manage the round and take it out.
+    h.sim.set_mid(ENTRY + TARGET);
+    h.flat().await;
+    assert_eq!((h.opens(), h.closes()), (2, 2));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn without_the_wallet_automation_the_status_claims_no_wallet_key() {
+    let h = Harness::start().await;
+    h.hedged().await;
+    let status = status_when(&h, "the open round", |status| status.phase == Phase::Hedged).await;
+    assert!(status.legs.iter().all(|leg| !leg.has_wallet_key && leg.wallet_key_problem.is_none()));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_dry_run_decides_and_shows_it_but_signs_and_sends_nothing() {
+    let mut h = Harness::prepare().await;
+    h.config.dry_run = true;
+    h.start_bot();
+    let status = status_when(&h, "the decision to open", |status| status.decision == "open").await;
+    assert!(status.dry_run);
+    steadily("nothing reaches the relayer", A_WHILE, || h.sim.received().is_empty()).await;
+    // Not signed either: an intent is journaled the moment it is signed.
+    assert!(h.store.recent_intents(10).await.unwrap().is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_session_key_its_wallet_has_not_registered_waits_instead_of_trading() {
+    let mut h = Harness::prepare().await;
+    // The key exists on this machine and is unlocked. The exchange has never heard of it.
+    h.sim.set_session_key(h.short, None);
+    h.start_bot();
+    let waiting = status_when(&h, "the wait for a registration", |status| {
+        status.summary == "flat; the short account's session key is not registered or expires soon"
+    })
+    .await;
+    assert_eq!(waiting.decision, "wait");
+    let expiry = |side: usize| waiting.legs[side].account.as_ref().unwrap().session_key_expiry;
+    assert!(expiry(0).is_some() && expiry(1).is_none(), "{:?}", waiting.legs);
+    steadily("nothing is sent on a key that is not registered", A_WHILE, || h.sim.received().is_empty())
+        .await;
+
+    // Once the wallet has registered that same key, the round opens.
+    h.sim.set_session_key(h.short, Some(h.keys.short.session.address()));
+    h.hedged().await;
 }
 
 #[tokio::test(flavor = "multi_thread")]

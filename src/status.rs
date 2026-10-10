@@ -135,9 +135,14 @@ pub struct LegSnapshot {
     /// `None` while the account's live state is unavailable.
     pub account: Option<AccountSnapshot>,
     pub pending_intents: usize,
-    /// The wallet's own key is on this machine, so the bot can withdraw and register for it.
+    /// The wallet's own key is unlocked in the running bot, which can therefore
+    /// sign for the wallet. Not whether a key file exists.
     #[serde(default)]
     pub has_wallet_key: bool,
+    /// Why that key is not there although `PT_WALLET_AUTOMATION` is on.
+    /// `None` when it is loaded, and when the automation is off.
+    #[serde(default)]
+    pub wallet_key_problem: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -221,6 +226,7 @@ mod tests {
             (&None, &None, &None, &None)
         );
         assert!(!snapshot.legs[0].has_wallet_key);
+        assert_eq!(snapshot.legs[0].wallet_key_problem, None);
         assert_eq!(snapshot.legs[0].account.as_ref().unwrap().positions[0].opened_at_ms, None);
         assert_eq!(snapshot.held_since_ms(), None);
 
@@ -259,6 +265,7 @@ mod tests {
             }),
             pending_intents: 0,
             has_wallet_key: false,
+            wallet_key_problem: None,
         };
         let held = |long, short| {
             let mut snapshot: Snapshot = serde_json::from_value(serde_json::json!({

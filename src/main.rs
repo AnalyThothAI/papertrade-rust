@@ -1,22 +1,23 @@
 use std::fs;
 use std::io::{IsTerminal, Write as _};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use alloy::primitives::{Address, Signature};
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use clap::{Parser, Subcommand};
 use futures::FutureExt;
 use papertrade::config::Config;
-use papertrade::keystore::{self, KeyRole, Stored};
+use papertrade::keystore::{self, KeyRole, UnlockedKeys, WalletKey};
 use papertrade::protocol::client::Client;
-use papertrade::protocol::deployment::SESSION_KEY_TTL_SECONDS;
 use papertrade::protocol::intents::{
-    NonceSequence, RegisterSessionKey, register_session_key_document, register_session_key_from_document,
-    seal_register_session_key,
+    register_session_key_document, register_session_key_from_document, seal_register_session_key,
 };
 use papertrade::store::Store;
 use papertrade::strategy::decide::{Mode, Side};
 use papertrade::{bot, session_keys, tui};
+use tracing::{info, warn};
 use zeroize::Zeroizing;
 
 /// Two-account hedged PAPER farming bot for Papertrade.
@@ -31,7 +32,8 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
-    /// Run the bot. With PT_DRY_RUN=true it decides and records but never submits.
+    /// Run the bot. Asks once for the password that unlocks its keys. With
+    /// PT_DRY_RUN=true it decides and records but never signs or submits.
     Run,
     /// Live terminal dashboard of what the bot sees, intends and has done.
     Tui,
@@ -43,7 +45,7 @@ enum Command {
     Resume,
     /// Close every position now and open nothing until resumed.
     Flatten,
-    /// Create and register the session keys the bot signs with.
+    /// Register a session key by hand: the wallet signs elsewhere, this submits.
     #[command(subcommand)]
     SessionKey(SessionKeyCommand),
     /// Keep this machine's keys encrypted under one password.
@@ -53,22 +55,25 @@ enum Command {
 
 #[derive(Debug, Subcommand)]
 enum KeysCommand {
-    /// Encrypt the two accounts' keys under one password: create or import what
-    /// is missing, keep what is there. Asks at the terminal, works offline and
-    /// sends nothing.
+    /// Encrypt the two accounts' keys under one password: create the session
+    /// keys, take the wallets' own keys if PT_WALLET_AUTOMATION is on, keep
+    /// what is already there. Asks at the terminal, works offline, sends nothing.
     Init,
 }
 
 #[derive(Debug, Subcommand)]
 enum SessionKeyCommand {
-    /// Create the account's session key and a registration request for the master wallet to sign.
+    /// Write the request that registers the account's session key, for the
+    /// account's wallet to sign. Asks for the password to read the key's
+    /// address. The key itself is made by `keys init`; this sends nothing.
     New {
         side: Side,
         /// How long the signed registration stays submittable.
         #[arg(long, default_value_t = 60)]
         valid_for_minutes: u64,
     },
-    /// Send the signed registration to the relayer.
+    /// Send the signed registration to the relayer. This is a real write
+    /// whatever PT_DRY_RUN says: that setting is for `run`.
     Submit {
         side: Side,
         /// The master wallet's 65-byte signature of the registration request.
@@ -92,8 +97,10 @@ async fn main() -> Result<()> {
                 .init();
             let store = Store::open(&config.database()).await?;
             let _only_one = lock_data_dir(&config)?;
+            // Once, here, outside the restarts below: they are handed the same keys.
+            let keys = unlock_keys(&config).await?;
             let stop = shutdown_signal().shared();
-            bot::keep_running(|| bot::start(&config, store.clone()), RESTART_DELAY, stop).await
+            bot::keep_running(|| bot::start(&config, store.clone(), keys.clone()), RESTART_DELAY, stop).await
         }
         Command::Tui => tui::run(&Store::open(&config.database()).await?).await,
         Command::Status => status(&Store::open(&config.database()).await?).await,
@@ -101,7 +108,8 @@ async fn main() -> Result<()> {
         Command::Resume => set_mode(&config, Mode::Run).await,
         Command::Flatten => set_mode(&config, Mode::Flatten).await,
         Command::SessionKey(SessionKeyCommand::New { side, valid_for_minutes }) => {
-            new_session_key(&config, side, valid_for_minutes)
+            require_terminal()?;
+            new_session_key(&config, side, valid_for_minutes, &mut Terminal)
         }
         Command::SessionKey(SessionKeyCommand::Submit { side, signature }) => {
             submit_session_key(&config, side, signature).await
@@ -156,39 +164,90 @@ async fn status(store: &Store) -> Result<()> {
     Ok(())
 }
 
-fn registration_path(config: &Config, wallet: Address) -> std::path::PathBuf {
-    config.keys_dir.join(format!("{wallet:#x}.registration.json"))
+/// Asks for the password and decrypts what this run signs with, once. The keys
+/// then stay in memory for as long as the process lives: a restart inside
+/// `keep_running` neither asks again nor reads a file.
+async fn unlock_keys(config: &Config) -> Result<Arc<UnlockedKeys>> {
+    // Is there anything to unlock? Asked before the operator is asked for anything.
+    for side in Side::BOTH {
+        keystore::require(&config.keys_dir, config.wallet(side)?, KeyRole::Session)?;
+    }
+    require_terminal()?;
+    // The prompt blocks and deriving the file key takes a moment: one blocking
+    // task at start, so neither ever happens on the loop's threads.
+    let unlocking = config.clone();
+    let (keys, took) = tokio::task::spawn_blocking(move || -> Result<_> {
+        let password = Terminal.secret(&format!("Password for {}: ", unlocking.keys_dir.display()))?;
+        let started = Instant::now();
+        Ok((keystore::unlock(&unlocking, &password)?, started.elapsed()))
+    })
+    .await??;
+
+    info!(
+        long = %keys.long.session.address(),
+        short = %keys.short.session.address(),
+        took = ?took,
+        "session keys unlocked"
+    );
+    if !config.wallet_automation {
+        info!("wallet automation is off: the wallets' own keys are not read");
+    }
+    for side in Side::BOTH {
+        match &keys.get(side).wallet {
+            WalletKey::Disabled => {}
+            WalletKey::Loaded(_) => info!(%side, "wallet key unlocked"),
+            WalletKey::Unavailable(reason) => warn!(
+                %side,
+                %reason,
+                "wallet key unavailable: nothing is signed for this wallet; trading on the session keys goes on"
+            ),
+        }
+    }
+    Ok(Arc::new(keys))
 }
 
-fn new_session_key(config: &Config, side: Side, valid_for_minutes: u64) -> Result<()> {
+fn new_session_key(
+    config: &Config,
+    side: Side,
+    valid_for_minutes: u64,
+    operator: &mut dyn Operator,
+) -> Result<()> {
     if valid_for_minutes == 0 {
         bail!("--valid-for-minutes must be positive");
     }
     let wallet = config.wallet(side)?;
-    let key = session_keys::ensure(&config.keys_dir, wallet)?;
+    keystore::require(&config.keys_dir, wallet, KeyRole::Session)?;
+    let password = operator.secret(&format!("Password for {}: ", config.keys_dir.display()))?;
+    let (key, path) = write_registration(config, side, valid_for_minutes, &password)?;
+    operator.say(&format!("Session key {key} for {wallet}."));
+    operator.say(&format!("Registration request written to {}. Nothing was sent.", path.display()));
+    operator.say("Sign it with the account's wallet as EIP-712 typed data, for example:");
+    operator.say(&format!("  cast wallet sign --data --from-file {} --interactive", path.display()));
+    operator.say(&format!("then: papertrade session-key submit {side} --signature 0x…"));
+    Ok(())
+}
+
+/// Writes the request that registers the account's session key and returns the
+/// key's address. The address is only known by decrypting the key.
+fn write_registration(
+    config: &Config,
+    side: Side,
+    valid_for_minutes: u64,
+    password: &str,
+) -> Result<(Address, PathBuf)> {
+    let wallet = config.wallet(side)?;
+    let key = keystore::load(&config.keys_dir, wallet, KeyRole::Session, password)?.address();
     let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
-    let message = RegisterSessionKey {
-        user: wallet,
-        key: key.address(),
-        expiry: now + SESSION_KEY_TTL_SECONDS,
-        feeAddress: Address::ZERO,
-        nonce: NonceSequence::random().allocate(),
-        deadline: now + valid_for_minutes * 60,
-    };
-    let path = registration_path(config, wallet);
+    let message = session_keys::registration(wallet, key, now, valid_for_minutes * 60);
+    let path = session_keys::registration_path(&config.keys_dir, wallet);
     fs::write(&path, serde_json::to_string_pretty(&register_session_key_document(&message))?)
         .with_context(|| format!("writing {}", path.display()))?;
-    println!("Session key {} for {wallet}.", key.address());
-    println!("Registration request written to {}.", path.display());
-    println!("Sign it with the master wallet as EIP-712 typed data, for example:");
-    println!("  cast wallet sign --data --from-file {} --interactive", path.display());
-    println!("then: papertrade session-key submit {side} --signature 0x…");
-    Ok(())
+    Ok((key, path))
 }
 
 async fn submit_session_key(config: &Config, side: Side, signature: Signature) -> Result<()> {
     let wallet = config.wallet(side)?;
-    let path = registration_path(config, wallet);
+    let path = session_keys::registration_path(&config.keys_dir, wallet);
     let document = serde_json::from_str(
         &fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?,
     )?;
@@ -197,6 +256,7 @@ async fn submit_session_key(config: &Config, side: Side, signature: Signature) -
     let intent = seal_register_session_key(&message, signature)?;
     let receipt = Client::new()?.submit_intent(&intent).await?;
     println!("Relayer accepted the registration: {} ({}).", receipt.state, receipt.intent_id);
+    println!("This was a real request; PT_DRY_RUN applies to `run` only.");
     println!("`papertrade status` shows the key as valid once it has executed.");
     Ok(())
 }
@@ -204,11 +264,10 @@ async fn submit_session_key(config: &Config, side: Side, signature: Signature) -
 /// A new password is at least this long. A floor, not a measure of strength.
 const MIN_PASSWORD_CHARS: usize = 16;
 
-/// Whoever answers `keys init`. Secrets are typed and never shown.
+/// Whoever answers at the terminal. Secrets are typed and never shown.
 trait Operator {
     fn say(&mut self, line: &str);
     fn secret(&mut self, prompt: &str) -> Result<Zeroizing<String>>;
-    fn confirm(&mut self, question: &str) -> Result<bool>;
 }
 
 /// The operator at the terminal the command was started from.
@@ -221,14 +280,6 @@ impl Operator for Terminal {
 
     fn secret(&mut self, prompt: &str) -> Result<Zeroizing<String>> {
         Ok(Zeroizing::new(rpassword::prompt_password(prompt).context("reading from the terminal")?))
-    }
-
-    fn confirm(&mut self, question: &str) -> Result<bool> {
-        print!("{question} [y/N] ");
-        std::io::stdout().flush()?;
-        let mut answer = String::new();
-        std::io::stdin().read_line(&mut answer)?;
-        Ok(matches!(answer.trim(), "y" | "Y" | "yes"))
     }
 }
 
@@ -244,11 +295,10 @@ fn require_terminal() -> Result<()> {
 }
 
 /// `keys init`: brings the keys directory to one encrypted file per key the
-/// configuration calls for, all under one password. What is already encrypted
-/// is checked against the password and kept; a plaintext key of an earlier
-/// version is encrypted if the operator agrees; a missing session key is
-/// created; a missing wallet key is typed in. It only ever adds files, so it
-/// can be run again after an interruption or a change of configuration.
+/// configuration calls for, all under one password. What is already there is
+/// checked against the password and kept; a missing session key is created; a
+/// missing wallet key is typed in. It only ever adds files, so it can be run
+/// again after an interruption or after turning the wallet automation on.
 fn init_keys(config: &Config, operator: &mut dyn Operator) -> Result<()> {
     let dir = &config.keys_dir;
     let accounts = [(Side::Long, config.wallet(Side::Long)?), (Side::Short, config.wallet(Side::Short)?)];
@@ -264,12 +314,12 @@ fn init_keys(config: &Config, operator: &mut dyn Operator) -> Result<()> {
     let mut keys = Vec::new();
     for (side, owner) in accounts {
         for &role in roles {
-            keys.push((side, owner, role, keystore::stored(dir, owner, role)?));
+            keys.push((side, owner, role, keystore::exists(dir, owner, role)?));
         }
     }
-    // With keys already encrypted, the password is theirs and has to open every one
+    // With keys already there, the password is theirs and has to open every one
     // of them before anything is added. Otherwise it is chosen now.
-    let password = if keys.iter().any(|key| key.3 == Stored::Encrypted) {
+    let password = if keys.iter().any(|&(.., exists)| exists) {
         operator.secret(&format!("Password for {}: ", dir.display()))?
     } else {
         operator.say(&format!(
@@ -289,48 +339,28 @@ fn init_keys(config: &Config, operator: &mut dyn Operator) -> Result<()> {
         password
     };
     let mut kept = Vec::new();
-    for &(side, owner, role, stored) in &keys {
-        if stored == Stored::Encrypted {
+    for &(side, owner, role, exists) in &keys {
+        if exists {
             let signer = keystore::load(dir, owner, role, &password)
                 .map_err(|error| anyhow!("{error:#}; nothing was changed"))?;
             kept.push((side, role, signer.address()));
         }
     }
     for (side, role, address) in kept {
-        operator.say(&format!("{side} {role} key {address}: already encrypted, kept."));
+        operator.say(&format!("{side} {role} key {address}: already there, kept."));
     }
 
-    let mut unfinished = Vec::new();
-    for (side, owner, role, stored) in keys {
-        match (stored, role) {
-            (Stored::Encrypted, _) => {}
-            (Stored::Plaintext, _) => {
-                let plaintext = keystore::plaintext_path(dir, owner, role);
-                let question = format!(
-                    "{} holds the {side} account's {role} key in plaintext. Encrypt that key?",
-                    plaintext.display()
-                );
-                if operator.confirm(&question)? {
-                    let address = keystore::migrate_plaintext(dir, owner, role, &password)?;
-                    operator.say(&format!(
-                        "{side} {role} key {address}: encrypted, the same key as before. {} was not \
-                         deleted and still holds it in plaintext.",
-                        plaintext.display()
-                    ));
-                } else {
-                    // Not replaced by a new key either: that would change the address behind the operator's back.
-                    operator.say(&format!("{side} {role} key: left as it is, not encrypted."));
-                    unfinished.push(format!("the {side} account's {role} key"));
-                }
-            }
-            (Stored::Missing, KeyRole::Session) => {
+    for (side, owner, role, exists) in keys {
+        match role {
+            _ if exists => {}
+            KeyRole::Session => {
                 let address = session_keys::create(dir, owner, &password)?;
                 operator.say(&format!(
-                    "{side} session key {address}: created and encrypted. It is not registered: it \
-                     signs for {owner} only once that wallet has registered it."
+                    "{side} session key {address}: created and encrypted. It is not registered: it signs \
+                     for {owner} only once that wallet has registered it (`papertrade session-key new {side}`)."
                 ));
             }
-            (Stored::Missing, KeyRole::Wallet) => {
+            KeyRole::Wallet => {
                 let typed =
                     operator.secret(&format!("Private key of the {side} account's wallet {owner}: "))?;
                 let address =
@@ -341,16 +371,7 @@ fn init_keys(config: &Config, operator: &mut dyn Operator) -> Result<()> {
     }
 
     operator.say(&format!("Key files are {}.", keystore::FORMAT));
-    operator.say(
-        "This version's `run` and `session-key` still use the plaintext <wallet>.key files; the \
-         encrypted keys take over with the version that unlocks them at start.",
-    );
     operator.say("Nothing was sent: no registration, no withdrawal, no transfer, no order.");
-    ensure!(
-        unfinished.is_empty(),
-        "not finished, still in plaintext only: {}. `papertrade keys init` asks again",
-        unfinished.join(", ")
-    );
     Ok(())
 }
 
@@ -361,27 +382,22 @@ mod tests {
 
     use alloy::primitives::hex;
     use alloy::signers::local::PrivateKeySigner;
+    use papertrade::protocol::deployment::SESSION_KEY_TTL_SECONDS;
 
     use super::*;
 
     const PASSWORD: &str = "correct horse battery staple";
 
-    /// An operator who gives prepared answers, and everything they were shown.
+    /// An operator who types prepared answers, and everything they were shown.
     #[derive(Default)]
     struct Script {
         secrets: VecDeque<String>,
-        confirms: VecDeque<bool>,
         shown: Vec<String>,
     }
 
     impl Script {
         fn typing(secrets: &[&str]) -> Self {
-            Self { secrets: secrets.iter().map(|&secret| secret.to_owned()).collect(), ..Self::default() }
-        }
-
-        fn answering(mut self, confirms: &[bool]) -> Self {
-            self.confirms = confirms.iter().copied().collect();
-            self
+            Self { secrets: secrets.iter().map(|&secret| secret.to_owned()).collect(), shown: Vec::new() }
         }
 
         fn shown(&self) -> String {
@@ -397,11 +413,6 @@ mod tests {
         fn secret(&mut self, prompt: &str) -> Result<Zeroizing<String>> {
             self.shown.push(prompt.to_owned());
             Ok(Zeroizing::new(self.secrets.pop_front().unwrap_or_else(|| panic!("not expected: {prompt}"))))
-        }
-
-        fn confirm(&mut self, question: &str) -> Result<bool> {
-            self.shown.push(question.to_owned());
-            Ok(self.confirms.pop_front().unwrap_or_else(|| panic!("not expected: {question}")))
         }
     }
 
@@ -467,7 +478,7 @@ mod tests {
             let secret = secret.trim_start_matches("0x");
             assert!(!shown.contains(secret), "the operator was shown a secret:\n{shown}");
             for (name, content) in files(keys_dir) {
-                assert!(!name.ends_with(".json") || !content.contains(secret), "{name} holds a secret");
+                assert!(!content.contains(secret), "{name} holds a secret");
             }
         }
     }
@@ -510,12 +521,30 @@ mod tests {
         let mut again = Script::typing(&[PASSWORD]);
         init_keys(&config, &mut again).unwrap();
         assert_eq!(files(dir.path()), before);
-        assert_eq!(again.shown().matches("already encrypted, kept").count(), 2, "{}", again.shown());
+        assert_eq!(again.shown().matches("already there, kept").count(), 2, "{}", again.shown());
 
         let mut wrong = Script::typing(&["not the password at all"]);
         let error = init_keys(&config, &mut wrong).unwrap_err().to_string();
         assert!(error.contains("wrong password") && error.ends_with("nothing was changed"), "{error}");
         assert_eq!(files(dir.path()), before);
+    }
+
+    #[test]
+    fn an_interrupted_run_is_finished_by_the_next_without_touching_what_was_done() {
+        let (dir, wallets) = (tempfile::tempdir().unwrap(), Wallets::random());
+        let config = wallets.config(dir.path(), false);
+        // As if the first run had stopped after the long account's key.
+        let long = session_keys::create(dir.path(), wallets.long.address(), PASSWORD).unwrap();
+        let before = files(dir.path());
+
+        let mut operator = Script::typing(&[PASSWORD]);
+        init_keys(&config, &mut operator).unwrap();
+        let after = files(dir.path());
+        assert_eq!(after.len(), 2);
+        assert!(after.contains(&before[0]), "the key that was there changed");
+        let shown = operator.shown();
+        assert!(shown.contains(&format!("long session key {long}: already there, kept.")), "{shown}");
+        assert!(shown.contains("short session key") && shown.contains("created and encrypted"), "{shown}");
     }
 
     #[test]
@@ -530,43 +559,6 @@ mod tests {
             init_keys(&config, &mut Script::typing(&[PASSWORD, "correct horse battery stapel"])).unwrap_err();
         assert!(error.to_string().contains("the two passwords differ"), "{error}");
         assert!(!keys_dir.exists());
-    }
-
-    #[test]
-    fn a_plaintext_key_of_an_earlier_version_is_encrypted_only_if_the_operator_agrees() {
-        let (dir, wallets) = (tempfile::tempdir().unwrap(), Wallets::random());
-        let config = wallets.config(dir.path(), false);
-        let (long, short) = (wallets.long.address(), wallets.short.address());
-        // The long account's session key as the earlier version stored it.
-        let earlier = PrivateKeySigner::random();
-        let plaintext = keystore::plaintext_path(dir.path(), long, KeyRole::Session);
-        fs::write(&plaintext, format!("{}\n", Wallets::typed(&earlier))).unwrap();
-
-        // Declined: that account gets no encrypted key, and no new key in its place.
-        let mut declined = Script::typing(&[PASSWORD, PASSWORD]).answering(&[false]);
-        let error = init_keys(&config, &mut declined).unwrap_err().to_string();
-        assert!(
-            error.contains("not finished") && error.contains("the long account's session key"),
-            "{error}"
-        );
-        assert_eq!(names(dir.path()), sorted([format!("{long:#x}.key"), format!("{short:#x}.session.json")]));
-
-        // Agreed, on a second run that also finds the short account done.
-        let mut agreed = Script::typing(&[PASSWORD]).answering(&[true]);
-        init_keys(&config, &mut agreed).unwrap();
-        let migrated = keystore::load(dir.path(), long, KeyRole::Session, PASSWORD).unwrap();
-        assert_eq!(migrated.address(), earlier.address());
-        // The plaintext file is neither deleted nor touched, and the operator is told so.
-        assert_eq!(fs::read_to_string(&plaintext).unwrap(), format!("{}\n", Wallets::typed(&earlier)));
-        let shown = agreed.shown();
-        assert!(
-            shown.contains(&format!(
-                "{} was not deleted and still holds it in plaintext",
-                plaintext.display()
-            )),
-            "{shown}"
-        );
-        assert_kept_secret(&shown, dir.path(), &[PASSWORD, &Wallets::typed(&earlier)]);
     }
 
     #[test]
@@ -590,6 +582,16 @@ mod tests {
     }
 
     #[test]
+    fn with_the_automation_off_no_wallet_key_is_asked_for() {
+        let (dir, wallets) = (tempfile::tempdir().unwrap(), Wallets::random());
+        // Two answers, both for the password: a prompt for a private key would panic.
+        let mut operator = Script::typing(&[PASSWORD, PASSWORD]);
+        init_keys(&wallets.config(dir.path(), false), &mut operator).unwrap();
+        assert!(!operator.shown().contains("Private key"), "{}", operator.shown());
+        assert!(names(dir.path()).iter().all(|name| name.ends_with(".session.json")));
+    }
+
+    #[test]
     fn a_wallet_key_that_is_not_the_accounts_own_is_refused() {
         let (dir, wallets) = (tempfile::tempdir().unwrap(), Wallets::random());
         let config = wallets.config(dir.path(), true);
@@ -606,5 +608,43 @@ mod tests {
         let mut operator = Script::typing(&[PASSWORD, "hunter2hunter2"]);
         let error = format!("{:#}", init_keys(&config, &mut operator).unwrap_err());
         assert_eq!(error, "not a private key: 64 hex digits are expected");
+    }
+
+    #[test]
+    fn the_registration_request_names_the_encrypted_session_key_and_sends_nothing() {
+        let (dir, wallets) = (tempfile::tempdir().unwrap(), Wallets::random());
+        let config = wallets.config(dir.path(), false);
+        let owner = wallets.short.address();
+
+        // There is no key to register before `keys init` has made one, and no prompt for a password.
+        let error = new_session_key(&config, Side::Short, 60, &mut Script::typing(&[])).unwrap_err();
+        assert!(error.to_string().contains("`papertrade keys init` sets it up"), "{error}");
+        assert!(names(dir.path()).is_empty(), "asking for a registration created something");
+
+        init_keys(&config, &mut Script::typing(&[PASSWORD, PASSWORD])).unwrap();
+        let keys = files(dir.path());
+        let session = keystore::load(dir.path(), owner, KeyRole::Session, PASSWORD).unwrap().address();
+
+        let mut wrong = Script::typing(&["not the password at all"]);
+        let error = new_session_key(&config, Side::Short, 60, &mut wrong).unwrap_err().to_string();
+        assert!(error.contains("wrong password"), "{error}");
+        assert_eq!(files(dir.path()), keys);
+
+        let mut operator = Script::typing(&[PASSWORD]);
+        let before = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+        new_session_key(&config, Side::Short, 60, &mut operator).unwrap();
+        let path = session_keys::registration_path(dir.path(), owner);
+        let document = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        let request = register_session_key_from_document(&document).unwrap();
+        assert_eq!((request.user, request.key, request.feeAddress), (owner, session, Address::ZERO));
+        assert!((before + 3_600..=before + 3_605).contains(&request.deadline), "{request:?}");
+        assert_eq!(request.expiry - request.deadline, SESSION_KEY_TTL_SECONDS - 3_600);
+        let shown = operator.shown();
+        assert!(shown.contains(&format!("Session key {session} for {owner}.")), "{shown}");
+        assert!(shown.contains("Nothing was sent."), "{shown}");
+        // The key files are as they were: asking again makes no second key.
+        let after = files(dir.path());
+        assert!(keys.iter().all(|key| after.contains(key)) && after.len() == keys.len() + 1);
+        assert_kept_secret(&shown, dir.path(), &[PASSWORD]);
     }
 }

@@ -5,8 +5,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use alloy::primitives::{Address, U256};
-use alloy::signers::local::PrivateKeySigner;
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, bail, ensure};
 use serde_json::json;
 use tokio::sync::{Notify, mpsc, watch};
 use tokio::task::JoinSet;
@@ -15,6 +14,7 @@ use tracing::{error, info, warn};
 
 use crate::config::Config;
 use crate::economics::{self, Leg as EstimatedLeg, Round, Terms};
+use crate::keystore::{UnlockedKeys, WalletKey};
 use crate::market::{Quote, follow_price, format_price, price_decimals};
 use crate::protocol::account::AccountState;
 use crate::protocol::chain::{Chain, FeeRates};
@@ -24,7 +24,6 @@ use crate::protocol::intents::{
 };
 use crate::protocol::stream::{StreamTiming, follow_account};
 use crate::protocol::wire::{IntentOutcome, IntentReceipt, MintCurve, TradingState};
-use crate::session_keys;
 use crate::status::{
     AccountSnapshot, EstimateSnapshot, FeesSnapshot, LegSnapshot, PositionSnapshot, RoundEstimate,
     RoundSnapshot, Snapshot, TradingSnapshot, format_amount, format_signed_amount, format_signed_decimal,
@@ -133,7 +132,6 @@ fn fresh<T: Clone>(polled: &Polled<T>, every: Duration) -> Option<T> {
 
 struct Leg {
     wallet: Address,
-    signer: PrivateKeySigner,
     nonces: NonceSequence,
     account: watch::Receiver<Option<AccountState>>,
 }
@@ -148,6 +146,9 @@ struct Bot {
     price_decimals: u32,
     client: Client,
     store: Store,
+    /// What the bot signs with. Unlocked before the first start and handed to
+    /// every later one: nothing here reads a key file or asks for a password.
+    keys: Arc<UnlockedKeys>,
     legs: PerSide<Leg>,
     outcomes: mpsc::Receiver<IntentOutcome>,
     quote: watch::Receiver<Option<Quote>>,
@@ -179,22 +180,22 @@ pub struct Running {
     tasks: JoinSet<()>,
 }
 
-/// Starts the bot against production. Fails if it cannot start: a missing
-/// session key, an unlisted market, an unreachable relayer.
-pub async fn start(config: &Config, store: Store) -> Result<Running> {
+/// Starts the bot against production, signing with `keys`. Fails if it cannot
+/// start: an unlisted market, an unreachable relayer.
+pub async fn start(config: &Config, store: Store, keys: Arc<UnlockedKeys>) -> Result<Running> {
     let coin = config.coin.clone();
     let price = move |price_decimals: u32, tasks: &mut JoinSet<()>| {
         let (sender, quote) = watch::channel(None);
         tasks.spawn(follow_price(coin, price_decimals, sender));
         quote
     };
-    start_with(config, store, Client::new()?, Chain::new()?, price, Timing::default()).await
+    start_with(config, store, Client::new()?, Chain::new()?, price, Timing::default(), keys).await
 }
 
 /// Keeps a bot running until `stop` resolves.
 ///
-/// The first start has to succeed, so a wrong setting or a missing session key
-/// is reported at once instead of being retried forever. After that, whenever
+/// The first start has to succeed, so a wrong setting is reported at once
+/// instead of being retried forever. After that, whenever
 /// the bot cannot go on (a feed died, the relayer became unreachable) it is
 /// started again after `restart_delay`. The bot takes over from the account
 /// state and its journal on every start, so starting again is always safe; and
@@ -229,6 +230,8 @@ where
 }
 
 /// Starts the bot and runs it until `shutdown` resolves or it cannot go on.
+// One argument per outside party, plus when to stop: a struct would only rename them.
+#[allow(clippy::too_many_arguments)]
 pub async fn run_with(
     config: &Config,
     store: Store,
@@ -236,15 +239,17 @@ pub async fn run_with(
     chain: Chain,
     price: impl FnOnce(u32, &mut JoinSet<()>) -> watch::Receiver<Option<Quote>>,
     timing: Timing,
+    keys: Arc<UnlockedKeys>,
     shutdown: impl Future<Output = ()>,
 ) -> Result<()> {
-    start_with(config, store, client, chain, price, timing).await?.until(shutdown).await
+    start_with(config, store, client, chain, price, timing, keys).await?.until(shutdown).await
 }
 
 /// Starts the bot against any relayer and price source.
 ///
 /// `price` is given the market's price decimals and returns the quote to follow;
 /// it may spawn its feed onto the task set so the feed is supervised with the rest.
+/// `keys` are the two accounts' keys as unlocked when the process started.
 pub async fn start_with(
     config: &Config,
     store: Store,
@@ -253,7 +258,15 @@ pub async fn start_with(
     chain: Chain,
     price: impl FnOnce(u32, &mut JoinSet<()>) -> watch::Receiver<Option<Quote>>,
     timing: Timing,
+    keys: Arc<UnlockedKeys>,
 ) -> Result<Running> {
+    for side in Side::BOTH {
+        let (wallet, unlocked) = (config.wallet(side)?, keys.get(side).owner);
+        ensure!(
+            unlocked == wallet,
+            "the {side} account is {wallet}, but its keys were unlocked for {unlocked}"
+        );
+    }
     let trading_state = client.trading_state().await.context("fetching the trading state")?;
     let instrument = trading_state
         .instrument(&config.coin)
@@ -272,12 +285,7 @@ pub async fn start_with(
             sender,
             outcome_sender.clone(),
         ));
-        Ok(Leg {
-            wallet,
-            signer: session_keys::load(&config.keys_dir, wallet)?,
-            nonces: NonceSequence::random(),
-            account,
-        })
+        Ok(Leg { wallet, nonces: NonceSequence::random(), account })
     };
     let legs = PerSide { long: leg(Side::Long)?, short: leg(Side::Short)? };
 
@@ -334,6 +342,7 @@ pub async fn start_with(
         inflight: store.unresolved_intents().await?,
         open_allowed_at_ms: store.last_open_attempt_ms().await?.map_or(0, |at| at + ttl_ms),
         store,
+        keys,
         legs,
         outcomes,
         quote,
@@ -416,7 +425,7 @@ impl Bot {
         let (now, grace_ms) = (now_ms(), duration_ms(self.timing.grace));
         let leg = |side: Side| LegView {
             account: accounts.get(side).as_ref(),
-            session_key: self.legs.get(side).signer.address(),
+            session_key: self.keys.get(side).session.address(),
             awaiting: self
                 .inflight
                 .iter()
@@ -534,7 +543,7 @@ impl Bot {
                 nonce: leg.nonces.allocate(),
                 deadline,
             };
-            match sign_open_position(&leg.signer, &message) {
+            match sign_open_position(&self.keys.get(side).session, &message) {
                 Ok(intent) => intents.push((side, intent)),
                 Err(error) => {
                     error!(%side, %error, "signing the open failed; not opening");
@@ -574,7 +583,7 @@ impl Bot {
             let leg = self.legs.get_mut(side);
             let message =
                 Close { user: leg.wallet, positionIds: position_ids, nonce: leg.nonces.allocate(), deadline };
-            let intent = match sign_close(&leg.signer, &message) {
+            let intent = match sign_close(&self.keys.get(side).session, &message) {
                 Ok(intent) => intent,
                 Err(error) => {
                     error!(%side, %error, "signing the close failed");
@@ -664,15 +673,16 @@ impl Bot {
     ) -> Snapshot {
         let price = |raw: u64| format_price(raw, self.price_decimals);
         let leg = |side: Side| {
-            let leg = self.legs.get(side);
+            let (leg, keys) = (self.legs.get(side), self.keys.get(side));
+            let session_key = keys.session.address();
             LegSnapshot {
                 side,
                 wallet: format!("{:#x}", leg.wallet),
-                session_key: format!("{:#x}", leg.signer.address()),
+                session_key: format!("{session_key:#x}"),
                 account: accounts.get(side).as_ref().map(|account| AccountSnapshot {
                     available_usd: format_amount(account.available_balance),
                     queued_usd: format_amount(account.queued),
-                    session_key_expiry: account.session_keys.get(&leg.signer.address()).copied(),
+                    session_key_expiry: account.session_keys.get(&session_key).copied(),
                     positions: account
                         .positions
                         .iter()
@@ -688,7 +698,11 @@ impl Bot {
                         .collect(),
                 }),
                 pending_intents: self.inflight.iter().filter(|entry| entry.side == side).count(),
-                has_wallet_key: false,
+                has_wallet_key: keys.wallet.signer().is_some(),
+                wallet_key_problem: match &keys.wallet {
+                    WalletKey::Unavailable(reason) => Some(reason.clone()),
+                    WalletKey::Disabled | WalletKey::Loaded(_) => None,
+                },
             }
         };
         let phase = Phase::of(accounts.long.as_ref(), accounts.short.as_ref(), &self.market);

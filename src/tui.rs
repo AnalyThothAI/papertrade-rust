@@ -123,7 +123,7 @@ fn draw(frame: &mut Frame, screen: &Screen) {
         Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)]).areas(accounts);
     for (area, leg) in [long, short].into_iter().zip(&status.legs) {
         let title = format!(" {} {} ", leg.side.as_str().to_uppercase(), short_hex(&leg.wallet));
-        panel(frame, area, &title, account_lines(leg, screen.now_ms, short_hex));
+        panel(frame, area, &title, account_lines(leg, screen.now_ms, Room::Panel));
     }
     panel(frame, funds_area, " Funds ", funds);
     panel(frame, ledger, " Ledger ", vec![ledger_line(&screen.totals)]);
@@ -322,7 +322,15 @@ fn estimate_cells(round: Option<&RoundEstimate>) -> [String; 5] {
 }
 
 /// One account: balances, keys, intents on their way, positions.
-fn account_lines(leg: &LegSnapshot, now_ms: i64, hex: fn(&str) -> String) -> Vec<Line<'static>> {
+/// How much room an account's lines have: half the dashboard's width, or a
+/// line of the `status` text, which is as long as it needs to be.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Room {
+    Panel,
+    Report,
+}
+
+fn account_lines(leg: &LegSnapshot, now_ms: i64, room: Room) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
     match &leg.account {
         None => lines.push(Line::from("account state unavailable").red()),
@@ -333,7 +341,10 @@ fn account_lines(leg: &LegSnapshot, now_ms: i64, hex: fn(&str) -> String) -> Vec
                 dim(" · queued payout "),
                 plain(format!("{} USD", account.queued_usd)),
             ]));
-            let key = hex(&leg.session_key);
+            let key = match room {
+                Room::Panel => short_hex(&leg.session_key),
+                Room::Report => leg.session_key.clone(),
+            };
             lines.push(match account.session_key_expiry {
                 None => Line::from(format!("session key {key} NOT REGISTERED")).red(),
                 Some(expiry) => {
@@ -347,10 +358,16 @@ fn account_lines(leg: &LegSnapshot, now_ms: i64, hex: fn(&str) -> String) -> Vec
             });
         }
     }
-    lines.push(Line::from(vec![
-        dim("wallet key "),
-        if leg.has_wallet_key { plain("present") } else { plain("absent").dim() },
-    ]));
+    // Whether the running bot holds the wallet's own key, not whether a file exists.
+    lines.push(match (leg.has_wallet_key, &leg.wallet_key_problem, room) {
+        (true, ..) => Line::from(vec![dim("wallet key "), plain("loaded")]),
+        // The reason names a file and does not fit the panel.
+        (false, Some(_), Room::Panel) => Line::from("wallet key UNAVAILABLE · see `papertrade status`").red(),
+        (false, Some(problem), Room::Report) => {
+            Line::from(format!("wallet key UNAVAILABLE: {problem}")).red()
+        }
+        (false, None, _) => Line::from(vec![dim("wallet key "), plain("off").dim()]),
+    });
     lines.push(match leg.pending_intents {
         0 => Line::from(vec![dim("in flight "), plain("nothing")]),
         pending => Line::from(format!("{pending} intent(s) in flight")).yellow(),
@@ -472,7 +489,7 @@ fn text(screen: &Screen) -> String {
     for leg in &status.legs {
         section(
             format!("{} account {}", leg.side, leg.wallet),
-            account_lines(leg, screen.now_ms, str::to_owned),
+            account_lines(leg, screen.now_ms, Room::Report),
         );
     }
     section("Funds".to_owned(), funds_lines(status, screen.now_ms));
@@ -537,6 +554,7 @@ mod tests {
             }),
             pending_intents: 0,
             has_wallet_key: false,
+            wallet_key_problem: None,
         }
     }
 
@@ -658,7 +676,7 @@ mod tests {
                 // Accounts
                 "available 1000.00 USD · queued payout 0.00 USD",
                 "· 20d left",
-                "wallet key absent",
+                "wallet key off",
                 "in flight nothing",
                 "long 500.00 USD × 20 @ 82700.0 · bust 78604.4",
                 "short 500.00 USD × 20 @ 82700.0 · bust 86795.6",
@@ -788,7 +806,7 @@ mod tests {
                 "no hedged round open",
                 "at target   -100.00    +86.38    -13.61     9800.00   0.001389",
                 "no position",
-                "wallet key present",
+                "wallet key loaded",
             ],
         );
         let dashboard = render(&screen);
@@ -838,6 +856,29 @@ mod tests {
         );
         screen.status.as_mut().unwrap().transfer.as_mut().unwrap().note = None;
         both_show(&screen, &["stage stuck · 3m elapsed", "settled positions 12"]);
+    }
+
+    #[test]
+    fn a_wallet_key_that_did_not_load_is_called_out_and_status_says_why() {
+        let mut screen = hedged_screen();
+        let status = status(&mut screen);
+        status.legs[0].has_wallet_key = true;
+        let reason = "no encrypted wallet key at ./secrets/0x70997970c51812dc3a010c7d01b50e0d17dc79c8.wallet.json; \
+                      `papertrade keys init` sets it up";
+        status.legs[1].wallet_key_problem = Some(reason.into());
+        both_show(&screen, &["wallet key loaded", "wallet key UNAVAILABLE"]);
+        // The dashboard has half its width for an account: it points at the full text.
+        assert!(
+            render(&screen).contains("│wallet key UNAVAILABLE · see `papertrade status`"),
+            "{}",
+            render(&screen)
+        );
+        assert!(text(&screen).contains(&format!("wallet key UNAVAILABLE: {reason}")), "{}", text(&screen));
+
+        // With the automation off there is no key and nothing wrong with that.
+        let off = hedged_screen();
+        both_show(&off, &["wallet key off"]);
+        assert!(!render(&off).contains("UNAVAILABLE") && !text(&off).contains("UNAVAILABLE"));
     }
 
     #[test]
