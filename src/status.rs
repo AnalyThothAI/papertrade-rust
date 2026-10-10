@@ -27,6 +27,65 @@ pub struct Snapshot {
     pub trading: Option<TradingSnapshot>,
     pub queue_total_usd: Option<String>,
     pub legs: Vec<LegSnapshot>,
+    /// What a round is expected to cost and mint. `None` until the inputs are known.
+    #[serde(default)]
+    pub estimate: Option<EstimateSnapshot>,
+    /// How the two accounts are funded. `None` while an account's state is unavailable.
+    #[serde(default)]
+    pub funds: Option<FundsSnapshot>,
+    /// The transfer between the two accounts that is under way, if any.
+    #[serde(default)]
+    pub transfer: Option<TransferSnapshot>,
+}
+
+/// What a round is expected to cost and mint, by the protocol's published rules.
+/// An estimate: the contract has the last word at settlement.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EstimateSnapshot {
+    /// PAPER minted per USD of loss basis right now.
+    pub mint_rate: String,
+    /// If both legs are closed once price is the close distance from the entry.
+    pub at_target: RoundEstimate,
+    /// If both legs were closed at the current mid. Only while hedged.
+    pub now: Option<RoundEstimate>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RoundEstimate {
+    /// What the losing leg loses, USD.
+    pub loser_usd: String,
+    /// What the winning leg is paid after the impact haircut and the win fee, USD.
+    pub winner_usd: String,
+    /// The pair's net result, USD. Negative: a cost.
+    pub net_usd: String,
+    pub paper: String,
+    /// USD spent per PAPER minted. `None` when no PAPER would be minted.
+    pub usd_per_paper: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FundsSnapshot {
+    pub total_usd: String,
+    /// How much more the richer account holds.
+    pub difference_usd: String,
+    /// Rounds both accounts can still fund at the current margin, before any transfer.
+    pub rounds_affordable: u32,
+    /// `enough`, `rebalance` or `underfunded`.
+    pub verdict: String,
+    /// Both wallet keys are present, so a transfer can be signed without the operator.
+    pub can_rebalance: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TransferSnapshot {
+    pub from: Side,
+    pub to: Side,
+    pub amount_usd: String,
+    /// `withdraw`, `send`, `credit`, `done` or `stuck`.
+    pub stage: String,
+    pub started_at_ms: i64,
+    /// What it is waiting for, or why it is stuck.
+    pub note: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -43,6 +102,9 @@ pub struct LegSnapshot {
     /// `None` while the account's live state is unavailable.
     pub account: Option<AccountSnapshot>,
     pub pending_intents: usize,
+    /// The wallet's own key is on this machine, so the bot can withdraw and register for it.
+    #[serde(default)]
+    pub has_wallet_key: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

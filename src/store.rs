@@ -399,6 +399,9 @@ mod tests {
             trading: None,
             queue_total_usd: None,
             legs: Vec::new(),
+            estimate: None,
+            funds: None,
+            transfer: None,
         };
         store.write_status(&snapshot).await.unwrap();
         snapshot.at_ms = 2;
