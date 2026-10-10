@@ -1015,7 +1015,24 @@ impl Harness {
     /// every start with the keys that were unlocked once before the first.
     /// Its first `dead_feeds` starts get a price feed that ends at once.
     pub fn start_self_healing_bot(&mut self, dead_feeds: usize) {
+        self.start_self_healing(dead_feeds, None);
+    }
+
+    /// Like `start_self_healing_bot`, but the start after the `dead_feeds` ones
+    /// never finishes, as against an exchange that does not answer. The returned
+    /// receiver resolves when that start has begun.
+    pub fn start_self_healing_bot_whose_next_start_hangs(
+        &mut self,
+        dead_feeds: usize,
+    ) -> oneshot::Receiver<()> {
+        let (begun, has_begun) = oneshot::channel();
+        self.start_self_healing(dead_feeds, Some(begun));
+        has_begun
+    }
+
+    fn start_self_healing(&mut self, dead_feeds: usize, hang_after: Option<oneshot::Sender<()>>) {
         let (stop, stopped) = oneshot::channel::<()>();
+        let mut hang_after = hang_after.map(|begun| (dead_feeds + 1, Some(begun)));
         let (config, store, sim) = (self.config.clone(), self.store.clone(), self.sim.clone());
         let keys = self.keys.clone();
         let bot = tokio::spawn(async move {
@@ -1029,7 +1046,13 @@ impl Harness {
                 let (config, store, quote, chain) = (config.clone(), store.clone(), sim.quote(), sim.chain());
                 let client = Client::with_origin(&sim.url).unwrap();
                 let (keys, hypercore) = (keys.clone(), sim.hypercore());
+                let hanging =
+                    hang_after.as_mut().filter(|(at, _)| *at == starts).and_then(|(_, begun)| begun.take());
                 async move {
+                    if let Some(begun) = hanging {
+                        let _ = begun.send(());
+                        std::future::pending::<()>().await;
+                    }
                     let price = move |_, tasks: &mut tokio::task::JoinSet<()>| {
                         if dead {
                             tasks.spawn(async {});
@@ -1042,6 +1065,14 @@ impl Harness {
             bot::keep_running(start, Duration::from_millis(100), stop).await
         });
         self.bot = Some((stop, bot));
+    }
+
+    /// Waits for the bot to end by its own doing, without asking it to stop,
+    /// and returns how it ended.
+    pub async fn bot_ended(&mut self) -> Result<()> {
+        // The sender is held until then: dropping it would read as a stop.
+        let (_stop, bot) = self.bot.take().expect("the bot is running");
+        bot.await.unwrap()
     }
 
     /// Stops the bot gracefully and returns how it ended.

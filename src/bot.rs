@@ -210,6 +210,10 @@ pub async fn start(config: &Config, store: Store, keys: Arc<UnlockedKeys>) -> Re
 /// started again after `restart_delay`. The bot takes over from the account
 /// state and its journal on every start, so starting again is always safe; and
 /// doing it in the same process means a terminal that stays open is all it needs.
+///
+/// `stop` is acted on wherever it finds the bot: running, waiting to start
+/// again, or in the middle of a start. A start only reads and signs nothing, so
+/// one that is under way is simply dropped.
 pub async fn keep_running<S, Starting>(
     mut start: S,
     restart_delay: Duration,
@@ -219,7 +223,10 @@ where
     S: FnMut() -> Starting,
     Starting: Future<Output = Result<Running>>,
 {
-    let mut running = start().await?;
+    let mut running = tokio::select! {
+        () = stop.clone() => return Ok(()),
+        started = start() => started?,
+    };
     loop {
         match running.until(stop.clone()).await {
             Ok(()) => return Ok(()),
@@ -231,7 +238,11 @@ where
                 () = stop.clone() => return Ok(()),
                 () = tokio::time::sleep(restart_delay) => {}
             }
-            match start().await {
+            let started = tokio::select! {
+                () = stop.clone() => return Ok(()),
+                started = start() => started,
+            };
+            match started {
                 Ok(running) => break running,
                 Err(error) => error!("the bot could not start: {error:#}"),
             }

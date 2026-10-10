@@ -17,6 +17,7 @@ use papertrade::protocol::intents::{
 use papertrade::store::Store;
 use papertrade::strategy::decide::{Mode, Side};
 use papertrade::{bot, session_keys, tui};
+use tokio::signal::unix::{Signal, SignalKind, signal};
 use tracing::{info, warn};
 use zeroize::Zeroizing;
 
@@ -106,9 +107,11 @@ async fn main() -> Result<()> {
                 .init();
             let store = Store::open(&config.database()).await?;
             let _only_one = lock_data_dir(&config)?;
+            // Listening for Ctrl-C from here, before the password is asked for: one
+            // pressed at the prompt or while the bot is still starting is not lost.
+            let stop = shutdown_signal(interrupts()?).shared();
             // Once, here, outside the restarts below: they are handed the same keys.
             let keys = unlock_keys(&config, Terminal).await?;
-            let stop = shutdown_signal().shared();
             bot::keep_running(|| bot::start(&config, store.clone(), keys.clone()), RESTART_DELAY, stop).await
         }
         Command::Tui => tui::run(&Store::open(&config.database()).await?).await,
@@ -150,15 +153,30 @@ const RESTART_DELAY: Duration = Duration::from_secs(5);
 /// finishes the tick it is in and exits cleanly. Being killed outright is safe
 /// too, but then an intent could be left half-recorded for the next start to
 /// sort out, so there is no reason to let a closed terminal do that.
-async fn shutdown_signal() {
-    use tokio::signal::unix::{SignalKind, signal};
+///
+/// `interrupt` is a Ctrl-C listener that is already listening: see [`interrupts`].
+async fn shutdown_signal(mut interrupt: Signal) {
     let mut terminate = signal(SignalKind::terminate()).expect("installing the SIGTERM handler");
     let mut hangup = signal(SignalKind::hangup()).expect("installing the SIGHUP handler");
     tokio::select! {
-        _ = tokio::signal::ctrl_c() => {}
+        _ = interrupt.recv() => {}
         _ = terminate.recv() => {}
         _ = hangup.recv() => {}
     }
+}
+
+/// Starts listening for Ctrl-C. From then on it no longer ends the process by
+/// itself: whoever holds the listener decides.
+///
+/// The hidden prompt needs that. While it reads, `rpassword` has the terminal's
+/// own Ctrl-C handling switched off, and when it reads a Ctrl-C it raises the
+/// interrupt itself, before it has put the terminal back. With nobody listening
+/// that ends the process on the spot and leaves the terminal as it was: no
+/// Ctrl-C for whatever runs in it next, and a shell does not necessarily repair
+/// that (zsh does not). With a listener the prompt gets to return, the terminal
+/// is put back, and the command ends by its own doing.
+fn interrupts() -> Result<Signal> {
+    signal(SignalKind::interrupt()).context("listening for Ctrl-C")
 }
 
 async fn set_mode(config: &Config, mode: Mode) -> Result<()> {
@@ -319,7 +337,13 @@ impl Operator for Terminal {
 
     fn secret(&mut self, prompt: &str) -> Result<Zeroizing<String>> {
         require_terminal()?;
-        Ok(Zeroizing::new(rpassword::prompt_password(prompt).context("reading from the terminal")?))
+        let _listening = interrupts()?;
+        match rpassword::prompt_password(prompt) {
+            Ok(typed) => Ok(Zeroizing::new(typed)),
+            // Ctrl-C at the prompt. The terminal is whole again by now.
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => bail!("interrupted"),
+            Err(error) => Err(error).context("reading from the terminal"),
+        }
     }
 }
 

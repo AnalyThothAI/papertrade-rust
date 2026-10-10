@@ -157,3 +157,22 @@ async fn a_transfer_that_has_started_is_finished_after_rebalancing_is_switched_o
     .await;
     assert!(h.store.active_transfer().await.unwrap().is_none());
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stop_asked_for_while_the_bot_is_still_starting_is_acted_on_at_once() {
+    // The very first start, against an exchange that does not answer.
+    let mut h = Harness::prepare().await;
+    let begun = h.start_self_healing_bot_whose_next_start_hangs(0);
+    tokio::time::timeout(SOON, begun).await.expect("the start begins").unwrap();
+    let stopped = tokio::time::timeout(SOON, h.stop_bot()).await;
+    stopped.expect("the stop waited for a start that never ends").unwrap();
+
+    // And a start after the bot had to give up: the first run gets going and
+    // loses its feed, the one that follows never gets an answer.
+    let begun = h.start_self_healing_bot_whose_next_start_hangs(1);
+    tokio::time::timeout(SOON, begun).await.expect("the second start begins").unwrap();
+    let stopped = tokio::time::timeout(SOON, h.stop_bot()).await;
+    stopped.expect("the stop waited for a start that never ends").unwrap();
+    // A bot that never got to run sent nothing.
+    assert_eq!(h.opens(), 0);
+}

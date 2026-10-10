@@ -372,7 +372,7 @@ async fn a_bot_that_cannot_start_the_first_time_says_so_instead_of_retrying() {
     let mut h = Harness::prepare().await;
     h.config.coin = "NOPE".into();
     h.start_self_healing_bot(0);
-    let error = h.stop_bot().await.unwrap_err().to_string();
+    let error = h.bot_ended().await.unwrap_err().to_string();
     assert!(error.contains("NOPE is not listed on Papertrade"), "{error}");
 }
 
@@ -413,7 +413,7 @@ async fn a_bot_handed_the_keys_of_other_accounts_does_not_start() {
     let mut h = Harness::prepare().await;
     h.keys = Arc::new(support::session_keys(h.short, h.long));
     h.start_self_healing_bot(0);
-    let error = h.stop_bot().await.unwrap_err().to_string();
+    let error = h.bot_ended().await.unwrap_err().to_string();
     assert!(error.contains("but its keys were unlocked for"), "{error}");
     assert!(h.sim.received().is_empty());
 }
