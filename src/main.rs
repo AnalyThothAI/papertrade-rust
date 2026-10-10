@@ -110,13 +110,19 @@ fn lock_data_dir(config: &Config) -> Result<fs::File> {
 /// How long to wait before starting over after the bot stopped on its own.
 const RESTART_DELAY: Duration = Duration::from_secs(5);
 
-/// Resolves on Ctrl-C or SIGTERM.
+/// Resolves when the operator asks the bot to stop: Ctrl-C, SIGTERM, or the
+/// terminal it runs in going away (SIGHUP). All three end the same way: the bot
+/// finishes the tick it is in and exits cleanly. Being killed outright is safe
+/// too, but then an intent could be left half-recorded for the next start to
+/// sort out, so there is no reason to let a closed terminal do that.
 async fn shutdown_signal() {
-    let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-        .expect("installing the SIGTERM handler");
+    use tokio::signal::unix::{SignalKind, signal};
+    let mut terminate = signal(SignalKind::terminate()).expect("installing the SIGTERM handler");
+    let mut hangup = signal(SignalKind::hangup()).expect("installing the SIGHUP handler");
     tokio::select! {
         _ = tokio::signal::ctrl_c() => {}
         _ = terminate.recv() => {}
+        _ = hangup.recv() => {}
     }
 }
 
