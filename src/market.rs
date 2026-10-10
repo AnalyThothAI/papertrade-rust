@@ -11,9 +11,6 @@ use hypersdk::hypercore::{self, Incoming, Subscription, ws::Event};
 use rust_decimal::prelude::ToPrimitive;
 use tokio::sync::watch;
 
-/// A quote older than this is treated as unknown.
-const MAX_AGE: Duration = Duration::from_secs(5);
-
 #[derive(Debug, Clone, Copy)]
 pub struct Quote {
     mid: u64,
@@ -21,9 +18,14 @@ pub struct Quote {
 }
 
 impl Quote {
+    /// A mid in wire scale, observed now.
+    pub fn new(mid: u64) -> Self {
+        Self { mid, at: Instant::now() }
+    }
+
     /// The mid in wire scale, or `None` once the quote is too old to act on.
-    pub fn fresh_mid(self) -> Option<u64> {
-        (self.at.elapsed() <= MAX_AGE).then_some(self.mid)
+    pub fn fresh_mid(self, max_age: Duration) -> Option<u64> {
+        (self.at.elapsed() <= max_age).then_some(self.mid)
     }
 }
 
@@ -36,7 +38,7 @@ pub async fn follow_price(coin: String, price_decimals: u32, quote: watch::Sende
             Event::Message(Incoming::Bbo(bbo)) => {
                 let (Some(bid), Some(ask)) = (bbo.bid(), bbo.ask()) else { continue };
                 if let Some(mid) = mid_raw(bid.px, ask.px, price_decimals) {
-                    quote.send_replace(Some(Quote { mid, at: Instant::now() }));
+                    quote.send_replace(Some(Quote::new(mid)));
                 }
             }
             Event::Disconnected => {

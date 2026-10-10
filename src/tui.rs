@@ -134,7 +134,8 @@ fn draw_header(frame: &mut Frame, area: Rect, screen: &Screen) {
             _ => Color::Green,
         };
         decision = Line::from(vec![
-            Span::from(format!("{} ▸ ", status.decision.to_uppercase())).bold().fg(color),
+            Span::from(format!(" {} ", status.phase.to_string().to_uppercase())).black().on_white(),
+            Span::from(format!(" {} ▸ ", status.decision.to_uppercase())).bold().fg(color),
             Span::from(status.summary.clone()).fg(color),
         ]);
     }
@@ -345,6 +346,7 @@ mod tests {
                 mode: Mode::Run,
                 coin: "BTC".into(),
                 close_bps: 100,
+                phase: crate::strategy::decide::Phase::Hedged,
                 decision: "wait".into(),
                 summary: "hedged; price is inside the target".into(),
                 mid: Some("83100.5".into()),
@@ -391,7 +393,7 @@ mod tests {
         for expected in [
             "RUN",
             "live",
-            "WAIT ▸ hedged; price is inside the target",
+            "HEDGED  WAIT ▸ hedged; price is inside the target",
             "mid 83100.5",
             "move +48.4 bps of ±100 target",
             "relayer refuses nothing",

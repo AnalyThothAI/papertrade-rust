@@ -14,12 +14,29 @@ use super::wire::IntentOutcome;
 
 /// Upper bound for the silence allowed before the connection is treated as dead.
 const MAX_SILENCE: Duration = Duration::from_secs(45);
-/// The server only sends a frame when the wallet changes, so an idle wallet's
-/// indexed-through time stands still. Reconnecting yields a full snapshot taken
-/// at the indexer's current position, which also covers any patch that was lost.
-const RESYNC: Duration = Duration::from_secs(30);
-const RETRY: Duration = Duration::from_secs(1);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+#[derive(Debug, Clone, Copy)]
+pub struct StreamTiming {
+    /// The server only sends a frame when the wallet changes, so an idle wallet's
+    /// indexed-through time stands still. Reconnecting this often yields a full
+    /// snapshot taken at the indexer's current position, which also covers any
+    /// patch that was lost.
+    pub resync: Duration,
+    /// Wait before reconnecting after a failure; doubles up to `retry_max` while failures repeat.
+    pub retry_min: Duration,
+    pub retry_max: Duration,
+}
+
+impl Default for StreamTiming {
+    fn default() -> Self {
+        Self {
+            resync: Duration::from_secs(30),
+            retry_min: Duration::from_secs(1),
+            retry_max: Duration::from_secs(30),
+        }
+    }
+}
 
 enum End {
     /// Planned: time for a fresh snapshot. The held state stays valid meanwhile.
@@ -36,6 +53,7 @@ enum End {
 /// data.
 pub async fn follow_account(
     url: String,
+    timing: StreamTiming,
     state: watch::Sender<Option<AccountState>>,
     outcomes: mpsc::Sender<IntentOutcome>,
 ) {
@@ -44,11 +62,17 @@ pub async fn follow_account(
         .connect_timeout(CONNECT_TIMEOUT)
         .build()
         .expect("default HTTP client configuration is valid");
+    let mut retry = timing.retry_min;
     loop {
-        if let End::Lost(reason) = connection(&http, &url, &state, &outcomes).await {
-            state.send_replace(None);
-            warn!(%reason, "account stream lost");
-            sleep(RETRY).await;
+        match connection(&http, &url, timing.resync, &state, &outcomes).await {
+            // A connection that lasted until its resync was healthy.
+            End::Resync => retry = timing.retry_min,
+            End::Lost(reason) => {
+                state.send_replace(None);
+                warn!(%reason, retry_in = ?retry, "account stream lost");
+                sleep(retry).await;
+                retry = (retry * 2).min(timing.retry_max);
+            }
         }
     }
 }
@@ -56,6 +80,7 @@ pub async fn follow_account(
 async fn connection(
     http: &reqwest::Client,
     url: &str,
+    resync: Duration,
     state: &watch::Sender<Option<AccountState>>,
     outcomes: &mpsc::Sender<IntentOutcome>,
 ) -> End {
@@ -69,7 +94,7 @@ async fn connection(
         Ok(response) => response.bytes_stream().eventsource(),
         Err(error) => return End::Lost(error.to_string()),
     };
-    let resync_at = Instant::now() + RESYNC;
+    let resync_at = Instant::now() + resync;
     let mut silence = MAX_SILENCE;
     // Every connection starts over from a full snapshot.
     let mut held: Option<AccountState> = None;

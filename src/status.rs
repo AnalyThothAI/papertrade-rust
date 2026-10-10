@@ -5,7 +5,7 @@ use alloy::primitives::{I256, U256};
 use serde::{Deserialize, Serialize};
 
 use crate::protocol::deployment::USD_DECIMALS;
-use crate::strategy::decide::{Mode, Side};
+use crate::strategy::decide::{Mode, Phase, Side};
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Snapshot {
@@ -14,6 +14,8 @@ pub struct Snapshot {
     pub mode: Mode,
     pub coin: String,
     pub close_bps: u32,
+    /// Where the two legs stand.
+    pub phase: Phase,
     /// `wait`, `open` or `close`.
     pub decision: String,
     /// The decision in words: what the bot is doing or why it is waiting.
