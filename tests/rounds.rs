@@ -605,7 +605,7 @@ mod funding {
 
     use alloy::primitives::{Address, U256};
     use alloy::signers::local::PrivateKeySigner;
-    use papertrade::keystore::WalletKey;
+    use papertrade::keystore::{AccountKeys, UnlockedKeys, WalletKey};
     use papertrade::protocol::deployment::usd;
     use papertrade::status::Snapshot;
     use papertrade::store::Abandoned;
@@ -1715,4 +1715,337 @@ mod funding {
         .await;
         assert_eq!(h.sim.count(h.short, "registerSessionKey"), 1);
     }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_unrelated_withdrawal_receipt_keeps_the_original_deadline_and_does_not_pay_twice() {
+        let mut h = Harness::prepare_with(Setup { long_usd: 1_150, short_usd: 550, ..rebalancing() }).await;
+        h.config.intent_ttl_seconds = 1;
+        h.timing.funding.transfer.settle = Duration::from_millis(50);
+        h.sim.script(h.long, "withdrawToCore", &[Behavior::WrongReceipt]);
+        h.start_bot();
+        h.hedged().await;
+        eventually_stored("the foreign receipt is recorded as unknown", SOON, || async {
+            h.store
+                .recent_intents(10)
+                .await
+                .unwrap()
+                .iter()
+                .any(|r| r.action == "withdrawToCore" && r.status == "unknown")
+        })
+        .await;
+        let expected = withdrawals(&h)[0].intent_id;
+        assert!(h.store.unresolved_intents().await.unwrap().iter().any(|r| r.intent_id == expected));
+        steadily("no second withdrawal before the original deadline", A_WHILE, || withdrawals(&h).len() == 1)
+            .await;
+        eventually("the expired original request is retried", SOON, || withdrawals(&h).len() == 2).await;
+        eventually("only the second withdrawal funds a send", SOON, || h.sim.sends().len() == 1).await;
+        transfer_finished(&h).await;
+        // First request never executed; only the retried withdrawal funded one send.
+        assert_eq!(h.sim.sends().len(), 1);
+        assert_eq!(h.sim.sends()[0].amount_usdc, 300);
+    }
+
+    fn small_transfer() -> Setup {
+        Setup { long_usd: 610, short_usd: 590, ..rebalancing() }
+    }
+
+    fn swap_wallet_roles(h: &mut Harness) {
+        let copy = |account: &AccountKeys| AccountKeys {
+            owner: account.owner,
+            session: account.session.clone(),
+            wallet: WalletKey::Loaded(account.wallet.signer().unwrap().clone()),
+        };
+        h.keys = Arc::new(UnlockedKeys { long: copy(&h.keys.short), short: copy(&h.keys.long) });
+        std::mem::swap(&mut h.config.long_account, &mut h.config.short_account);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn swapping_wallet_roles_cannot_rebind_a_credit_baseline() {
+        let mut h = Harness::prepare_with(lopsided()).await;
+        h.sim.pause("openPosition");
+        h.sim.set_sweep(Sweep::Never);
+        h.start_bot();
+        in_stage(&h, Stage::Credit).await;
+        let original = h.store.active_transfer().await.unwrap().unwrap();
+        assert_eq!((original.from_wallet, original.to_wallet), (Some(h.long), Some(h.short)));
+        h.kill_bot().await;
+        swap_wallet_roles(&mut h);
+        h.start_bot();
+        status_when(&h, "the old wallet binding prevents recovery with swapped roles", |status| {
+            status.transfer.as_ref().is_some_and(|transfer| {
+                transfer.stage == "credit"
+                    && transfer.note.as_ref().is_some_and(|note| note.contains("restore"))
+            })
+        })
+        .await;
+        tokio::time::sleep(A_WHILE).await;
+        assert_eq!(h.store.active_transfer().await.unwrap(), Some(original));
+        assert_eq!(h.sim.sends().len(), 1);
+        // Actual credit while the roles are swapped still cannot finish the old
+        // transfer; restoring its recorded owners resumes the same payment.
+        h.sim.set_sweep(Sweep::After(Duration::ZERO));
+        eventually("the original receiver is credited", SOON, || h.sim.balance(h.short) == usd(LEVELLED))
+            .await;
+        h.kill_bot().await;
+        swap_wallet_roles(&mut h);
+        h.start_bot();
+        transfer_finished(&h).await;
+        assert_eq!(withdrawals(&h).len(), 1);
+        assert_eq!(h.sim.sends().len(), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn hypercore_arrival_does_not_release_an_unindexed_withdrawal() {
+        let mut h = Harness::prepare_with(lopsided()).await;
+        h.timing.stream.resync = Duration::from_secs(60);
+        h.sim.pause("openPosition");
+        h.sim.hold_account_frames(h.long);
+        h.start_bot();
+        eventually("withdrawal has arrived on Core ahead of its account patch", SOON, || {
+            h.sim.core_usdc(h.long) == usd(MOVED)
+        })
+        .await;
+        tokio::time::sleep(A_WHILE).await;
+        assert_eq!(transfer_stage(&h).await, Some(Stage::Withdraw));
+        assert_eq!(h.sim.sends().len(), 0);
+        h.sim.release_account_frames(h.long);
+        transfer_finished(&h).await;
+        assert_eq!(withdrawals(&h).len(), 1);
+        assert_eq!(h.sim.sends().len(), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_small_credit_is_not_completed_by_realized_profit() {
+        let mut h = Harness::prepare_with(small_transfer()).await;
+        h.sim.hold_arrivals();
+        h.sim.set_sweep(Sweep::Never);
+        h.start_bot();
+        h.hedged().await;
+        h.sim.pause("openPosition");
+        h.sim.release_arrivals();
+        in_stage(&h, Stage::Credit).await;
+        assert_eq!(h.sim.sends()[0].amount_usdc, 10);
+        h.sim.pause("withdrawToCore");
+        h.sim.set_mid(ENTRY - TARGET);
+        h.flat().await;
+        assert!(h.sim.balance(h.short) > usd(590 + 10));
+        tokio::time::sleep(A_WHILE).await;
+        assert_eq!(transfer_stage(&h).await, Some(Stage::Credit));
+        h.sim.set_sweep(Sweep::After(Duration::ZERO));
+        transfer_finished(&h).await;
+        assert_eq!(h.sim.balance(h.short), usd(100) + won());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_credit_received_with_realized_loss_survives_a_restart() {
+        let mut h = Harness::prepare_with(small_transfer()).await;
+        h.sim.hold_arrivals();
+        h.sim.set_sweep(Sweep::Never);
+        h.start_bot();
+        h.hedged().await;
+        h.sim.pause("openPosition");
+        h.sim.release_arrivals();
+        in_stage(&h, Stage::Credit).await;
+        h.kill_bot().await;
+        h.sim.pause("withdrawToCore");
+        // Both the cash credit and a losing settlement happen while it is down.
+        h.sim.set_mid(ENTRY + TARGET);
+        h.sim.settle_positions(h.long);
+        h.sim.settle_positions(h.short);
+        h.sim.set_sweep(Sweep::After(Duration::ZERO));
+        eventually("10 USDC credited despite the receiver's 100 USDC loss", SOON, || {
+            h.sim.balance(h.short) == usd(500)
+        })
+        .await;
+        h.timing.funding.transfer.stuck_after = Duration::from_millis(300);
+        h.start_bot();
+        transfer_finished(&h).await;
+        assert_eq!(withdrawals(&h).len(), 1);
+        assert_eq!(h.sim.sends().len(), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_refused_withdrawal_can_retry_after_the_sender_realizes_a_loss() {
+        let mut h = Harness::prepare_with(Setup { long_usd: 1_150, short_usd: 550, ..rebalancing() }).await;
+        h.timing.funding.transfer.settle = Duration::from_secs(1);
+        h.sim.script(
+            h.long,
+            "withdrawToCore",
+            &[Behavior::Reject("admission_rejected", "temporary"), Behavior::Hold],
+        );
+        h.start_bot();
+        h.hedged().await;
+        eventually("the first withdrawal was refused", SOON, || withdrawals(&h).len() == 1).await;
+        h.sim.pause("openPosition");
+        h.sim.set_mid(ENTRY - TARGET);
+        h.flat().await;
+        assert_eq!(h.sim.balance(h.long), usd(1_050));
+        eventually("the unchanged cash withdrawal total permits retry", SOON, || withdrawals(&h).len() == 2)
+            .await;
+        assert_eq!(transfer_stage(&h).await, Some(Stage::Withdraw));
+        assert_eq!(h.sim.sends().len(), 0);
+    }
+
+    async fn slow_funding_reply_does_not_delay_a_close(action: &str) {
+        let mut h = Harness::prepare_with(small_transfer()).await;
+        h.sim.hold_replies(action);
+        h.sim.set_sweep(Sweep::Never);
+        h.start_bot();
+        h.hedged().await;
+        eventually("the funding request is waiting on its reply", SOON, || match action {
+            "withdrawToCore" => !withdrawals(&h).is_empty(),
+            "hlSend" => !h.sim.sends().is_empty(),
+            "checkDeposit" => h.sim.deposit_checks(h.short) > 0,
+            _ => unreachable!(),
+        })
+        .await;
+        h.sim.pause("openPosition");
+        h.sim.pause("withdrawToCore");
+        h.sim.set_mid(ENTRY + TARGET);
+        // The withheld reply never returns until after both legs are flat.
+        h.flat().await;
+        assert_eq!(h.closes(), 2);
+        assert_eq!(withdrawals(&h).len(), 1);
+        assert!(h.sim.sends().len() <= 1);
+        h.sim.release_replies(action);
+        h.sim.set_sweep(Sweep::After(Duration::ZERO));
+        transfer_finished(&h).await;
+        assert_eq!(h.sim.sends().len(), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_slow_withdrawal_reply_does_not_delay_a_close() {
+        slow_funding_reply_does_not_delay_a_close("withdrawToCore").await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_slow_hyperliquid_reply_does_not_delay_a_close() {
+        slow_funding_reply_does_not_delay_a_close("hlSend").await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_slow_deposit_check_reply_does_not_delay_a_close() {
+        slow_funding_reply_does_not_delay_a_close("checkDeposit").await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_slow_registration_reply_does_not_delay_a_close() {
+        let mut h = Harness::prepare_with(rebalancing()).await;
+        h.start_bot();
+        h.hedged().await;
+        h.sim.hold_replies("registerSessionKey");
+        let soon = papertrade::store::now_ms() as u64 / 1000 + 2 * 86_400;
+        h.sim.set_session_key_expiry(h.long, h.keys.long.session.address(), soon);
+        eventually("renewal is waiting on its reply", SOON, || {
+            h.sim.count(h.long, "registerSessionKey") == 1
+        })
+        .await;
+        h.sim.pause("openPosition");
+        h.sim.set_mid(ENTRY + TARGET);
+        h.flat().await;
+        assert_eq!(h.closes(), 2);
+        h.sim.release_replies("registerSessionKey");
+    }
+
+    async fn a_kill_during_a_funding_reply_keeps_one_payment(action: &str) {
+        let mut h = Harness::prepare_with(small_transfer()).await;
+        h.sim.hold_replies(action);
+        h.sim.set_sweep(Sweep::Never);
+        h.start_bot();
+        h.hedged().await;
+        h.sim.pause("openPosition");
+        eventually("the signed request left before its reply", SOON, || {
+            if action == "hlSend" { !h.sim.sends().is_empty() } else { !withdrawals(&h).is_empty() }
+        })
+        .await;
+        h.kill_bot().await;
+        h.sim.release_replies(action);
+        h.sim.pause("withdrawToCore");
+        h.sim.set_sweep(Sweep::After(Duration::ZERO));
+        h.start_bot();
+        transfer_finished(&h).await;
+        assert_eq!(withdrawals(&h).len(), 1);
+        assert_eq!(h.sim.sends().len(), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_kill_during_an_unanswered_withdrawal_does_not_withdraw_twice() {
+        a_kill_during_a_funding_reply_keeps_one_payment("withdrawToCore").await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_kill_during_an_unanswered_send_does_not_pay_twice() {
+        a_kill_during_a_funding_reply_keeps_one_payment("hlSend").await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn missing_cashflow_evidence_holds_only_rebalancing() {
+        let mut h = Harness::prepare_with(small_transfer()).await;
+        h.sim.set_cashflows_visible(h.short, false);
+        h.start_bot();
+        h.hedged().await;
+        let status = planned_but_held_by(&h, "account cashflow totals unavailable").await;
+        assert_eq!(status.phase, Phase::Hedged);
+        assert!(withdrawals(&h).is_empty());
+        h.sim.pause("openPosition");
+        h.sim.set_mid(ENTRY + TARGET);
+        h.flat().await;
+        assert_eq!(h.closes(), 2);
+        assert!(withdrawals(&h).is_empty());
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn failed_history_is_unknown_then_recovers_and_becomes_stale_without_holding_closes() {
+    let mut h = Harness::prepare().await;
+    h.sim.set_history_readable(false);
+    h.start_bot();
+    h.hedged().await;
+    let wallet = format!("{:#x}", h.long);
+    eventually_stored("the failed first history fetch is recorded", SOON, || async {
+        h.store.ledger_sync(&wallet).await.unwrap().is_some_and(|s| s.latest_error.is_some())
+    })
+    .await;
+    let report = papertrade::tui::report(&h.store).await.unwrap();
+    assert!(report.contains("history unknown"), "{report}");
+    assert!(!report.contains("actual cost"), "{report}");
+    h.sim.pause("openPosition");
+    h.sim.set_mid(ENTRY + TARGET);
+    h.flat().await;
+    assert_eq!(h.closes(), 2);
+    h.sim.set_history_readable(true);
+    eventually_stored("both settled positions are fully synchronized", SOON, || async {
+        let long = h.store.ledger_sync(&wallet).await.unwrap();
+        let short = h.store.ledger_sync(&format!("{:#x}", h.short)).await.unwrap();
+        [long, short]
+            .iter()
+            .all(|s| s.as_ref().is_some_and(|s| s.complete && s.is_fresh(papertrade::store::now_ms())))
+            && h.store.totals().await.unwrap().trades == 2
+    })
+    .await;
+    assert!(papertrade::tui::report(&h.store).await.unwrap().contains("actual cost"));
+    h.sim.set_history_readable(false);
+    eventually_stored("an error marks the last successful history stale", SOON, || async {
+        h.store.ledger_sync(&wallet).await.unwrap().is_some_and(|s| s.latest_error.is_some())
+    })
+    .await;
+    let report = papertrade::tui::report(&h.store).await.unwrap();
+    assert!(report.contains("stale: request failed") && report.contains("recorded cost"), "{report}");
+    assert!(!report.contains("actual cost"), "{report}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_history_longer_than_one_page_is_fully_imported_and_not_duplicated() {
+    let mut h = Harness::prepare().await;
+    h.sim.seed_settled_trades(h.long, 76);
+    h.sim.pause("openPosition");
+    h.start_bot();
+    eventually_stored("all 76 positions are in the ledger", SOON, || async {
+        h.store.totals().await.unwrap().trades == 76
+    })
+    .await;
+    tokio::time::sleep(A_WHILE).await;
+    assert_eq!(h.store.totals().await.unwrap().trades, 76);
+    let sync = h.store.ledger_sync(&format!("{:#x}", h.long)).await.unwrap().unwrap();
+    assert!(sync.complete && sync.is_fresh(papertrade::store::now_ms()));
 }

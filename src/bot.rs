@@ -310,6 +310,7 @@ pub async fn start_with(
         let (sender, account) = watch::channel(None);
         tasks.spawn(follow_account(
             client.account_stream_url(wallet),
+            wallet,
             timing.stream,
             sender,
             outcome_sender.clone(),
@@ -356,9 +357,17 @@ pub async fn start_with(
     let (status, latest_status) = watch::channel(None);
     tasks.spawn(follow_status(store.clone(), latest_status));
 
-    let funding =
-        funding::Funding::start(&mut tasks, &store, &keys, deposit_chain, hypercore, &timing.funding, config)
-            .await?;
+    let funding = funding::Funding::start(
+        &mut tasks,
+        &store,
+        client.clone(),
+        &keys,
+        deposit_chain,
+        hypercore,
+        &timing.funding,
+        config,
+    )
+    .await?;
     let ttl_ms = i64::try_from(config.intent_ttl_seconds * 1000)?;
     let bot = Bot {
         dry_run: config.dry_run,
@@ -430,7 +439,11 @@ impl Running {
 
 impl Bot {
     async fn tick(&mut self) {
+        self.collect_funding();
         while let Ok(outcome) = self.outcomes.try_recv() {
+            // Started is sent before HTTP; once its outcome arrives, collect
+            // that update before choosing the journal owner or marking failure.
+            self.collect_funding();
             let failed = is_failure(&outcome.outcome);
             if failed {
                 warn!(intent_id = %outcome.intent_id, outcome = %outcome.outcome, "intent did not succeed");
@@ -438,8 +451,12 @@ impl Bot {
             for entry in self.inflight.iter_mut().filter(|entry| entry.intent_id == outcome.intent_id) {
                 entry.failed = failed;
             }
-            let recorded = self.store.set_outcome(outcome.intent_id, &outcome.outcome).await;
-            self.best_effort("recording an intent outcome", recorded);
+            if self.is_funding_intent(outcome.intent_id) {
+                self.funding_outcome(outcome.intent_id, &outcome.outcome);
+            } else {
+                let recorded = self.store.set_outcome(outcome.intent_id, &outcome.outcome).await;
+                self.best_effort("recording an intent outcome", recorded);
+            }
         }
 
         let accounts = PerSide {
@@ -452,7 +469,6 @@ impl Bot {
         if let Some(mode) = self.best_effort("reading the operator's mode", mode) {
             self.mode = mode;
         }
-        self.notice_abandoned_transfer().await;
         let trading = fresh(&self.trading, self.timing.state_poll);
         let queue_total = fresh(&self.queue_total, self.timing.state_poll);
         let max_age = self.timing.quote_max_age;
@@ -508,7 +524,7 @@ impl Bot {
             self.status.send_replace(Some(snapshot));
             self.status_at = Instant::now();
         }
-        self.report_held_transfer(funds.as_ref()).await;
+        self.report_held_transfer(funds.as_ref());
 
         let open_positions = Side::BOTH
             .iter()
@@ -521,6 +537,7 @@ impl Bot {
         }
 
         if self.dry_run {
+            self.dispatch_funding();
             return;
         }
         match decision {
@@ -538,10 +555,11 @@ impl Bot {
         // requests; and whatever the legs hold, because a transfer is planned
         // by what the accounts hold, and one that has begun has to be seen through.
         if let Some((from, to, amount_usdc)) = funds.as_ref().and_then(funding::FundsView::to_start) {
-            self.start_transfer(from, to, amount_usdc).await;
+            self.start_transfer(from, to, amount_usdc);
         }
-        self.advance_transfer(&accounts).await;
-        self.register_session_keys(&accounts, trading.as_ref()).await;
+        self.advance_transfer(&accounts);
+        self.register_session_keys(&accounts, trading.as_ref());
+        self.dispatch_funding();
     }
 
     /// The database makes the bot durable and visible, but it must never stand
@@ -563,7 +581,8 @@ impl Bot {
     async fn track_inflight(&mut self, accounts: &PerSide<Option<AccountState>>) {
         let mut still_inflight = Vec::with_capacity(self.inflight.len());
         for entry in std::mem::take(&mut self.inflight) {
-            let (intent_id, side, was_seen) = (entry.intent_id, entry.side, entry.seen_queued);
+            let (intent_id, side, was_seen, funding) =
+                (entry.intent_id, entry.side, entry.seen_queued, !entry.kind.is_trade());
             let recorded = match track(entry, accounts.get(side).as_ref()) {
                 Some(tracked) => {
                     let newly_seen = tracked.seen_queued && !was_seen;
@@ -571,7 +590,15 @@ impl Bot {
                     if !newly_seen {
                         continue;
                     }
+                    if funding {
+                        self.funding_seen(intent_id);
+                        continue;
+                    }
                     self.store.mark_seen_queued(intent_id).await
+                }
+                None if funding => {
+                    self.funding_settled(intent_id);
+                    continue;
                 }
                 None => self.store.mark_settled(intent_id).await,
             };
@@ -666,11 +693,7 @@ impl Bot {
         let (id, action) = (intent.intent_id, intent.action.as_str());
         let (journaled, summary) = match result {
             Ok(receipt) => {
-                if receipt.intent_id != id {
-                    error!(%id, relayer = %receipt.intent_id, "relayer derived a different intent id");
-                }
                 for entry in self.inflight.iter_mut().filter(|entry| entry.intent_id == id) {
-                    entry.intent_id = receipt.intent_id;
                     entry.queue_revision = Some(receipt.queue_revision.0);
                 }
                 info!(%side, action, %id, state = %receipt.state, "intent accepted");
@@ -921,6 +944,7 @@ async fn follow_ledger(
     every: Duration,
     wake: Arc<Notify>,
 ) {
+    let max_age_ms = duration_ms(every.saturating_mul(3));
     let mut every = interval(every);
     every.set_missed_tick_behavior(MissedTickBehavior::Delay);
     loop {
@@ -929,14 +953,23 @@ async fn follow_ledger(
             () = wake.notified() => {}
         }
         for (side, wallet) in wallets {
-            if let Err(error) = sync_ledger(&client, &store, side, wallet).await {
+            if let Err(error) = sync_ledger(&client, &store, side, wallet, max_age_ms).await {
+                if let Err(recording) = store.record_ledger_failure(wallet, &error.to_string()).await {
+                    warn!(%side, error = %recording, "recording the ledger sync failure failed");
+                }
                 warn!(%side, %error, "ledger sync failed");
             }
         }
     }
 }
 
-async fn sync_ledger(client: &Client, store: &Store, side: Side, wallet: Address) -> Result<()> {
+async fn sync_ledger(
+    client: &Client,
+    store: &Store,
+    side: Side,
+    wallet: Address,
+    max_age_ms: i64,
+) -> Result<()> {
     let trades = client.trades(wallet).await?;
     for trade in store.record_trades(wallet, side, &trades).await? {
         let summary = format!(
@@ -949,6 +982,7 @@ async fn sync_ledger(client: &Client, store: &Store, side: Side, wallet: Address
         info!("{summary}");
         store.record_event("trade", &summary, None).await?;
     }
+    store.record_ledger_success(wallet, true, max_age_ms).await?;
     Ok(())
 }
 

@@ -316,8 +316,22 @@ impl Trade {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct TradePage {
     pub items: Vec<Trade>,
+    // Official frontend index-Tu4xzYeT.js, history schema `mg` and request
+    // `_g`: a nullable opaque cursor, required even on the last page. The
+    // empty production reply captured 2026-10-10 is trades-empty.json.
+    #[serde(deserialize_with = "history_cursor")]
+    pub next_cursor: Option<String>,
+}
+
+fn history_cursor<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Option<String>, D::Error> {
+    let cursor = Option::<String>::deserialize(deserializer)?;
+    if cursor.as_ref().is_some_and(|cursor| cursor.is_empty() || cursor.len() > 2048) {
+        return Err(de::Error::custom("history cursor must contain 1 to 2048 bytes"));
+    }
+    Ok(cursor)
 }
 
 // --- /state/user/live --------------------------------------------------------
@@ -404,6 +418,33 @@ pub struct Funds {
     pub available_balance: Dec,
 }
 
+/// Actual cash credited to and debited from the Exchange, from the account's
+/// lifetime statistics. Trades and their fees do not change these counters.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(from = "FundingTotalsWire")]
+pub struct FundingTotals {
+    pub deposited: U256,
+    pub withdrawn: U256,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct FundingTotalsWire {
+    deposited_raw: Dec,
+    withdrawn_raw: Dec,
+}
+
+impl From<FundingTotalsWire> for FundingTotals {
+    fn from(wire: FundingTotalsWire) -> Self {
+        Self { deposited: wire.deposited_raw.0, withdrawn: wire.withdrawn_raw.0 }
+    }
+}
+
+/// Absent means unchanged on a patch; an explicit null is not a cash reading.
+fn funding_totals<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Option<FundingTotals>, D::Error> {
+    FundingTotals::deserialize(deserializer).map(Some)
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct WalletSnapshot {
@@ -417,6 +458,9 @@ pub struct WalletSnapshot {
     pub queue_revision: Dec,
     pub queued: Dec,
     pub funds: Funds,
+    /// Missing cash evidence disables funding actions, not management of positions.
+    #[serde(default, rename = "lifetime", deserialize_with = "funding_totals")]
+    pub funding_totals: Option<FundingTotals>,
     pub operations: Vec<Operation>,
     pub open_positions: Vec<Position>,
 }
@@ -439,6 +483,9 @@ pub struct WalletPatch {
     pub account_revision: u64,
     pub base_account_revision: u64,
     pub state: WalletChanges,
+    /// Top-level on a patch, exactly as in the official frontend's account fold.
+    #[serde(default, rename = "lifetime", deserialize_with = "funding_totals")]
+    pub funding_totals: Option<FundingTotals>,
     pub intent_outcomes: Option<Vec<IntentOutcome>>,
     pub added_positions: Vec<Position>,
     pub removed_position_ids: Vec<Dec>,
@@ -642,7 +689,22 @@ mod tests {
         assert_eq!(trade.paper_minted_raw.0, usd(9_800));
 
         // Production today: no trades yet.
-        let empty: TradePage = serde_json::from_value(json!({ "items": [], "nextCursor": null })).unwrap();
+        let empty: TradePage =
+            serde_json::from_str(include_str!("../../tests/fixtures/trades-empty.json")).unwrap();
         assert!(empty.items.is_empty());
+        assert_eq!(empty.next_cursor, None);
+    }
+
+    #[test]
+    fn a_history_page_requires_an_explicit_valid_cursor() {
+        assert!(serde_json::from_value::<TradePage>(json!({ "items": [] })).is_err());
+        for cursor in ["".to_owned(), "x".repeat(2049)] {
+            assert!(
+                serde_json::from_value::<TradePage>(json!({ "items": [], "nextCursor": cursor })).is_err()
+            );
+        }
+        let page: TradePage =
+            serde_json::from_value(json!({ "items": [], "nextCursor": "opaque+/=&?" })).unwrap();
+        assert_eq!(page.next_cursor.as_deref(), Some("opaque+/=&?"));
     }
 }

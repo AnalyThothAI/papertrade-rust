@@ -69,6 +69,8 @@ struct TransferRow {
     started_at_ms: i64,
     from_side: String,
     to_side: String,
+    from_wallet: Option<String>,
+    to_wallet: Option<String>,
     amount_usdc: i64,
     stage: String,
     attempts: i64,
@@ -76,6 +78,7 @@ struct TransferRow {
     core_baseline: Option<String>,
     sender_baseline: Option<String>,
     receiver_baseline: Option<String>,
+    cashflow_baselines: bool,
     withdraw_intent: Option<String>,
     send_nonce: Option<i64>,
     checked_at_ms: Option<i64>,
@@ -91,6 +94,8 @@ impl TryFrom<TransferRow> for Transfer {
             id: row.id,
             from: serde_json::from_value(Value::String(row.from_side))?,
             to: serde_json::from_value(Value::String(row.to_side))?,
+            from_wallet: row.from_wallet.map(|wallet| wallet.parse()).transpose()?,
+            to_wallet: row.to_wallet.map(|wallet| wallet.parse()).transpose()?,
             amount_usdc: u64::try_from(row.amount_usdc)?,
             stage: Stage::parse(&row.stage)
                 .with_context(|| format!("unknown transfer stage {:?}", row.stage))?,
@@ -100,6 +105,7 @@ impl TryFrom<TransferRow> for Transfer {
             core_baseline: amount(row.core_baseline)?,
             sender_baseline: amount(row.sender_baseline)?,
             receiver_baseline: amount(row.receiver_baseline)?,
+            cashflow_baselines: row.cashflow_baselines,
             withdraw_intent: row.withdraw_intent.map(|text| text.parse()).transpose()?,
             send_nonce: row.send_nonce.map(u64::try_from).transpose()?,
             checked_at_ms: row.checked_at_ms,
@@ -131,6 +137,25 @@ impl Totals {
     /// What one PAPER has cost so far, in USD.
     pub fn cost_per_paper(&self) -> Option<f64> {
         (self.paper_minted > 0.0).then(|| -self.net_pnl_usd / self.paper_minted)
+    }
+}
+
+/// How much the account's history has actually confirmed about the local ledger.
+/// Persisted independently of the bot's status: a restart must not turn old
+/// totals, or a history request that never succeeded, into current figures.
+#[derive(Debug, Clone, PartialEq, Eq, sqlx::FromRow)]
+pub struct LedgerSync {
+    pub last_success_ms: Option<i64>,
+    pub attempted_at_ms: i64,
+    pub complete: bool,
+    pub max_age_ms: i64,
+    pub latest_error: Option<String>,
+}
+
+impl LedgerSync {
+    pub fn is_fresh(&self, at_ms: i64) -> bool {
+        self.latest_error.is_none()
+            && self.last_success_ms.is_some_and(|success| at_ms.saturating_sub(success) <= self.max_age_ms)
     }
 }
 
@@ -369,20 +394,34 @@ impl Store {
     // --- transfers ----------------------------------------------------------------
 
     /// Starts a transfer of whole USDC. Fails while another one is unfinished.
-    pub async fn create_transfer(&self, from: Side, to: Side, amount_usdc: u64) -> Result<Transfer> {
+    pub async fn create_transfer(
+        &self,
+        from: Side,
+        to: Side,
+        amount_usdc: u64,
+        from_wallet: Address,
+        to_wallet: Address,
+    ) -> Result<Transfer> {
+        anyhow::ensure!(from_wallet != to_wallet, "a transfer needs two distinct wallet owners");
         let now = now_ms();
         let created = sqlx::query(
-            "INSERT INTO transfers (started_at_ms, from_side, to_side, amount_usdc, stage, attempts, attempt_at_ms)
-             VALUES (?, ?, ?, ?, 'withdraw', 0, ?)",
+            "INSERT INTO transfers (started_at_ms, from_side, to_side, amount_usdc, stage, attempts, attempt_at_ms, cashflow_baselines, from_wallet, to_wallet)
+             VALUES (?, ?, ?, ?, 'withdraw', 0, ?, 1, ?, ?)",
         )
         .bind(now)
         .bind(from.as_str())
         .bind(to.as_str())
         .bind(i64::try_from(amount_usdc)?)
         .bind(now)
+        .bind(format!("{from_wallet:#x}"))
+        .bind(format!("{to_wallet:#x}"))
         .execute(&self.pool)
         .await?;
-        Ok(Transfer::new(created.last_insert_rowid(), from, to, amount_usdc, now))
+        Ok(Transfer {
+            from_wallet: Some(from_wallet),
+            to_wallet: Some(to_wallet),
+            ..Transfer::new(created.last_insert_rowid(), from, to, amount_usdc, now)
+        })
     }
 
     /// The transfer that is under way or stuck, if there is one.
@@ -390,7 +429,7 @@ impl Store {
         let row: Option<TransferRow> = sqlx::query_as(
             "SELECT id, started_at_ms, from_side, to_side, amount_usdc, stage, attempts, attempt_at_ms,
                     core_baseline, sender_baseline, receiver_baseline, withdraw_intent, send_nonce,
-                    checked_at_ms, note
+                    checked_at_ms, note, cashflow_baselines, from_wallet, to_wallet
              FROM transfers WHERE finished_at_ms IS NULL",
         )
         .fetch_optional(&self.pool)
@@ -399,8 +438,8 @@ impl Store {
     }
 
     /// Writes the transfer's record: before the action it describes, never after.
-    /// Fails if the transfer is no longer unfinished, which only happens when
-    /// the operator has abandoned it.
+    /// Fails if the transfer is no longer unfinished or its owners were changed.
+    /// Ownership is fixed at creation, including unknown ownership on old rows.
     pub async fn save_transfer(&self, transfer: &Transfer) -> Result<()> {
         update_transfer(&self.pool, transfer).await
     }
@@ -456,6 +495,61 @@ impl Store {
 
     // --- ledger -------------------------------------------------------------------
 
+    /// The last history attempt for this wallet, including failed first attempts.
+    pub async fn ledger_sync(&self, wallet: &str) -> Result<Option<LedgerSync>> {
+        Ok(sqlx::query_as(
+            "SELECT last_success_ms, attempted_at_ms, complete, max_age_ms, latest_error
+             FROM ledger_sync WHERE wallet = ?",
+        )
+        .bind(wallet)
+        .fetch_optional(&self.pool)
+        .await?)
+    }
+
+    /// Called only after the history response has been written to the ledger.
+    /// `complete` means the response proved that the entire history was fetched.
+    pub async fn record_ledger_success(
+        &self,
+        wallet: Address,
+        complete: bool,
+        max_age_ms: i64,
+    ) -> Result<()> {
+        let at_ms = now_ms();
+        sqlx::query(
+            "INSERT INTO ledger_sync (wallet, last_success_ms, attempted_at_ms, complete, max_age_ms)
+             VALUES (?, ?, ?, ?, ?)
+             ON CONFLICT (wallet) DO UPDATE SET last_success_ms = excluded.last_success_ms,
+                 attempted_at_ms = excluded.attempted_at_ms, complete = excluded.complete,
+                 max_age_ms = excluded.max_age_ms, latest_error = NULL",
+        )
+        .bind(format!("{wallet:#x}"))
+        .bind(at_ms)
+        .bind(at_ms)
+        .bind(complete)
+        .bind(max_age_ms.max(0))
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// A failed history read invalidates freshness without erasing known rows or
+    /// the time of the last successful read. Bound the saved error's size.
+    pub async fn record_ledger_failure(&self, wallet: Address, error: &str) -> Result<()> {
+        let detail: String = error.chars().take(240).collect();
+        sqlx::query(
+            "INSERT INTO ledger_sync (wallet, attempted_at_ms, complete, max_age_ms, latest_error)
+             VALUES (?, ?, 0, 0, ?)
+             ON CONFLICT (wallet) DO UPDATE SET attempted_at_ms = excluded.attempted_at_ms,
+                 latest_error = excluded.latest_error",
+        )
+        .bind(format!("{wallet:#x}"))
+        .bind(now_ms())
+        .bind(detail)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
     /// Adds trades the ledger does not hold yet and returns them.
     pub async fn record_trades(&self, wallet: Address, side: Side, trades: &[Trade]) -> Result<Vec<Trade>> {
         let mut added = Vec::new();
@@ -500,6 +594,26 @@ impl Store {
         .await?;
         Ok(Totals { trades, net_pnl_usd, paper_minted })
     }
+
+    /// Only the two wallets shown in the current status, not rows imported for
+    /// an earlier configuration that happens to share this database.
+    pub async fn totals_for_wallets(&self, wallets: &[String]) -> Result<Totals> {
+        if wallets.is_empty() {
+            return Ok(Totals::default());
+        }
+        let mut query = sqlx::QueryBuilder::<sqlx::Sqlite>::new(
+            "SELECT COUNT(*), COALESCE(SUM(net_pnl_usd), 0.0), COALESCE(SUM(paper_minted), 0.0)
+             FROM trades_usd WHERE wallet IN (",
+        );
+        let mut list = query.separated(", ");
+        for wallet in wallets {
+            list.push_bind(wallet);
+        }
+        list.push_unseparated(")");
+        let (trades, net_pnl_usd, paper_minted) =
+            query.build_query_as::<(i64, f64, f64)>().fetch_one(&self.pool).await?;
+        Ok(Totals { trades, net_pnl_usd, paper_minted })
+    }
 }
 
 async fn insert_intent<'e>(
@@ -528,8 +642,9 @@ async fn update_transfer<'e>(executor: impl sqlx::SqliteExecutor<'e>, transfer: 
         "UPDATE transfers
          SET stage = ?, finished_at_ms = ?, attempts = ?, attempt_at_ms = ?, core_baseline = ?,
              sender_baseline = ?, receiver_baseline = ?, withdraw_intent = ?, send_nonce = ?,
-             checked_at_ms = ?, note = ?
-         WHERE id = ? AND finished_at_ms IS NULL",
+             checked_at_ms = ?, note = ?, cashflow_baselines = ?
+         WHERE id = ? AND finished_at_ms IS NULL AND from_side = ? AND to_side = ?
+             AND from_wallet IS ? AND to_wallet IS ?",
     )
     .bind(transfer.stage.as_str())
     .bind((transfer.stage == Stage::Done).then(now_ms))
@@ -542,10 +657,19 @@ async fn update_transfer<'e>(executor: impl sqlx::SqliteExecutor<'e>, transfer: 
     .bind(transfer.send_nonce.map(i64::try_from).transpose()?)
     .bind(transfer.checked_at_ms)
     .bind(&transfer.note)
+    .bind(transfer.cashflow_baselines)
     .bind(transfer.id)
+    .bind(transfer.from.as_str())
+    .bind(transfer.to.as_str())
+    .bind(transfer.from_wallet.map(|wallet| format!("{wallet:#x}")))
+    .bind(transfer.to_wallet.map(|wallet| format!("{wallet:#x}")))
     .execute(executor)
     .await?;
-    anyhow::ensure!(written.rows_affected() == 1, "transfer #{} is no longer under way", transfer.id);
+    anyhow::ensure!(
+        written.rows_affected() == 1,
+        "transfer #{} is no longer under way or does not match its persisted wallet owners",
+        transfer.id
+    );
     Ok(())
 }
 
@@ -560,6 +684,7 @@ mod tests {
     use crate::protocol::wire::{Dec, SignedDec};
 
     const WALLET: Address = address!("0x000000000000000000000000000000000000dead");
+    const OTHER_WALLET: Address = address!("0x00000000000000000000000000000000000000bb");
 
     fn intent(nonce: u64) -> SignedIntent {
         let message = OpenPosition {
@@ -797,11 +922,19 @@ mod tests {
     async fn one_transfer_at_a_time_and_its_record_survives_as_written() {
         let store = Store::in_memory().await.unwrap();
         assert_eq!(store.active_transfer().await.unwrap(), None);
-        let created = store.create_transfer(Side::Long, Side::Short, 850).await.unwrap();
-        assert_eq!(created, Transfer::new(created.id, Side::Long, Side::Short, 850, created.started_at_ms));
+        let created =
+            store.create_transfer(Side::Long, Side::Short, 850, WALLET, OTHER_WALLET).await.unwrap();
+        assert_eq!(
+            created,
+            Transfer {
+                from_wallet: Some(WALLET),
+                to_wallet: Some(OTHER_WALLET),
+                ..Transfer::new(created.id, Side::Long, Side::Short, 850, created.started_at_ms)
+            }
+        );
         assert_eq!(store.active_transfer().await.unwrap(), Some(created.clone()));
         // While it is unfinished there is no second one, in either direction.
-        assert!(store.create_transfer(Side::Short, Side::Long, 10).await.is_err());
+        assert!(store.create_transfer(Side::Short, Side::Long, 10, OTHER_WALLET, WALLET).await.is_err());
 
         let written = Transfer {
             stage: Stage::Credit,
@@ -826,21 +959,23 @@ mod tests {
         store.save_transfer(&Transfer { stage: Stage::Done, ..written.clone() }).await.unwrap();
         assert_eq!(store.active_transfer().await.unwrap(), None);
         assert!(store.save_transfer(&written).await.unwrap_err().to_string().contains("no longer under way"));
-        let next = store.create_transfer(Side::Short, Side::Long, 10).await.unwrap();
+        let next = store.create_transfer(Side::Short, Side::Long, 10, OTHER_WALLET, WALLET).await.unwrap();
         assert_ne!(next.id, created.id);
     }
 
     #[tokio::test]
     async fn a_transfer_between_one_account_and_itself_cannot_be_recorded() {
         let store = Store::in_memory().await.unwrap();
-        assert!(store.create_transfer(Side::Long, Side::Long, 850).await.is_err());
-        assert!(store.create_transfer(Side::Long, Side::Short, 0).await.is_err());
+        assert!(store.create_transfer(Side::Long, Side::Long, 850, WALLET, OTHER_WALLET).await.is_err());
+        assert!(store.create_transfer(Side::Long, Side::Short, 0, WALLET, OTHER_WALLET).await.is_err());
+        assert!(store.create_transfer(Side::Long, Side::Short, 850, WALLET, WALLET).await.is_err());
     }
 
     #[tokio::test]
     async fn a_withdrawal_attempt_and_its_intent_are_written_together_or_not_at_all() {
         let store = Store::in_memory().await.unwrap();
-        let created = store.create_transfer(Side::Long, Side::Short, 850).await.unwrap();
+        let created =
+            store.create_transfer(Side::Long, Side::Short, 850, WALLET, OTHER_WALLET).await.unwrap();
         let intent = withdrawal(1);
         let attempt = Transfer {
             attempts: 1,
@@ -869,7 +1004,7 @@ mod tests {
         let store = Store::in_memory().await.unwrap();
         assert_eq!(store.abandon_stuck_transfer().await.unwrap(), Abandoned::Nothing);
 
-        let moving = store.create_transfer(Side::Long, Side::Short, 850).await.unwrap();
+        let moving = store.create_transfer(Side::Long, Side::Short, 850, WALLET, OTHER_WALLET).await.unwrap();
         assert_eq!(store.abandon_stuck_transfer().await.unwrap(), Abandoned::NotStuck(moving.clone()));
         assert_eq!(store.active_transfer().await.unwrap(), Some(moving.clone()));
 
@@ -881,7 +1016,7 @@ mod tests {
         store.save_transfer(&stuck).await.unwrap();
         // Stuck is not finished: it still stands in the way of the next transfer.
         assert_eq!(store.active_transfer().await.unwrap(), Some(stuck.clone()));
-        assert!(store.create_transfer(Side::Long, Side::Short, 850).await.is_err());
+        assert!(store.create_transfer(Side::Long, Side::Short, 850, WALLET, OTHER_WALLET).await.is_err());
 
         assert_eq!(store.abandon_stuck_transfer().await.unwrap(), Abandoned::Ended(stuck.clone()));
         assert_eq!(store.active_transfer().await.unwrap(), None);
@@ -898,7 +1033,7 @@ mod tests {
                 stuck.id
             )
         );
-        store.create_transfer(Side::Long, Side::Short, 850).await.unwrap();
+        store.create_transfer(Side::Long, Side::Short, 850, WALLET, OTHER_WALLET).await.unwrap();
     }
 
     #[tokio::test]
@@ -965,5 +1100,123 @@ mod tests {
         winner.user_paid_fee_raw = Dec(usd(2));
         store.record_trades(WALLET, Side::Short, &[winner]).await.unwrap();
         assert!((store.totals().await.unwrap().net_pnl_usd - 86.0).abs() < 1e-9);
+    }
+
+    #[tokio::test]
+    async fn a_history_failure_preserves_rows_and_the_last_success_without_claiming_freshness() {
+        let store = Store::in_memory().await.unwrap();
+        let wallet = format!("{WALLET:#x}");
+        assert_eq!(store.ledger_sync(&wallet).await.unwrap(), None);
+        store.record_ledger_failure(WALLET, "HTTP 503").await.unwrap();
+        let first = store.ledger_sync(&wallet).await.unwrap().unwrap();
+        assert_eq!(first.last_success_ms, None);
+        assert!(!first.is_fresh(now_ms()));
+
+        store.record_trades(WALLET, Side::Long, &[trade(1, -100, 9_800)]).await.unwrap();
+        store.record_ledger_success(WALLET, true, 75).await.unwrap();
+        let success = store.ledger_sync(&wallet).await.unwrap().unwrap();
+        let at_ms = success.last_success_ms.unwrap();
+        assert!(success.complete && success.is_fresh(at_ms + 75));
+        assert!(!success.is_fresh(at_ms + 76));
+
+        store.record_ledger_failure(WALLET, &"界".repeat(300)).await.unwrap();
+        let failed = store.ledger_sync(&wallet).await.unwrap().unwrap();
+        assert_eq!(failed.last_success_ms, success.last_success_ms);
+        assert_eq!(failed.max_age_ms, 75);
+        assert_eq!(failed.latest_error.as_ref().unwrap().chars().count(), 240);
+        assert!(failed.complete && !failed.is_fresh(at_ms));
+        assert_eq!(store.totals().await.unwrap().trades, 1);
+
+        store.record_ledger_success(WALLET, false, 900).await.unwrap();
+        let recovered = store.ledger_sync(&wallet).await.unwrap().unwrap();
+        assert!(!recovered.complete);
+        assert_eq!(recovered.latest_error, None);
+        assert_eq!(recovered.max_age_ms, 900);
+        assert!(recovered.is_fresh(recovered.last_success_ms.unwrap()));
+    }
+
+    #[tokio::test]
+    async fn ledger_sync_evidence_survives_reopening_and_totals_only_count_the_current_wallets() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ledger.db");
+        let wallet = format!("{WALLET:#x}");
+        let store = Store::open(&path).await.unwrap();
+        store.record_trades(WALLET, Side::Long, &[trade(1, -100, 9_800)]).await.unwrap();
+        store.record_trades(Address::ZERO, Side::Short, &[trade(2, -500, 50_000)]).await.unwrap();
+        store.record_ledger_success(WALLET, true, 1_800).await.unwrap();
+        let sync = store.ledger_sync(&wallet).await.unwrap().unwrap();
+        store.close().await;
+
+        let reopened = Store::open(&path).await.unwrap();
+        assert_eq!(reopened.ledger_sync(&wallet).await.unwrap(), Some(sync));
+        assert_eq!(reopened.totals().await.unwrap().trades, 2);
+        let scoped = reopened.totals_for_wallets(&[wallet]).await.unwrap();
+        assert_eq!(scoped.trades, 1);
+        assert!((scoped.net_pnl_usd - -100.0).abs() < 1e-9);
+        assert!((scoped.paper_minted - 9_800.0).abs() < 1e-9);
+        assert_eq!(reopened.totals_for_wallets(&[]).await.unwrap(), Totals::default());
+    }
+
+    #[tokio::test]
+    async fn old_transfer_rows_keep_their_equity_evidence_version_and_new_baselines_survive_reopening() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("legacy.db");
+        let store = Store::open(&path).await.unwrap();
+        // An old-format insert omits the new column: migration's default stays false.
+        sqlx::query("INSERT INTO transfers (started_at_ms,from_side,to_side,amount_usdc,stage,attempts,attempt_at_ms,sender_baseline,receiver_baseline,send_nonce) VALUES (1,'long','short',10,'credit',0,1,'100','200',42)").execute(&store.pool).await.unwrap();
+        let old = store.active_transfer().await.unwrap().unwrap();
+        assert!(!old.cashflow_baselines);
+        assert_eq!((old.from_wallet, old.to_wallet), (None, None));
+        assert_eq!(
+            (old.sender_baseline, old.receiver_baseline, old.send_nonce),
+            (Some(U256::from(100)), Some(U256::from(200)), Some(42))
+        );
+        store.save_transfer(&Transfer { stage: Stage::Stuck, ..old }).await.unwrap();
+        store.abandon_stuck_transfer().await.unwrap();
+        let new = store.create_transfer(Side::Long, Side::Short, 10, WALLET, OTHER_WALLET).await.unwrap();
+        assert!(new.cashflow_baselines);
+        assert!(new.matches_wallets(WALLET, OTHER_WALLET));
+        let next = Transfer { sender_baseline: Some(usd(7)), receiver_baseline: Some(usd(11)), ..new };
+        store.save_transfer(&next).await.unwrap();
+        store.close().await;
+        let reopened = Store::open(&path).await.unwrap();
+        assert_eq!(reopened.active_transfer().await.unwrap(), Some(next));
+    }
+
+    #[tokio::test]
+    async fn a_wallet_owner_migration_keeps_existing_pending_rows_unbound() {
+        let pool = SqlitePoolOptions::new().max_connections(1).connect("sqlite::memory:").await.unwrap();
+        sqlx::migrate!().run_to(5, &pool).await.unwrap();
+        // A cashflow-format row from before wallet ownership was persisted.
+        sqlx::query("INSERT INTO transfers (started_at_ms,from_side,to_side,amount_usdc,stage,attempts,attempt_at_ms,receiver_baseline,send_nonce,cashflow_baselines) VALUES (1,'long','short',10,'credit',0,1,'200',42,1)")
+            .execute(&pool).await.unwrap();
+        let store = Store::connect(pool).await.unwrap();
+        let old = store.active_transfer().await.unwrap().unwrap();
+        assert!(old.cashflow_baselines);
+        assert_eq!((old.from_wallet, old.to_wallet), (None, None));
+        assert_eq!((old.receiver_baseline, old.send_nonce), (Some(U256::from(200)), Some(42)));
+        assert!(!old.matches_wallets(WALLET, OTHER_WALLET));
+        let rebound = Transfer { from_wallet: Some(WALLET), to_wallet: Some(OTHER_WALLET), ..old.clone() };
+        assert!(store.save_transfer(&rebound).await.is_err());
+        assert_eq!(store.active_transfer().await.unwrap(), Some(old.clone()));
+        store.save_transfer(&Transfer { stage: Stage::Stuck, ..old }).await.unwrap();
+        assert!(matches!(store.abandon_stuck_transfer().await.unwrap(), Abandoned::Ended(_)));
+    }
+
+    #[tokio::test]
+    async fn a_new_transfers_wallet_owners_cannot_be_changed_or_erased() {
+        let store = Store::in_memory().await.unwrap();
+        let owned = store.create_transfer(Side::Long, Side::Short, 10, WALLET, OTHER_WALLET).await.unwrap();
+        for rebound in [
+            Transfer { from_wallet: Some(OTHER_WALLET), to_wallet: Some(WALLET), ..owned.clone() },
+            Transfer { from_wallet: None, to_wallet: None, ..owned.clone() },
+            Transfer { from: Side::Short, to: Side::Long, ..owned.clone() },
+        ] {
+            assert!(store.save_transfer(&rebound).await.is_err());
+            assert_eq!(store.active_transfer().await.unwrap(), Some(owned.clone()));
+        }
+        store.save_transfer(&Transfer { stage: Stage::Send, ..owned.clone() }).await.unwrap();
+        let written = store.active_transfer().await.unwrap().unwrap();
+        assert_eq!((written.from_wallet, written.to_wallet), (owned.from_wallet, owned.to_wallet));
     }
 }
