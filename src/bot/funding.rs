@@ -1,9 +1,11 @@
-//! The loop's side of funding: keeping the session keys registered, and
-//! carrying out a transfer between the two accounts one recorded step at a time.
+//! The loop's side of funding: keeping the session keys registered, judging
+//! whether funds should move between the two accounts, and carrying out a
+//! transfer one recorded step at a time.
 //!
-//! What to do is decided by pure functions (`decide`, [`next_step`]). This
-//! module gathers what they look at, writes the record they hand back, and
-//! only then acts.
+//! What to do is decided by pure functions ([`funds`], [`hold`], [`next_step`]).
+//! This module gathers what they look at, writes the record they hand back,
+//! and only then acts. None of it waits for the legs, and the legs wait for
+//! none of it.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -15,17 +17,18 @@ use tokio::task::JoinSet;
 use tracing::{error, info, warn};
 
 use super::{Bot, PerSide, duration_ms, inflight, unix_seconds};
+use crate::config::Config;
 use crate::keystore::UnlockedKeys;
 use crate::protocol::account::AccountState;
 use crate::protocol::chain::Chain;
 use crate::protocol::deployment::{SESSION_KEY_TTL_SECONDS, usd};
 use crate::protocol::intents::{RegisterSessionKey, USDC_UNIT, WithdrawToCore};
 use crate::protocol::wire::TradingState;
-use crate::status::{FundsSnapshot, Snapshot, TransferSnapshot, format_amount};
+use crate::status::{FundsSnapshot, PlannedTransfer, Snapshot, TransferSnapshot, format_amount};
 use crate::store::{Store, now_ms};
-use crate::strategy::decide::{Side, TransferState, session_key_needs_registration};
+use crate::strategy::decide::{Side, has_queued_trade, session_key_needs_registration};
 use crate::strategy::inflight::Kind;
-use crate::strategy::rebalance::{funds, rounds_affordable};
+use crate::strategy::rebalance::{Funds, Hold, Holding, Readiness, funds, hold, reserved, rounds_affordable};
 use crate::strategy::transfer::{Limits, Observed, Reading, Stage, Step, Transfer, Withdrawal, next_step};
 use crate::wallet::hypercore::HyperCore;
 use crate::wallet::{DepositSend, WalletSigner, Wallets};
@@ -66,6 +69,11 @@ pub(super) struct Funding {
     hypercore: Arc<dyn HyperCore>,
     /// Each wallet's own key, where the automation is on and the key was unlocked.
     signers: PerSide<Option<WalletSigner>>,
+    /// `PT_REBALANCE`: whether a transfer may be started. One that has started
+    /// is carried on either way.
+    rebalance: bool,
+    /// The transfer that was last put on the timeline as called for but not started.
+    reported_held: Option<String>,
     /// The unfinished transfer, exactly as it was last written to the database.
     transfer: Option<Transfer>,
     /// What the transfer is waiting for, for the status snapshot.
@@ -86,6 +94,7 @@ impl Funding {
         chain: Chain,
         hypercore: Arc<dyn HyperCore>,
         timing: &FundingTiming,
+        config: &Config,
     ) -> Result<Self> {
         // The keystore hands over a signer; from here on it signs three things.
         // It has already checked that the key is the wallet's own. Should it not
@@ -107,6 +116,8 @@ impl Funding {
             chain,
             hypercore,
             signers: PerSide { long: signer(Side::Long), short: signer(Side::Short) },
+            rebalance: config.rebalance,
+            reported_held: None,
             transfer: store.active_transfer().await?,
             waiting_for: None,
             watched,
@@ -154,10 +165,41 @@ async fn follow_core_balance(
     }
 }
 
+/// What one tick makes of the two accounts' funds.
+pub(super) struct FundsView {
+    long: Holding,
+    short: Holding,
+    /// `None` with `PT_REBALANCE` off: nothing is judged, so nothing is moved.
+    verdict: Option<Funds>,
+    /// Why the transfer the verdict calls for is not started in this tick.
+    hold: Option<Hold>,
+}
+
+impl FundsView {
+    /// The transfer the verdict calls for and what holds it back, unless one
+    /// is under way already: that one is what there is to show.
+    fn planned(&self) -> Option<(Side, Side, u64, Option<Hold>)> {
+        match (self.verdict?, self.hold) {
+            (_, Some(Hold::TransferActive)) => None,
+            (Funds::Rebalance { from, to, amount_usdc }, hold) => Some((from, to, amount_usdc, hold)),
+            _ => None,
+        }
+    }
+
+    /// The transfer to start now, as `(from, to, whole USDC)`.
+    pub(super) fn to_start(&self) -> Option<(Side, Side, u64)> {
+        match self.planned()? {
+            (from, to, amount_usdc, None) => Some((from, to, amount_usdc)),
+            _ => None,
+        }
+    }
+}
+
 impl Bot {
-    pub(super) fn transfer_state(&self) -> Option<TransferState> {
-        let transfer = self.funding.transfer.as_ref()?;
-        Some(if transfer.stage == Stage::Stuck { TransferState::Stuck } else { TransferState::Moving })
+    /// What a transfer between the two accounts has claimed from this
+    /// account's balance and may still take.
+    pub(super) fn reserved(&self, side: Side) -> U256 {
+        self.funding.transfer.as_ref().map_or(U256::ZERO, |transfer| reserved(transfer, side))
     }
 
     /// Both wallets' own keys are here, so a transfer can be signed from either side.
@@ -165,14 +207,69 @@ impl Bot {
         Side::BOTH.iter().all(|&side| self.funding.signers.get(side).is_some())
     }
 
-    /// Carries out a decision to rebalance: the transfer exists once its record does.
+    /// Judges whether funds should move between the two accounts. It is asked
+    /// in every tick and in every phase of the legs; `None` while an account's
+    /// state is unavailable. `trading` says for which accounts the bot has an
+    /// open or a close in flight or is sending one in this tick.
+    pub(super) fn judge_funds(
+        &self,
+        accounts: &PerSide<Option<AccountState>>,
+        trading: &PerSide<bool>,
+        trading_state: Option<&TradingState>,
+    ) -> Option<FundsView> {
+        let (long, short) = (accounts.long.as_ref()?, accounts.short.as_ref()?);
+        let view =
+            |verdict, hold| FundsView { long: Holding::of(long), short: Holding::of(short), verdict, hold };
+        if !self.funding.rebalance {
+            return Some(view(None, None));
+        }
+        let verdict =
+            funds(&Holding::of(long), &Holding::of(short), self.params.margin(), self.params.round_loss());
+        let Funds::Rebalance { from, .. } = verdict else { return Some(view(Some(verdict), None)) };
+        let sender = if from.is_long() { long } else { short };
+        let held = hold(&Readiness {
+            transfer_active: self.funding.transfer.is_some(),
+            sender_busy: *trading.get(from) || has_queued_trade(sender),
+            wallet_keys: self.can_rebalance(),
+            mode: self.mode,
+            trading: trading_state,
+            dry_run: self.dry_run,
+        });
+        Some(view(Some(verdict), held))
+    }
+
+    /// Puts a transfer that is called for but cannot start on the timeline,
+    /// once for as long as it stays the same. A dry run reports its plan this way.
+    pub(super) async fn report_held_transfer(&mut self, funds: Option<&FundsView>) {
+        let Some(funds) = funds else { return };
+        let held = match funds.planned() {
+            // It follows shortly, and is recorded when it starts.
+            Some((.., Some(hold))) if hold.is_passing() => return,
+            Some((from, to, amount_usdc, Some(hold))) => Some(format!(
+                "transfer planned, not started ({hold}): {amount_usdc} USDC from the {from} account to the {to} \
+                 account"
+            )),
+            _ => None,
+        };
+        if held == self.funding.reported_held {
+            return;
+        }
+        if let Some(summary) = &held {
+            info!("{summary}");
+            let recorded = self.store.record_event("transfer", summary, None).await;
+            self.best_effort("recording a planned transfer", recorded);
+        }
+        self.funding.reported_held = held;
+    }
+
+    /// Starts the transfer the funds call for: it exists once its record does.
     pub(super) async fn start_transfer(&mut self, from: Side, to: Side, amount_usdc: u64) {
         if self.funding.transfer.is_some() {
             return;
         }
         let created = self.store.create_transfer(from, to, amount_usdc).await;
         let Some(transfer) = self.best_effort("recording a new transfer", created) else { return };
-        let what = format!("started: {amount_usdc} USDC from the {from} account to the {to} account");
+        let what = format!("planned: {amount_usdc} USDC from the {from} account to the {to} account");
         self.transfer_event(&transfer, &what).await;
         self.funding.transfer = Some(transfer);
     }
@@ -232,7 +329,14 @@ impl Bot {
         let sender_core = (*self.funding.core.borrow())
             .filter(|reading| reading.wallet == sender)
             .map(|reading| Reading { amount: reading.amount, at_ms: reading.at_ms });
-        let balance = |side: Side| accounts.get(side).as_ref().map(|account| account.available_balance);
+        // What the account holds, the margins parked in its positions included.
+        // Rounds go on while a transfer is under way, and the available balance
+        // alone moves by a whole margin whenever a position opens or closes,
+        // which would pass for the transfer's money leaving or arriving.
+        // What a round wins or loses when it closes still shows in it: a loss
+        // the receiver realises while its credit is awaited makes the credit
+        // look short, and that transfer ends up stuck for the operator to check.
+        let balance = |side: Side| accounts.get(side).as_ref().map(|account| Holding::of(account).equity());
         let withdrawal = match (transfer.stage, transfer.withdraw_intent) {
             (Stage::Withdraw, Some(intent_id)) => self.withdrawal(intent_id).await,
             _ => None,
@@ -462,21 +566,24 @@ impl Bot {
     }
 
     /// Fills in what the snapshot says about funds and the transfer.
-    pub(super) fn describe_funding(&self, snapshot: &mut Snapshot, accounts: &PerSide<Option<AccountState>>) {
-        // What an account holds with its positions closed at their entry: while a
-        // round is open the margins are only parked.
-        let holds = |side: Side| {
-            let account = accounts.get(side).as_ref()?;
-            Some(account.positions.iter().fold(account.available_balance, |total, held| total + held.margin))
-        };
-        snapshot.funds = holds(Side::Long).zip(holds(Side::Short)).map(|(long, short)| {
+    pub(super) fn describe_funding(&self, snapshot: &mut Snapshot, funds: Option<&FundsView>) {
+        snapshot.funds = funds.map(|view| {
+            // What an account holds with its positions closed at their entry: while a
+            // round is open the margins are only parked.
+            let (long, short) = (view.long.equity(), view.short.equity());
             let (margin, buffer) = (self.params.margin(), self.params.round_loss());
             FundsSnapshot {
                 total_usd: format_amount(long + short),
                 difference_usd: format_amount(long.abs_diff(short)),
                 rounds_affordable: rounds_affordable(long, short, margin, buffer),
-                verdict: funds(long, short, margin, buffer).as_str().to_owned(),
+                verdict: view.verdict.map_or("off", Funds::as_str).to_owned(),
                 can_rebalance: self.can_rebalance(),
+                planned: view.planned().map(|(from, to, amount_usdc, hold)| PlannedTransfer {
+                    from,
+                    to,
+                    amount_usd: format_amount(usd(amount_usdc)),
+                    held_by: hold.map(|hold| hold.to_string()),
+                }),
             }
         });
         snapshot.transfer = self.funding.transfer.as_ref().map(|transfer| TransferSnapshot {

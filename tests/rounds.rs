@@ -609,7 +609,7 @@ mod funding {
     use papertrade::protocol::deployment::usd;
     use papertrade::status::Snapshot;
     use papertrade::store::Abandoned;
-    use papertrade::strategy::decide::Mode;
+    use papertrade::strategy::decide::{Mode, Phase, Side};
     use papertrade::strategy::transfer::Stage;
 
     use super::support::{
@@ -630,12 +630,18 @@ mod funding {
     const SETTLE: Duration = Duration::from_millis(600);
 
     /// The wallet automation is on and both wallets' own keys were unlocked.
+    /// Rebalancing is still off.
     fn automated() -> Setup {
         Setup { wallet_keys: true, ..Setup::default() }
     }
 
+    /// Rebalancing is switched on as well.
+    fn rebalancing() -> Setup {
+        Setup { rebalance: true, ..automated() }
+    }
+
     fn lopsided() -> Setup {
-        Setup { long_usd: 2_000, short_usd: 300, ..automated() }
+        Setup { long_usd: 2_000, short_usd: 300, ..rebalancing() }
     }
 
     /// A harness whose bot gives an attempt only a short settle time.
@@ -651,6 +657,19 @@ mod funding {
 
     async fn transfer_stage(h: &Harness) -> Option<Stage> {
         h.store.active_transfer().await.unwrap().map(|transfer| transfer.stage)
+    }
+
+    async fn transfer_finished(h: &Harness) {
+        eventually_stored("the transfer finishes", SOON, || async {
+            h.store.active_transfer().await.unwrap().is_none()
+        })
+        .await;
+    }
+
+    /// What the long leg is paid back when a round closes at the target in its
+    /// favour: its 500 margin, and 88% of the 100 it won less the 2% fee.
+    fn won() -> U256 {
+        usd(586) + usd(24) / U256::from(100)
     }
 
     async fn in_stage(h: &Harness, stage: Stage) {
@@ -678,6 +697,16 @@ mod funding {
             assert!(started.elapsed() < SOON, "timed out after {SOON:?} waiting for: {what}");
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
+    }
+
+    /// The first status that shows a transfer the bot would make, held back by this.
+    async fn planned_but_held_by(h: &Harness, reason: &str) -> Snapshot {
+        let what = format!("a transfer planned and not started: {reason}");
+        status_when(h, &what, |status| {
+            let planned = status.funds.as_ref().and_then(|funds| funds.planned.as_ref());
+            planned.is_some_and(|planned| planned.held_by.as_deref() == Some(reason))
+        })
+        .await
     }
 
     /// The round opened on level accounts, and nothing is left anywhere on the way.
@@ -726,7 +755,7 @@ mod funding {
         assert_eq!(
             timeline(&h).await[..5],
             [
-                "transfer #1 started: 850 USDC from the long account to the short account".to_owned(),
+                "transfer #1 planned: 850 USDC from the long account to the short account".to_owned(),
                 "transfer #1 withdrawing 850 USDC from the long account to its wallet's HyperCore account \
                  (attempt 1)"
                     .to_owned(),
@@ -756,10 +785,11 @@ mod funding {
         // between two connections when it was sent. The transfer never needed it.
         assert!(matches!(withdrawal.outcome.as_deref(), None | Some("succeeded")), "{withdrawal:?}");
 
-        let status = status_when(&h, "the status shows the round", |status| status.decision == "wait").await;
+        let status =
+            status_when(&h, "the status shows the round", |status| status.phase == Phase::Hedged).await;
         assert_eq!(status.transfer, None);
         let funds = status.funds.unwrap();
-        assert_eq!((funds.verdict.as_str(), funds.can_rebalance), ("enough", true));
+        assert_eq!((funds.verdict.as_str(), funds.can_rebalance, funds.planned), ("enough", true, None));
         assert_eq!((funds.total_usd.as_str(), funds.difference_usd.as_str()), ("2300.00", "0.00"));
         assert!(status.legs.iter().all(|leg| leg.has_wallet_key));
     }
@@ -777,7 +807,8 @@ mod funding {
                 .is_some_and(|transfer| transfer.stage == "credit" && transfer.note.is_some())
         })
         .await;
-        assert_eq!(status.summary, "flat; rebalancing: funds are moving between the two accounts");
+        // The transfer is no reason to wait. The short account's balance is.
+        assert_eq!(status.summary, "flat; the short account's balance is below the margin");
         let transfer = status.transfer.unwrap();
         assert_eq!((transfer.from.as_str(), transfer.to.as_str()), ("long", "short"));
         assert_eq!(transfer.amount_usd, "850.00");
@@ -785,18 +816,42 @@ mod funding {
         // What has left one account and not reached the other is missing from the total.
         let funds = status.funds.unwrap();
         assert_eq!((funds.total_usd.as_str(), funds.verdict.as_str()), ("1450.00", "rebalance"));
+        // One transfer at a time: the one under way is shown, no second one is planned.
+        assert_eq!(funds.planned, None);
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn an_account_that_can_open_but_could_not_absorb_a_loss_is_topped_up_first() {
+    async fn an_account_that_can_open_but_could_not_absorb_a_loss_opens_and_is_topped_up_all_the_same() {
         // 550 covers the 500 margin, but not the 100 a losing round takes on top.
         let mut h = Harness::prepare_with(Setup { short_usd: 550, ..lopsided() }).await;
         h.start_bot();
+        // Neither waits for the other: the round opens, and the funds are moved.
         h.hedged().await;
+        eventually("the funds are on their way", SOON, || !h.sim.sends().is_empty()).await;
+        transfer_finished(&h).await;
         assert_eq!(withdrawals(&h).len(), 1);
         assert_eq!(h.sim.sends()[0].amount_usdc, 725);
-        // 1,275 each, less the margin of the round that opened afterwards.
+        // 1,275 each, less the margin of the round that is open.
         assert_eq!((h.sim.balance(h.long), h.sim.balance(h.short)), (usd(775), usd(775)));
+        assert_eq!((h.opens(), h.closes()), (2, 0));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn while_both_accounts_hold_the_margin_and_a_loss_nothing_is_moved_however_uneven_they_are() {
+        let mut h = Harness::prepare_with(Setup { long_usd: 2_000, short_usd: 1_000, ..rebalancing() }).await;
+        h.start_bot();
+        h.hedged().await;
+        let status = status_when(&h, "the open round", |status| status.phase == Phase::Hedged).await;
+        let funds = status.funds.unwrap();
+        assert_eq!((funds.verdict.as_str(), funds.difference_usd.as_str()), ("enough", "1000.00"));
+        assert_eq!(funds.planned, None);
+        // The short leg loses the round: 900 left, still the margin and a loss.
+        h.sim.set_mid(ENTRY + TARGET);
+        h.flat().await;
+        steadily("nothing is moved", A_WHILE, || withdrawals(&h).is_empty() && h.sim.sends().is_empty())
+            .await;
+        assert_eq!(h.store.active_transfer().await.unwrap(), None);
+        assert_eq!(h.sim.hypercore_reads(), 0);
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -806,7 +861,8 @@ mod funding {
         let mut h = Harness::prepare_with(Setup { long_usd: 610, short_usd: 595, ..lopsided() }).await;
         h.start_bot();
         h.hedged().await;
-        assert!(withdrawals(&h).is_empty() && h.sim.sends().is_empty());
+        steadily("nothing is moved", A_WHILE, || withdrawals(&h).is_empty() && h.sim.sends().is_empty())
+            .await;
         assert_eq!(h.store.active_transfer().await.unwrap(), None);
     }
 
@@ -1185,7 +1241,7 @@ mod funding {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn a_credit_that_never_comes_leaves_the_transfer_stuck_until_the_operator_abandons_it() {
+    async fn a_credit_that_never_comes_leaves_the_transfer_stuck_and_rounds_go_on_all_the_same() {
         let mut h = Harness::prepare_with(lopsided()).await;
         h.timing.funding.transfer.stuck_after = Duration::from_millis(800);
         h.sim.set_sweep(Sweep::Never);
@@ -1204,26 +1260,29 @@ mod funding {
         })
         .await;
         assert_eq!(status.transfer.unwrap().note.as_deref(), Some(note));
-        assert_eq!(
-            status.summary,
-            "flat; the transfer between the two accounts is stuck: resolve it, then run `papertrade rebalance \
-             abandon`"
-        );
+        // Nothing opens, but for the short account's balance and not for the transfer.
+        assert_eq!(status.summary, "flat; the short account's balance is below the margin");
+        assert_eq!(h.opens(), 0);
         assert!(timeline(&h).await.contains(&format!("transfer #1 {note}")));
 
-        // The operator gets the deposit credited. Even so the bot leaves everything
-        // alone until it is told that the transfer has been dealt with.
+        // The operator gets the deposit credited. The transfer stays stuck until
+        // the bot is told that it has been dealt with. A round is opened and
+        // closed meanwhile, and no second transfer is started.
         h.sim.set_sweep(Sweep::After(Duration::ZERO));
-        eventually("the deposit is credited", SOON, || h.sim.balance(h.short) == usd(LEVELLED)).await;
-        steadily("nothing more is moved or opened", A_WHILE, || {
-            withdrawals(&h).len() == 1 && h.sim.sends().len() == 1 && h.opens() == 0
-        })
-        .await;
+        h.hedged().await;
+        assert_eq!((h.sim.balance(h.long), h.sim.balance(h.short)), (usd(AFTER_OPENING), usd(AFTER_OPENING)));
+        h.sim.set_mid(ENTRY + TARGET);
+        h.flat().await;
+        assert_eq!((h.opens(), h.closes()), (2, 2));
+        assert_eq!(transfer_stage(&h).await, Some(Stage::Stuck));
+        steadily("nothing more is moved", A_WHILE, || withdrawals(&h).len() == 1 && h.sim.sends().len() == 1)
+            .await;
 
         assert_eq!(h.store.abandon_stuck_transfer().await.unwrap(), Abandoned::Ended(stuck));
-        h.hedged().await;
-        assert_eq!((withdrawals(&h).len(), h.sim.sends().len()), (1, 1));
-        assert_levelled_and_trading(&h);
+        // Judged afresh, both accounts hold the margin and a loss: nothing to move.
+        steadily("nothing more is moved", A_WHILE, || withdrawals(&h).len() == 1 && h.sim.sends().len() == 1)
+            .await;
+        assert_eq!(h.store.active_transfer().await.unwrap(), None);
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -1234,42 +1293,184 @@ mod funding {
         in_stage(&h, Stage::Credit).await;
         h.store.set_mode(Mode::Pause).await.unwrap();
         h.sim.set_sweep(Sweep::After(Duration::ZERO));
-        eventually_stored("the transfer finishes", SOON, || async {
-            h.store.active_transfer().await.unwrap().is_none()
-        })
-        .await;
+        transfer_finished(&h).await;
         assert_eq!((h.sim.balance(h.long), h.sim.balance(h.short)), (usd(LEVELLED), usd(LEVELLED)));
         steadily("paused: no round is opened", A_WHILE, || h.opens() == 0).await;
+
+        // A paused bot finishes what it began and begins nothing: the short
+        // account runs short again, and no second transfer is started.
+        h.sim.set_balance(h.short, 300);
+        let status = planned_but_held_by(&h, "the bot is in pause mode").await;
+        let planned = status.funds.unwrap().planned.unwrap();
+        assert_eq!(
+            (planned.from, planned.to, planned.amount_usd.as_str()),
+            (Side::Long, Side::Short, "425.00")
+        );
+        steadily("paused: no transfer is started", A_WHILE, || withdrawals(&h).len() == 1).await;
+        assert_eq!(h.store.active_transfer().await.unwrap(), None);
+
+        h.store.set_mode(Mode::Run).await.unwrap();
+        eventually("running again, the transfer is started", SOON, || withdrawals(&h).len() == 2).await;
     }
 
     // --- when a transfer may start -------------------------------------------------
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn no_transfer_starts_while_a_round_is_open() {
-        let mut h = Harness::prepare_with(automated()).await;
+    async fn a_transfer_starts_and_finishes_while_a_round_is_open_and_leaves_the_round_alone() {
+        let mut h = Harness::prepare_with(rebalancing()).await;
         h.start_bot();
         h.hedged().await;
-        // The short account loses what it had outside its position.
+        assert!(withdrawals(&h).is_empty());
+        // The short account loses what it had outside its position. Its posted
+        // margin is all it holds now: not enough to lose a round as well.
         h.sim.set_balance(h.short, 0);
-        steadily("nothing is withdrawn while both legs are open", A_WHILE, || withdrawals(&h).is_empty())
-            .await;
+        transfer_finished_after(&h, 1).await;
+        // Half of what the long account held more: 2,000 against 500.
+        let sends = h.sim.sends();
+        assert_eq!(sends.len(), 1);
+        assert_eq!((sends[0].from, sends[0].amount_usdc), (h.long, 750));
+        assert_eq!((h.sim.balance(h.long), h.sim.balance(h.short)), (usd(750), usd(750)));
+        // Both legs are still open, and nothing was done to them.
+        assert_eq!((h.sim.positions(h.long).len(), h.sim.positions(h.short).len()), (1, 1));
+        assert_eq!((h.opens(), h.closes()), (2, 0));
 
+        // The round closes at its target as it would have.
         h.sim.set_mid(ENTRY + TARGET);
-        eventually("the accounts are levelled once the round has closed", SOON, || {
-            h.sim.count(h.long, "withdrawToCore") == 1
-        })
-        .await;
-        // Both closes went out before the withdrawal.
-        let received = h.sim.received();
-        let last_close = received.iter().rposition(|r| r.action == "closePositions").unwrap();
-        let withdrawal = received.iter().position(|r| r.action == "withdrawToCore").unwrap();
-        assert!(last_close < withdrawal, "{received:?}");
+        h.flat().await;
         assert_eq!(h.closes(), 2);
+        assert_eq!(withdrawals(&h).len(), 1);
+    }
+
+    /// Waits until this many transfers have been started and none is unfinished.
+    async fn transfer_finished_after(h: &Harness, started: usize) {
+        eventually("the transfer is started", SOON, || withdrawals(h).len() == started).await;
+        eventually("the funds are sent on", SOON, || h.sim.sends().len() == started).await;
+        transfer_finished(h).await;
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn no_transfer_starts_while_an_open_could_still_execute() {
-        let mut h = Harness::prepare_with(automated()).await;
+    async fn a_round_opens_and_closes_while_a_transfer_is_in_progress() {
+        // Both accounts can post the margin, and the short one is short of a loss.
+        let mut h = Harness::prepare_with(Setup { short_usd: 550, ..lopsided() }).await;
+        // The relayer takes no opens for now, so the transfer is the first thing
+        // to happen; and its withdrawal takes its time to reach HyperCore.
+        h.sim.pause("openPosition");
+        h.sim.hold_arrivals();
+        h.start_bot();
+        eventually("the withdrawal has left the long account", SOON, || h.sim.balance(h.long) == usd(1_275))
+            .await;
+        assert_eq!(h.opens(), 0);
+
+        // Opens are taken again: the round opens with the transfer under way.
+        h.sim.unpause("openPosition");
+        h.hedged().await;
+        assert_eq!(transfer_stage(&h).await, Some(Stage::Withdraw));
+        // One round is all this scenario is about.
+        h.sim.pause("openPosition");
+        h.sim.set_mid(ENTRY + TARGET);
+        h.flat().await;
+        assert_eq!((h.opens(), h.closes()), (2, 2));
+        assert_eq!(transfer_stage(&h).await, Some(Stage::Withdraw));
+        assert!(h.sim.sends().is_empty());
+
+        // The transfer goes on from where it was, and arrives.
+        h.sim.release_arrivals();
+        transfer_finished_after(&h, 1).await;
+        assert_eq!(h.sim.sends()[0].amount_usdc, 725);
+        // The long leg won the round, the short leg lost 100 of its margin.
+        assert_eq!(h.sim.balance(h.long), usd(1_275 - 500) + won());
+        assert_eq!(h.sim.balance(h.short), usd(550 - 100 + 725));
+        // Everything about the round came between the withdrawal and the send.
+        let received = h.sim.received();
+        let withdrawal = received.iter().position(|r| r.action == "withdrawToCore").unwrap();
+        let first_open = received.iter().position(|r| r.action == "openPosition").unwrap();
+        let last_close = received.iter().rfind(|r| r.action == "closePositions").unwrap();
+        assert!(withdrawal < first_open, "{received:?}");
+        assert!(last_close.at < h.sim.sends()[0].at, "{received:?}");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_round_that_closes_while_a_credit_is_awaited_does_not_pass_for_the_credit() {
+        let mut h = Harness::prepare_with(Setup { long_usd: 1_150, short_usd: 550, ..rebalancing() }).await;
+        // The funds leave the long wallet while the round is open, and are not
+        // credited to the short account for now.
+        h.sim.hold_arrivals();
+        h.sim.set_sweep(Sweep::Never);
+        h.start_bot();
+        h.hedged().await;
+        h.sim.pause("openPosition");
+        h.sim.release_arrivals();
+        in_stage(&h, Stage::Credit).await;
+        assert_eq!(h.sim.sends()[0].amount_usdc, 300);
+
+        // The round closes in the short account's favour: its margin comes back
+        // with its winnings, more than the 300 it is waiting for. That is not the credit.
+        h.sim.set_mid(ENTRY - TARGET);
+        h.flat().await;
+        assert_eq!(h.sim.balance(h.short), usd(50) + won());
+        tokio::time::sleep(A_WHILE).await;
+        assert_eq!(transfer_stage(&h).await, Some(Stage::Credit));
+
+        h.sim.set_sweep(Sweep::After(Duration::ZERO));
+        transfer_finished(&h).await;
+        assert_eq!(h.sim.balance(h.short), usd(350) + won());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn what_a_pending_withdrawal_will_take_is_not_opened_with() {
+        let mut h = Harness::prepare_with(Setup { long_usd: 680, short_usd: 680, ..rebalancing() }).await;
+        // Long enough for the round to close and the pause between two opens to
+        // pass while the withdrawal is still in the relayer's queue.
+        h.config.intent_ttl_seconds = 3;
+        h.sim.script(h.long, "withdrawToCore", &[Behavior::Hold]);
+        h.start_bot();
+        h.hedged().await;
+        tokio::time::sleep(Duration::from_millis(1_500)).await;
+
+        // The short account is left with its posted margin, so the long account
+        // sends half of the 180 it holds more. Its own margin is posted: it
+        // keeps nothing back. The withdrawal stays in the relayer's queue.
+        h.sim.set_balance(h.short, 0);
+        eventually("the withdrawal is queued", SOON, || h.sim.queued(h.long) == 1).await;
+        assert_eq!(h.store.active_transfer().await.unwrap().unwrap().amount_usdc, 90);
+        // One transfer is all this scenario is about: the relayer takes no further withdrawal.
+        h.sim.pause("withdrawToCore");
+
+        // The round closes against the long leg: 580 in the account, of which 90
+        // are about to leave. 490 do not make a margin, 580 would.
+        h.sim.set_mid(ENTRY - TARGET);
+        eventually("both legs are closed", SOON, || {
+            h.sim.positions(h.long).is_empty() && h.sim.positions(h.short).is_empty()
+        })
+        .await;
+        assert_eq!((h.sim.balance(h.long), h.sim.balance(h.short)), (usd(580), won()));
+        status_when(&h, "the open waits for the long account's balance", |status| {
+            status.summary == "flat; the long account's balance is below the margin"
+        })
+        .await;
+        assert_eq!(h.sim.queued(h.long), 1, "the withdrawal is still pending");
+        steadily("nothing is opened with money that is about to leave", Duration::from_millis(300), || {
+            h.opens() == 2
+        })
+        .await;
+
+        // The withdrawal goes through. Had the round been opened, the two would
+        // have competed for the same money and the relayer would have refused one.
+        h.sim.release();
+        transfer_finished_after(&h, 1).await;
+        assert_eq!((h.sim.balance(h.long), h.sim.balance(h.short)), (usd(490), usd(90) + won()));
+        assert_eq!(h.opens(), 2);
+        let journal = h.store.recent_intents(20).await.unwrap();
+        assert!(journal.iter().all(|row| row.status != "rejected"), "{journal:?}");
+        assert!(
+            journal.iter().all(|row| !matches!(row.outcome.as_deref(), Some("failed" | "expired"))),
+            "{journal:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn no_transfer_starts_while_the_sender_has_an_open_in_flight() {
+        let mut h = Harness::prepare_with(rebalancing()).await;
         h.sim.script(h.long, "openPosition", &[Behavior::Drop]);
         h.sim.script(h.short, "openPosition", &[Behavior::Drop]);
         h.start_bot();
@@ -1287,48 +1488,56 @@ mod funding {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn underfunded_accounts_neither_transfer_nor_open() {
+    async fn underfunded_accounts_are_only_reported_and_what_can_open_still_opens() {
         let mut h = Harness::prepare_with(Setup { long_usd: 600, short_usd: 399, ..lopsided() }).await;
         h.start_bot();
         let status = status_when(&h, "the status says so", |status| status.funds.is_some()).await;
-        assert_eq!(
-            status.summary,
-            "flat; needs funding: the two accounts together hold less than two margins"
-        );
         let funds = status.funds.unwrap();
-        assert_eq!((funds.verdict.as_str(), funds.rounds_affordable), ("underfunded", 0));
+        assert_eq!(
+            (funds.verdict.as_str(), funds.rounds_affordable, funds.planned),
+            ("underfunded", 0, None)
+        );
+        // What keeps the round from opening is the short account's own balance.
+        let waiting =
+            status_when(&h, "the reason to wait", |status| status.summary.starts_with("flat; the")).await;
+        assert_eq!(waiting.summary, "flat; the short account's balance is below the margin");
         steadily("nothing is moved or opened", A_WHILE, || {
             withdrawals(&h).is_empty() && h.sim.sends().is_empty() && h.opens() == 0
         })
         .await;
 
-        // A deposit makes both accounts good for a round and its loss.
-        h.sim.set_balance(h.short, 700);
+        // A small deposit: the short account can post its margin. The pair is
+        // still short of a round's loss, and the long account has nothing to
+        // spare. The round opens all the same.
+        h.sim.set_balance(h.short, 500);
         h.hedged().await;
         assert!(withdrawals(&h).is_empty());
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn without_wallet_keys_the_bot_only_says_what_has_to_be_moved() {
-        let mut h = Harness::prepare_with(Setup { wallet_keys: false, ..lopsided() }).await;
+    async fn rebalancing_is_off_by_default_so_wallet_keys_alone_never_start_a_transfer() {
+        // The wallet automation is on and both keys are unlocked. That is all.
+        let setup = Setup { long_usd: 2_000, short_usd: 300, ..automated() };
+        assert!(!setup.rebalance && !Setup::default().rebalance);
+        let mut h = Harness::prepare_with(setup).await;
         h.start_bot();
-        let status = status_when(&h, "the status says what to move", |status| status.funds.is_some()).await;
-        assert_eq!(
-            status.summary,
-            "flat; needs a manual rebalance: move 850 USDC from the long account to the short account (the \
-             wallets' own keys are not both unlocked)"
-        );
+        let status = status_when(&h, "the status shows the funds", |status| {
+            status.funds.is_some() && status.summary.starts_with("flat; the")
+        })
+        .await;
+        assert_eq!(status.summary, "flat; the short account's balance is below the margin");
         assert_eq!(status.decision, "wait");
         let funds = status.funds.unwrap();
-        assert_eq!((funds.verdict.as_str(), funds.can_rebalance), ("rebalance", false));
+        assert_eq!((funds.verdict.as_str(), funds.can_rebalance, funds.planned), ("off", true, None));
         assert_eq!((funds.total_usd.as_str(), funds.difference_usd.as_str()), ("2300.00", "1700.00"));
-        assert!(status.legs.iter().all(|leg| !leg.has_wallet_key));
+        assert!(status.legs.iter().all(|leg| leg.has_wallet_key));
         assert_eq!(status.transfer, None);
         steadily("nothing is moved or opened", A_WHILE, || {
             withdrawals(&h).is_empty() && h.sim.sends().is_empty() && h.opens() == 0
         })
         .await;
         assert_eq!(h.store.active_transfer().await.unwrap(), None);
+        assert!(timeline(&h).await.is_empty());
         // With no transfer to watch, Hyperliquid is not asked for anything.
         assert_eq!(h.sim.hypercore_reads(), 0);
 
@@ -1346,33 +1555,46 @@ mod funding {
         let reason = "no encrypted wallet key";
         Arc::get_mut(&mut h.keys).unwrap().short.wallet = WalletKey::Unavailable(reason.into());
         h.start_bot();
-        let status = status_when(&h, "the status says what to move", |status| status.funds.is_some()).await;
-        assert!(
-            status.summary.starts_with("flat; needs a manual rebalance: move 850 USDC"),
-            "{}",
-            status.summary
-        );
+        let status = planned_but_held_by(&h, "the wallets' own keys are not both unlocked").await;
         let keys: Vec<bool> = status.legs.iter().map(|leg| leg.has_wallet_key).collect();
         assert_eq!(keys, [true, false]);
-        assert!(!status.funds.unwrap().can_rebalance);
+        let funds = status.funds.unwrap();
+        assert_eq!((funds.verdict.as_str(), funds.can_rebalance), ("rebalance", false));
+        let planned = funds.planned.unwrap();
+        assert_eq!(
+            (planned.from, planned.to, planned.amount_usd.as_str()),
+            (Side::Long, Side::Short, "850.00")
+        );
         steadily("nothing is moved", A_WHILE, || withdrawals(&h).is_empty() && h.sim.sends().is_empty())
             .await;
+        assert_eq!(h.store.active_transfer().await.unwrap(), None);
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn a_dry_run_only_reports_the_rebalance_it_would_make() {
+    async fn a_dry_run_only_reports_the_transfer_it_would_make() {
         let mut h = Harness::prepare_with(lopsided()).await;
         h.config.dry_run = true;
         h.start_bot();
-        let status = status_when(&h, "the status shows the decision", |status| status.funds.is_some()).await;
-        assert_eq!(status.decision, "rebalance");
-        assert_eq!(status.summary, "rebalance: move 850 USDC from the long account to the short account");
-        steadily("nothing is recorded, signed or sent", A_WHILE, || {
+        let status = planned_but_held_by(&h, "dry run").await;
+        // Moving funds is not a decision about the legs.
+        assert_eq!(status.decision, "wait");
+        let funds = status.funds.unwrap();
+        assert_eq!(funds.verdict, "rebalance");
+        let planned = funds.planned.unwrap();
+        assert_eq!(
+            (planned.from, planned.to, planned.amount_usd.as_str()),
+            (Side::Long, Side::Short, "850.00")
+        );
+        steadily("nothing is recorded as started, signed or sent", A_WHILE, || {
             h.sim.received().is_empty() && h.sim.sends().is_empty()
         })
         .await;
         assert_eq!(h.store.active_transfer().await.unwrap(), None);
-        assert!(timeline(&h).await.is_empty());
+        // The plan is on the timeline once, and says that it was not started.
+        assert_eq!(
+            timeline(&h).await,
+            ["transfer planned, not started (dry run): 850 USDC from the long account to the short account"]
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -1391,8 +1613,9 @@ mod funding {
         // Opens being refused as well does not matter to a transfer.
         h.sim.pause("openPosition");
         h.start_bot();
-        let status = status_when(&h, "the status says why it waits", |status| status.funds.is_some()).await;
-        assert_eq!(status.summary, "flat; the relayer has withdrawToCore paused");
+        let status = planned_but_held_by(&h, "the relayer has withdrawToCore paused").await;
+        // The legs wait for something else: the relayer refuses opens as well.
+        assert_eq!(status.summary, "flat; the relayer has openPosition paused");
         steadily("no withdrawal is sent into the pause", A_WHILE, || withdrawals(&h).is_empty()).await;
         assert_eq!(h.store.active_transfer().await.unwrap(), None);
 
@@ -1453,7 +1676,8 @@ mod funding {
         h.start_bot();
         eventually("the withdrawal is queued", SOON, || h.sim.queued(h.long) == 1).await;
         h.stop_bot().await.unwrap();
-        // The next run is started with the wallet automation off.
+        // The next run is started with the wallet automation off, and so with rebalancing off.
+        (h.config.wallet_automation, h.config.rebalance) = (false, false);
         let keys = Arc::get_mut(&mut h.keys).unwrap();
         (keys.long.wallet, keys.short.wallet) = (WalletKey::Disabled, WalletKey::Disabled);
 
@@ -1478,7 +1702,7 @@ mod funding {
         let mut h = Harness::prepare_with(Setup { registered: false, ..lopsided() }).await;
         Arc::get_mut(&mut h.keys).unwrap().long.wallet = WalletKey::Loaded(PrivateKeySigner::random());
         h.start_bot();
-        let status = status_when(&h, "the status says what to move", |status| status.funds.is_some()).await;
+        let status = status_when(&h, "the status shows the funds", |status| status.funds.is_some()).await;
         assert!(!status.funds.unwrap().can_rebalance);
         // The short wallet's key is its own: its session key gets registered.
         eventually("the short account's session key is registered", SOON, || {

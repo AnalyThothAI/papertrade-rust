@@ -390,34 +390,51 @@ fn account_lines(leg: &LegSnapshot, now_ms: i64, room: Room) -> Vec<Line<'static
     lines
 }
 
-/// How the two accounts are funded, and the transfer between them if one is under way.
+/// How the two accounts are funded, whether the bot moves funds between them,
+/// and the transfer that is planned or under way.
 fn funds_lines(status: &Snapshot, now_ms: i64) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
     lines.push(match &status.funds {
         None => Line::from(vec![dim("funds "), plain(MISSING)]),
         Some(funds) => {
-            let verdict = match funds.verdict.as_str() {
-                "enough" => plain("enough").green(),
-                "rebalance" => plain("rebalance").yellow(),
-                other => plain(other.to_owned()).red(),
-            };
-            Line::from(vec![
+            let mut spans = vec![
                 dim("total "),
                 strong(format!("{} USD", funds.total_usd)),
                 dim(" · difference "),
                 plain(format!("{} USD", funds.difference_usd)),
                 dim(" · rounds affordable "),
                 plain(funds.rounds_affordable.to_string()),
-                dim(" · verdict "),
-                verdict,
-                dim(" · transfers "),
-                plain(if funds.can_rebalance { "automatic" } else { "manual" }),
-            ])
+                dim(" · rebalancing "),
+            ];
+            // With rebalancing off the funds are not judged: there is no verdict.
+            match funds.verdict.as_str() {
+                "off" => spans.push(plain("off").dim()),
+                verdict => spans.extend([
+                    plain("on"),
+                    dim(" · verdict "),
+                    match verdict {
+                        "enough" => plain("enough").green(),
+                        "rebalance" => plain("rebalance").yellow(),
+                        other => plain(other.to_owned()).red(),
+                    },
+                ]),
+            }
+            Line::from(spans)
         }
     });
-    match &status.transfer {
-        None => lines.push(Line::from("no transfer in progress").dim()),
-        Some(transfer) => {
+    let planned = status.funds.as_ref().and_then(|funds| funds.planned.as_ref());
+    match (&status.transfer, planned) {
+        (None, None) => lines.push(Line::from("no transfer in progress").dim()),
+        (None, Some(planned)) => lines.push(Line::from(vec![
+            dim("planned "),
+            strong(format!("{} → {} {} USD", planned.from, planned.to, planned.amount_usd)),
+            dim(" · "),
+            match &planned.held_by {
+                Some(reason) => plain(format!("not started: {reason}")).yellow(),
+                None => plain("starting"),
+            },
+        ])),
+        (Some(transfer), _) => {
             let stuck = transfer.stage == "stuck";
             let stage = if stuck { plain("stuck").red() } else { plain(transfer.stage.clone()) };
             lines.push(Line::from(vec![
@@ -530,8 +547,8 @@ mod tests {
 
     use super::*;
     use crate::status::{
-        AccountSnapshot, EstimateSnapshot, FeesSnapshot, FundsSnapshot, PositionSnapshot, RoundSnapshot,
-        TradingSnapshot, TransferSnapshot,
+        AccountSnapshot, EstimateSnapshot, FeesSnapshot, FundsSnapshot, PlannedTransfer, PositionSnapshot,
+        RoundSnapshot, TradingSnapshot, TransferSnapshot,
     };
     use crate::strategy::decide::Side;
 
@@ -612,8 +629,9 @@ mod tests {
                     total_usd: "2000.00".into(),
                     difference_usd: "0.00".into(),
                     rounds_affordable: 2,
-                    verdict: "enough".into(),
+                    verdict: "off".into(),
                     can_rebalance: false,
+                    planned: None,
                 }),
                 transfer: None,
             }),
@@ -681,7 +699,7 @@ mod tests {
                 "long 500.00 USD × 20 @ 82700.0 · bust 78604.4",
                 "short 500.00 USD × 20 @ 82700.0 · bust 86795.6",
                 // Funds
-                "total 2000.00 USD · difference 0.00 USD · rounds affordable 2 · verdict enough · transfers manual",
+                "total 2000.00 USD · difference 0.00 USD · rounds affordable 2 · rebalancing off",
                 "no transfer in progress",
                 // Ledger and timeline
                 "settled positions 12  net -81.60 USD  PAPER 58800  actual cost 0.00139 USD/PAPER",
@@ -825,6 +843,7 @@ mod tests {
             rounds_affordable: 1,
             verdict: "rebalance".into(),
             can_rebalance: true,
+            planned: None,
         });
         status.transfer = Some(TransferSnapshot {
             from: Side::Long,
@@ -837,7 +856,7 @@ mod tests {
         both_show(
             &screen,
             &[
-                "total 1840.00 USD · difference 560.00 USD · rounds affordable 1 · verdict rebalance · transfers automatic",
+                "total 1840.00 USD · difference 560.00 USD · rounds affordable 1 · rebalancing on · verdict rebalance",
                 "transfer long → short 280.00 USD · stage credit · 3m elapsed",
                 "waiting for the deposit to be credited",
             ],
@@ -856,6 +875,63 @@ mod tests {
         );
         screen.status.as_mut().unwrap().transfer.as_mut().unwrap().note = None;
         both_show(&screen, &["stage stuck · 3m elapsed", "settled positions 12"]);
+    }
+
+    #[test]
+    fn the_funds_say_whether_rebalancing_is_on_what_it_found_and_what_it_plans() {
+        let mut screen = hedged_screen();
+        let funds = |verdict: &str, planned: Option<PlannedTransfer>| FundsSnapshot {
+            total_usd: "2300.00".into(),
+            difference_usd: "1700.00".into(),
+            rounds_affordable: 0,
+            verdict: verdict.into(),
+            can_rebalance: true,
+            planned,
+        };
+        let planned = |held_by: Option<&str>| {
+            Some(PlannedTransfer {
+                from: Side::Long,
+                to: Side::Short,
+                amount_usd: "850.00".into(),
+                held_by: held_by.map(str::to_owned),
+            })
+        };
+        // Off: the funds are shown, not judged.
+        status(&mut screen).funds = Some(funds("off", None));
+        both_show(
+            &screen,
+            &[
+                "total 2300.00 USD · difference 1700.00 USD · rounds affordable 0 · rebalancing off",
+                "no transfer in progress",
+            ],
+        );
+        assert!(!render(&screen).contains("verdict") && !text(&screen).contains("verdict"));
+
+        for verdict in ["enough", "underfunded"] {
+            status(&mut screen).funds = Some(funds(verdict, None));
+            both_show(&screen, &[&format!("rebalancing on · verdict {verdict}"), "no transfer in progress"]);
+        }
+
+        // A transfer that is called for and cannot start says what it waits for.
+        status(&mut screen).funds = Some(funds("rebalance", planned(Some("dry run"))));
+        both_show(
+            &screen,
+            &["rebalancing on · verdict rebalance", "planned long → short 850.00 USD · not started: dry run"],
+        );
+        status(&mut screen).funds = Some(funds("rebalance", planned(None)));
+        both_show(&screen, &["planned long → short 850.00 USD · starting"]);
+
+        // Once it is under way, the transfer itself is what is shown.
+        status(&mut screen).transfer = Some(TransferSnapshot {
+            from: Side::Long,
+            to: Side::Short,
+            amount_usd: "850.00".into(),
+            stage: "withdraw".into(),
+            started_at_ms: NOW - 2_000,
+            note: None,
+        });
+        both_show(&screen, &["transfer long → short 850.00 USD · stage withdraw · 2s elapsed"]);
+        assert!(!render(&screen).contains("planned") && !text(&screen).contains("planned"));
     }
 
     #[test]

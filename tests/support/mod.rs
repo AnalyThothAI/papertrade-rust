@@ -846,7 +846,7 @@ pub fn fast() -> Timing {
 }
 
 /// What a scenario starts from. The default is two accounts with 2,000 USD
-/// each, registered session keys and no wallet keys.
+/// each, registered session keys, no wallet keys and rebalancing off.
 #[derive(Debug, Clone, Copy)]
 pub struct Setup {
     pub long_usd: u64,
@@ -854,13 +854,15 @@ pub struct Setup {
     /// The bot holds each wallet's own key: the wallet automation is on and
     /// both keys were unlocked.
     pub wallet_keys: bool,
+    /// `PT_REBALANCE`: the bot may start transfers between the two accounts.
+    pub rebalance: bool,
     /// Whether the bot's session keys are registered with the exchange.
     pub registered: bool,
 }
 
 impl Default for Setup {
     fn default() -> Self {
-        Self { long_usd: 2_000, short_usd: 2_000, wallet_keys: false, registered: true }
+        Self { long_usd: 2_000, short_usd: 2_000, wallet_keys: false, rebalance: false, registered: true }
     }
 }
 
@@ -916,7 +918,9 @@ impl Harness {
             true => keys_with_wallets(),
             false => session_keys(Address::with_last_byte(1), Address::with_last_byte(2)),
         };
-        let harness = Self::with_keys(keys, setup.long_usd, setup.short_usd).await;
+        let mut harness = Self::with_keys(keys, setup.long_usd, setup.short_usd).await;
+        harness.config.wallet_automation = setup.wallet_keys;
+        harness.config.rebalance = setup.rebalance;
         if setup.registered {
             for account in [&harness.keys.long, &harness.keys.short] {
                 harness.sim.set_session_key(account.owner, Some(account.session.address()));
