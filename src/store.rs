@@ -14,6 +14,7 @@ use crate::protocol::wire::Trade;
 use crate::status::Snapshot;
 use crate::strategy::decide::{Mode, Side};
 use crate::strategy::inflight::{Inflight, Kind, is_failure};
+use crate::strategy::transfer::{Stage, Transfer};
 
 /// How often opening the database is tried, and the pause in between.
 const OPEN_ATTEMPTS: u32 = 10;
@@ -51,6 +52,71 @@ struct UnresolvedRow {
     queue_revision: Option<String>,
     seen_queued: bool,
     outcome: Option<String>,
+}
+
+/// What the journal knows about one intent.
+#[derive(Debug, Clone, PartialEq, Eq, sqlx::FromRow)]
+pub struct IntentFate {
+    pub status: String,
+    pub outcome: Option<String>,
+    pub created_at_ms: i64,
+    pub settled_at_ms: Option<i64>,
+}
+
+#[derive(sqlx::FromRow)]
+struct TransferRow {
+    id: i64,
+    started_at_ms: i64,
+    from_side: String,
+    to_side: String,
+    amount_usdc: i64,
+    stage: String,
+    attempts: i64,
+    attempt_at_ms: i64,
+    core_baseline: Option<String>,
+    sender_baseline: Option<String>,
+    receiver_baseline: Option<String>,
+    withdraw_intent: Option<String>,
+    send_nonce: Option<i64>,
+    checked_at_ms: Option<i64>,
+    note: Option<String>,
+}
+
+impl TryFrom<TransferRow> for Transfer {
+    type Error = anyhow::Error;
+
+    fn try_from(row: TransferRow) -> Result<Self> {
+        let amount = |text: Option<String>| text.map(|text| text.parse::<U256>()).transpose();
+        Ok(Transfer {
+            id: row.id,
+            from: serde_json::from_value(Value::String(row.from_side))?,
+            to: serde_json::from_value(Value::String(row.to_side))?,
+            amount_usdc: u64::try_from(row.amount_usdc)?,
+            stage: Stage::parse(&row.stage)
+                .with_context(|| format!("unknown transfer stage {:?}", row.stage))?,
+            started_at_ms: row.started_at_ms,
+            attempts: u32::try_from(row.attempts)?,
+            attempt_at_ms: row.attempt_at_ms,
+            core_baseline: amount(row.core_baseline)?,
+            sender_baseline: amount(row.sender_baseline)?,
+            receiver_baseline: amount(row.receiver_baseline)?,
+            withdraw_intent: row.withdraw_intent.map(|text| text.parse()).transpose()?,
+            send_nonce: row.send_nonce.map(u64::try_from).transpose()?,
+            checked_at_ms: row.checked_at_ms,
+            note: row.note,
+        })
+    }
+}
+
+/// What `rebalance abandon` found.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Abandoned {
+    /// The stuck transfer, now ended.
+    Ended(Transfer),
+    /// The transfer is still under way. Only a stuck one can be abandoned.
+    NotStuck(Transfer),
+    /// No transfer is unfinished.
+    Nothing,
 }
 
 /// Ledger totals for display. Floating point: not for accounting.
@@ -189,19 +255,7 @@ impl Store {
 
     /// Records an intent before it is sent. If this fails, the intent must not go out.
     pub async fn journal_intent(&self, side: Side, intent: &SignedIntent) -> Result<()> {
-        sqlx::query(
-            "INSERT INTO intents (intent_id, created_at_ms, side, action, deadline, body, status)
-             VALUES (?, ?, ?, ?, ?, ?, 'signed')",
-        )
-        .bind(intent.intent_id.to_string())
-        .bind(now_ms())
-        .bind(side.as_str())
-        .bind(intent.action.as_str())
-        .bind(i64::try_from(intent.deadline)?)
-        .bind(intent.body().to_string())
-        .execute(&self.pool)
-        .await?;
-        Ok(())
+        insert_intent(&self.pool, side, intent).await
     }
 
     pub async fn mark_accepted(&self, intent_id: B256, queue_revision: U256) -> Result<()> {
@@ -263,7 +317,7 @@ impl Store {
             .map(|row| {
                 Ok(Inflight {
                     side: serde_json::from_value(Value::String(row.side))?,
-                    kind: if row.action == "openPosition" { Kind::Open } else { Kind::Close },
+                    kind: Kind::of_action(&row.action),
                     intent_id: row.intent_id.parse()?,
                     deadline: u64::try_from(row.deadline)?,
                     sent_at_ms: row.created_at_ms,
@@ -291,6 +345,113 @@ impl Store {
         .bind(limit)
         .fetch_all(&self.pool)
         .await?)
+    }
+
+    /// When the account last signed an intent of this kind, whatever became of it.
+    pub async fn last_attempt_ms(&self, side: Side, action: &str) -> Result<Option<i64>> {
+        Ok(sqlx::query_scalar("SELECT MAX(created_at_ms) FROM intents WHERE side = ? AND action = ?")
+            .bind(side.as_str())
+            .bind(action)
+            .fetch_one(&self.pool)
+            .await?)
+    }
+
+    /// What the journal holds about one intent, if it was ever journaled.
+    pub async fn intent_fate(&self, intent_id: B256) -> Result<Option<IntentFate>> {
+        Ok(sqlx::query_as(
+            "SELECT status, outcome, created_at_ms, settled_at_ms FROM intents WHERE intent_id = ?",
+        )
+        .bind(intent_id.to_string())
+        .fetch_optional(&self.pool)
+        .await?)
+    }
+
+    // --- transfers ----------------------------------------------------------------
+
+    /// Starts a transfer of whole USDC. Fails while another one is unfinished.
+    pub async fn create_transfer(&self, from: Side, to: Side, amount_usdc: u64) -> Result<Transfer> {
+        let now = now_ms();
+        let created = sqlx::query(
+            "INSERT INTO transfers (started_at_ms, from_side, to_side, amount_usdc, stage, attempts, attempt_at_ms)
+             VALUES (?, ?, ?, ?, 'withdraw', 0, ?)",
+        )
+        .bind(now)
+        .bind(from.as_str())
+        .bind(to.as_str())
+        .bind(i64::try_from(amount_usdc)?)
+        .bind(now)
+        .execute(&self.pool)
+        .await?;
+        Ok(Transfer::new(created.last_insert_rowid(), from, to, amount_usdc, now))
+    }
+
+    /// The transfer that is under way or stuck, if there is one.
+    pub async fn active_transfer(&self) -> Result<Option<Transfer>> {
+        let row: Option<TransferRow> = sqlx::query_as(
+            "SELECT id, started_at_ms, from_side, to_side, amount_usdc, stage, attempts, attempt_at_ms,
+                    core_baseline, sender_baseline, receiver_baseline, withdraw_intent, send_nonce,
+                    checked_at_ms, note
+             FROM transfers WHERE finished_at_ms IS NULL",
+        )
+        .fetch_optional(&self.pool)
+        .await?;
+        row.map(Transfer::try_from).transpose()
+    }
+
+    /// Writes the transfer's record: before the action it describes, never after.
+    /// Fails if the transfer is no longer unfinished, which only happens when
+    /// the operator has abandoned it.
+    pub async fn save_transfer(&self, transfer: &Transfer) -> Result<()> {
+        update_transfer(&self.pool, transfer).await
+    }
+
+    /// Records a withdrawal attempt together with its intent: both or neither,
+    /// so there is never an attempt without the intent a restart has to track.
+    pub async fn begin_withdrawal(&self, transfer: &Transfer, intent: &SignedIntent) -> Result<()> {
+        let mut both = self.pool.begin().await?;
+        update_transfer(&mut *both, transfer).await?;
+        insert_intent(&mut *both, transfer.from, intent).await?;
+        both.commit().await?;
+        Ok(())
+    }
+
+    /// Keeps the latest error of a transfer's action with its record.
+    pub async fn note_transfer(&self, id: i64, note: &str) -> Result<()> {
+        sqlx::query("UPDATE transfers SET note = ? WHERE id = ? AND finished_at_ms IS NULL")
+            .bind(note)
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// Ends the stuck transfer, once the operator has dealt with the funds.
+    /// A transfer that is still under way is left alone.
+    pub async fn abandon_stuck_transfer(&self) -> Result<Abandoned> {
+        let Some(transfer) = self.active_transfer().await? else { return Ok(Abandoned::Nothing) };
+        if transfer.stage != Stage::Stuck {
+            return Ok(Abandoned::NotStuck(transfer));
+        }
+        let ended = sqlx::query(
+            "UPDATE transfers SET stage = 'abandoned', finished_at_ms = ? WHERE id = ? AND stage = 'stuck'",
+        )
+        .bind(now_ms())
+        .bind(transfer.id)
+        .execute(&self.pool)
+        .await?;
+        if ended.rows_affected() == 0 {
+            return Ok(Abandoned::Nothing);
+        }
+        let summary = format!(
+            "operator abandoned transfer #{} ({} USDC from {} to {}); it was {}",
+            transfer.id,
+            transfer.amount_usdc,
+            transfer.from,
+            transfer.to,
+            transfer.note.as_deref().unwrap_or("stuck"),
+        );
+        self.record_event("transfer", &summary, None).await?;
+        Ok(Abandoned::Ended(transfer))
     }
 
     // --- ledger -------------------------------------------------------------------
@@ -341,6 +502,53 @@ impl Store {
     }
 }
 
+async fn insert_intent<'e>(
+    executor: impl sqlx::SqliteExecutor<'e>,
+    side: Side,
+    intent: &SignedIntent,
+) -> Result<()> {
+    sqlx::query(
+        "INSERT INTO intents (intent_id, created_at_ms, side, action, deadline, body, status)
+         VALUES (?, ?, ?, ?, ?, ?, 'signed')",
+    )
+    .bind(intent.intent_id.to_string())
+    .bind(now_ms())
+    .bind(side.as_str())
+    .bind(intent.action.as_str())
+    .bind(i64::try_from(intent.deadline)?)
+    .bind(intent.body().to_string())
+    .execute(executor)
+    .await?;
+    Ok(())
+}
+
+async fn update_transfer<'e>(executor: impl sqlx::SqliteExecutor<'e>, transfer: &Transfer) -> Result<()> {
+    let amount = |amount: Option<U256>| amount.map(|amount| amount.to_string());
+    let written = sqlx::query(
+        "UPDATE transfers
+         SET stage = ?, finished_at_ms = ?, attempts = ?, attempt_at_ms = ?, core_baseline = ?,
+             sender_baseline = ?, receiver_baseline = ?, withdraw_intent = ?, send_nonce = ?,
+             checked_at_ms = ?, note = ?
+         WHERE id = ? AND finished_at_ms IS NULL",
+    )
+    .bind(transfer.stage.as_str())
+    .bind((transfer.stage == Stage::Done).then(now_ms))
+    .bind(transfer.attempts)
+    .bind(transfer.attempt_at_ms)
+    .bind(amount(transfer.core_baseline))
+    .bind(amount(transfer.sender_baseline))
+    .bind(amount(transfer.receiver_baseline))
+    .bind(transfer.withdraw_intent.map(|id| id.to_string()))
+    .bind(transfer.send_nonce.map(i64::try_from).transpose()?)
+    .bind(transfer.checked_at_ms)
+    .bind(&transfer.note)
+    .bind(transfer.id)
+    .execute(executor)
+    .await?;
+    anyhow::ensure!(written.rows_affected() == 1, "transfer #{} is no longer under way", transfer.id);
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use alloy::primitives::address;
@@ -348,7 +556,7 @@ mod tests {
 
     use super::*;
     use crate::protocol::deployment::usd;
-    use crate::protocol::intents::{OpenPosition, sign_open_position};
+    use crate::protocol::intents::{OpenPosition, WithdrawToCore, sign_open_position, sign_withdraw_to_core};
     use crate::protocol::wire::{Dec, SignedDec};
 
     const WALLET: Address = address!("0x000000000000000000000000000000000000dead");
@@ -541,6 +749,156 @@ mod tests {
         store.journal_intent(Side::Long, &intent(1)).await.unwrap();
         let attempt = store.last_open_attempt_ms().await.unwrap().unwrap();
         assert!((before..=now_ms()).contains(&attempt));
+    }
+
+    fn withdrawal(nonce: u64) -> SignedIntent {
+        let wallet = PrivateKeySigner::random();
+        let message = WithdrawToCore {
+            user: wallet.address(),
+            amount: U256::from(850_000_000u64),
+            nonce: U256::from(nonce),
+            deadline: 1_800_000_120,
+        };
+        sign_withdraw_to_core(&wallet, &message).unwrap()
+    }
+
+    #[tokio::test]
+    async fn the_journal_tells_what_became_of_an_intent_and_when_each_kind_was_last_tried() {
+        let store = Store::in_memory().await.unwrap();
+        let (open, withdrawn) = (intent(1), withdrawal(2));
+        assert_eq!(store.intent_fate(withdrawn.intent_id).await.unwrap(), None);
+        assert_eq!(store.last_attempt_ms(Side::Long, "withdrawToCore").await.unwrap(), None);
+        store.journal_intent(Side::Short, &open).await.unwrap();
+        store.journal_intent(Side::Long, &withdrawn).await.unwrap();
+
+        // The withdrawal is tracked like any other intent, under its own kind.
+        let unresolved = store.unresolved_intents().await.unwrap();
+        assert_eq!(
+            unresolved.iter().map(|entry| entry.kind).collect::<Vec<_>>(),
+            [Kind::Open, Kind::Withdraw]
+        );
+        let fate = store.intent_fate(withdrawn.intent_id).await.unwrap().unwrap();
+        assert_eq!((fate.status.as_str(), fate.outcome, fate.settled_at_ms), ("signed", None, None));
+        assert_eq!(
+            store.last_attempt_ms(Side::Long, "withdrawToCore").await.unwrap(),
+            Some(fate.created_at_ms)
+        );
+        assert_eq!(store.last_attempt_ms(Side::Short, "withdrawToCore").await.unwrap(), None);
+        assert_eq!(store.last_attempt_ms(Side::Long, "openPosition").await.unwrap(), None);
+
+        store.set_outcome(withdrawn.intent_id, "expired").await.unwrap();
+        store.mark_settled(withdrawn.intent_id).await.unwrap();
+        let fate = store.intent_fate(withdrawn.intent_id).await.unwrap().unwrap();
+        assert_eq!((fate.status.as_str(), fate.outcome.as_deref()), ("settled", Some("expired")));
+        assert!(fate.settled_at_ms.is_some_and(|at| at >= fate.created_at_ms));
+    }
+
+    #[tokio::test]
+    async fn one_transfer_at_a_time_and_its_record_survives_as_written() {
+        let store = Store::in_memory().await.unwrap();
+        assert_eq!(store.active_transfer().await.unwrap(), None);
+        let created = store.create_transfer(Side::Long, Side::Short, 850).await.unwrap();
+        assert_eq!(created, Transfer::new(created.id, Side::Long, Side::Short, 850, created.started_at_ms));
+        assert_eq!(store.active_transfer().await.unwrap(), Some(created.clone()));
+        // While it is unfinished there is no second one, in either direction.
+        assert!(store.create_transfer(Side::Short, Side::Long, 10).await.is_err());
+
+        let written = Transfer {
+            stage: Stage::Credit,
+            attempts: 2,
+            attempt_at_ms: 1_791_700_000_456,
+            core_baseline: Some(usd(855)),
+            sender_baseline: Some(usd(2_000)),
+            receiver_baseline: Some(U256::from(300_123_456_789_012_345_678u128)),
+            withdraw_intent: Some(B256::with_last_byte(9)),
+            send_nonce: Some(1_791_700_000_123),
+            checked_at_ms: Some(1_791_700_000_789),
+            note: Some("HTTP 502".into()),
+            ..created.clone()
+        };
+        store.save_transfer(&written).await.unwrap();
+        assert_eq!(store.active_transfer().await.unwrap(), Some(written.clone()));
+        store.note_transfer(written.id, "timed out").await.unwrap();
+        let noted = Transfer { note: Some("timed out".into()), ..written.clone() };
+        assert_eq!(store.active_transfer().await.unwrap(), Some(noted));
+
+        // Done ends it, and the next one can start.
+        store.save_transfer(&Transfer { stage: Stage::Done, ..written.clone() }).await.unwrap();
+        assert_eq!(store.active_transfer().await.unwrap(), None);
+        assert!(store.save_transfer(&written).await.unwrap_err().to_string().contains("no longer under way"));
+        let next = store.create_transfer(Side::Short, Side::Long, 10).await.unwrap();
+        assert_ne!(next.id, created.id);
+    }
+
+    #[tokio::test]
+    async fn a_transfer_between_one_account_and_itself_cannot_be_recorded() {
+        let store = Store::in_memory().await.unwrap();
+        assert!(store.create_transfer(Side::Long, Side::Long, 850).await.is_err());
+        assert!(store.create_transfer(Side::Long, Side::Short, 0).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn a_withdrawal_attempt_and_its_intent_are_written_together_or_not_at_all() {
+        let store = Store::in_memory().await.unwrap();
+        let created = store.create_transfer(Side::Long, Side::Short, 850).await.unwrap();
+        let intent = withdrawal(1);
+        let attempt = Transfer {
+            attempts: 1,
+            core_baseline: Some(usd(5)),
+            sender_baseline: Some(usd(2_000)),
+            withdraw_intent: Some(intent.intent_id),
+            ..created.clone()
+        };
+        store.begin_withdrawal(&attempt, &intent).await.unwrap();
+        assert_eq!(store.active_transfer().await.unwrap(), Some(attempt.clone()));
+        let journaled = store.unresolved_intents().await.unwrap();
+        assert_eq!(
+            journaled.iter().map(|entry| (entry.side, entry.kind, entry.intent_id)).collect::<Vec<_>>(),
+            [(Side::Long, Kind::Withdraw, intent.intent_id)]
+        );
+
+        // The same intent cannot be journaled twice, so this attempt is not recorded either.
+        let again = Transfer { attempts: 2, ..attempt.clone() };
+        assert!(store.begin_withdrawal(&again, &intent).await.is_err());
+        assert_eq!(store.active_transfer().await.unwrap(), Some(attempt));
+        assert_eq!(store.unresolved_intents().await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn only_a_stuck_transfer_can_be_abandoned() {
+        let store = Store::in_memory().await.unwrap();
+        assert_eq!(store.abandon_stuck_transfer().await.unwrap(), Abandoned::Nothing);
+
+        let moving = store.create_transfer(Side::Long, Side::Short, 850).await.unwrap();
+        assert_eq!(store.abandon_stuck_transfer().await.unwrap(), Abandoned::NotStuck(moving.clone()));
+        assert_eq!(store.active_transfer().await.unwrap(), Some(moving.clone()));
+
+        let stuck = Transfer {
+            stage: Stage::Stuck,
+            note: Some("stuck in credit: the short account was not credited".into()),
+            ..moving
+        };
+        store.save_transfer(&stuck).await.unwrap();
+        // Stuck is not finished: it still stands in the way of the next transfer.
+        assert_eq!(store.active_transfer().await.unwrap(), Some(stuck.clone()));
+        assert!(store.create_transfer(Side::Long, Side::Short, 850).await.is_err());
+
+        assert_eq!(store.abandon_stuck_transfer().await.unwrap(), Abandoned::Ended(stuck.clone()));
+        assert_eq!(store.active_transfer().await.unwrap(), None);
+        assert_eq!(store.abandon_stuck_transfer().await.unwrap(), Abandoned::Nothing);
+        // The bot can no longer write to it, and the timeline says who ended it.
+        assert!(store.save_transfer(&stuck).await.is_err());
+        let events = store.recent_events(1).await.unwrap();
+        assert_eq!(events[0].kind, "transfer");
+        assert_eq!(
+            events[0].summary,
+            format!(
+                "operator abandoned transfer #{} (850 USDC from long to short); it was stuck in credit: the \
+                 short account was not credited",
+                stuck.id
+            )
+        );
+        store.create_transfer(Side::Long, Side::Short, 850).await.unwrap();
     }
 
     #[tokio::test]

@@ -107,6 +107,23 @@ impl Client {
         }
     }
 
+    /// Asks the relayer to look at the wallet's deposit address now, so that
+    /// funds which have arrived there are credited without waiting for its own
+    /// round. Returns the address the relayer checked, for the log only: where
+    /// to send funds is never taken from here.
+    pub async fn check_deposit(&self, user: Address) -> reqwest::Result<Option<Address>> {
+        let reply: Value = self
+            .http
+            .post(format!("{}/funding/deposits/check", self.origin))
+            .json(&serde_json::json!({ "user": format!("{user:#x}") }))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        Ok(reply.get("proxy").and_then(Value::as_str).and_then(|proxy| proxy.parse().ok()))
+    }
+
     async fn get<T: DeserializeOwned>(&self, path: &str) -> reqwest::Result<T> {
         self.http.get(format!("{}{path}", self.origin)).send().await?.error_for_status()?.json().await
     }

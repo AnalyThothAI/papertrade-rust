@@ -9,6 +9,29 @@ use crate::protocol::account::AccountState;
 pub enum Kind {
     Open,
     Close,
+    /// A withdrawal to the wallet's HyperCore account, part of a transfer.
+    Withdraw,
+    /// A session key registration.
+    Register,
+}
+
+impl Kind {
+    /// The kind an action on the wire belongs to.
+    pub fn of_action(action: &str) -> Self {
+        match action {
+            "openPosition" => Kind::Open,
+            "withdrawToCore" => Kind::Withdraw,
+            "registerSessionKey" => Kind::Register,
+            _ => Kind::Close,
+        }
+    }
+
+    /// Opens and closes decide what the legs hold, so they are what the
+    /// strategy waits for. A withdrawal or a registration in flight must never
+    /// hold back a close.
+    pub fn is_trade(self) -> bool {
+        matches!(self, Kind::Open | Kind::Close)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -50,6 +73,9 @@ pub enum Awaiting {
 ///   Assuming a vanished open has failed would make the other leg look unhedged.
 /// - A close is also settled once it has left the relayer's queue. If the
 ///   position is still there, closing again is harmless.
+/// - A withdrawal or a registration is tracked like an open: until the relayer
+///   reports a failure or the deadline has passed. A second withdrawal is real
+///   money, so "it vanished" is not taken to mean "it did nothing".
 pub fn track(inflight: Inflight, account: Option<&AccountState>) -> Option<Inflight> {
     let Some(account) = account else { return Some(inflight) };
     if inflight.failed {
@@ -196,6 +222,32 @@ mod tests {
     fn an_unknown_outcome_turns_out_accepted_when_the_relayer_lists_it() {
         let tracked = track(unknown(Kind::Open), Some(&listing_it(0)));
         assert_eq!(tracked, Some(Inflight { seen_queued: true, ..unknown(Kind::Open) }));
+    }
+
+    #[test]
+    fn a_withdrawal_or_a_registration_is_in_flight_until_it_fails_or_expires() {
+        for kind in [Kind::Withdraw, Kind::Register] {
+            // Leaving the queue does not settle it: it may have executed just then.
+            assert_eq!(track(accepted(kind), Some(&at_revision(5))), Some(accepted(kind)));
+            let seen = Inflight { seen_queued: true, ..accepted(kind) };
+            assert_eq!(track(seen.clone(), Some(&at_revision(9))), Some(seen));
+            // An unanswered one could still execute until the chain clock is past its deadline.
+            let on_deadline = AccountState { indexed_through_timestamp: DEADLINE, ..at_revision(99) };
+            assert_eq!(track(unknown(kind), Some(&on_deadline)), Some(unknown(kind)));
+            let later = AccountState { indexed_through_timestamp: DEADLINE + 1, ..account() };
+            assert_eq!(track(unknown(kind), Some(&later)), None);
+            let failed = Inflight { failed: true, ..accepted(kind) };
+            assert_eq!(track(failed, Some(&listing_it(5))), None);
+        }
+    }
+
+    #[test]
+    fn only_opens_and_closes_are_trades() {
+        assert!(Kind::Open.is_trade() && Kind::Close.is_trade());
+        assert!(!Kind::Withdraw.is_trade() && !Kind::Register.is_trade());
+        let kinds =
+            ["openPosition", "closePositions", "withdrawToCore", "registerSessionKey"].map(Kind::of_action);
+        assert_eq!(kinds, [Kind::Open, Kind::Close, Kind::Withdraw, Kind::Register]);
     }
 
     #[test]

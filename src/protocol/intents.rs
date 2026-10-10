@@ -41,7 +41,19 @@ sol! {
         uint256 nonce;
         uint64 deadline;
     }
+
+    #[derive(Debug, PartialEq, Eq)]
+    struct WithdrawToCore {
+        address user;
+        /// USDC with 6 decimals, unlike the 18-decimal amounts everywhere else.
+        uint256 amount;
+        uint256 nonce;
+        uint64 deadline;
+    }
 }
+
+/// `WithdrawToCore` counts USDC in millionths.
+pub const USDC_UNIT: u64 = 1_000_000;
 
 /// EIP-712 domain of the Exchange contract. The name really is "String".
 pub fn exchange_domain() -> Eip712Domain {
@@ -58,6 +70,7 @@ pub enum Action {
     RegisterSessionKey,
     OpenPosition,
     ClosePositions,
+    WithdrawToCore,
 }
 
 impl Action {
@@ -67,6 +80,7 @@ impl Action {
             Self::RegisterSessionKey => "registerSessionKey",
             Self::OpenPosition => "openPosition",
             Self::ClosePositions => "closePositions",
+            Self::WithdrawToCore => "withdrawToCore",
         }
     }
 }
@@ -81,12 +95,20 @@ pub struct SignedIntent {
     /// Unix seconds after which the contract rejects the intent.
     pub deadline: u64,
     pub signed: Value,
+    /// Where a withdrawal goes on from HyperCore. Unsigned: the contract only
+    /// ever pays the user's own HyperCore account, this tells the relayer that
+    /// nothing follows.
+    pub withdrawal: Option<Value>,
 }
 
 impl SignedIntent {
     /// The request body, exactly as it is sent and journaled.
     pub fn body(&self) -> Value {
-        json!({ "action": self.action.as_str(), "signed": self.signed })
+        let mut body = json!({ "action": self.action.as_str(), "signed": self.signed });
+        if let Some(withdrawal) = &self.withdrawal {
+            body["withdrawal"] = withdrawal.clone();
+        }
+        body
     }
 }
 
@@ -130,6 +152,32 @@ pub fn sign_close(signer: &PrivateKeySigner, message: &Close) -> Result<SignedIn
     });
     let signature = signer.sign_hash_sync(&digest)?;
     seal(Action::ClosePositions, fields, message.user, message.deadline, digest, signature, signer.address())
+}
+
+/// A withdrawal to the wallet's own HyperCore account. Only the wallet's own
+/// key can sign one: the contract refuses a session key here.
+pub fn sign_withdraw_to_core(
+    signer: &PrivateKeySigner,
+    message: &WithdrawToCore,
+) -> Result<SignedIntent, SealError> {
+    let digest = message.eip712_signing_hash(&exchange_domain());
+    let fields = json!({
+        "user": lower(message.user),
+        "amount": message.amount.to_string(),
+        "nonce": message.nonce.to_string(),
+        "deadline": message.deadline.to_string(),
+    });
+    let signature = signer.sign_hash_sync(&digest)?;
+    let sealed = seal(
+        Action::WithdrawToCore,
+        fields,
+        message.user,
+        message.deadline,
+        digest,
+        signature,
+        message.user,
+    )?;
+    Ok(SignedIntent { withdrawal: Some(json!({ "route": "hypercore" })), ..sealed })
 }
 
 /// Seals a registration signed elsewhere; the master key never has to touch this process.
@@ -235,7 +283,7 @@ fn seal(
     extend_with_signature(&mut signed, &signature);
     let tag = keccak256("papertrade:intent-id:v2");
     let intent_id = keccak256([tag.as_slice(), digest.as_slice(), signer.as_slice()].concat());
-    Ok(SignedIntent { action, intent_id, user, deadline, signed: Value::Object(signed) })
+    Ok(SignedIntent { action, intent_id, user, deadline, signed: Value::Object(signed), withdrawal: None })
 }
 
 /// The relayer takes the signature split, with `v` as a decimal string.
@@ -328,6 +376,67 @@ mod tests {
         let (intent_id, body) = golden("register");
         assert_eq!(intent.body(), body);
         assert_eq!(intent.intent_id, intent_id);
+    }
+
+    fn withdrawal() -> WithdrawToCore {
+        WithdrawToCore {
+            user: MASTER,
+            amount: U256::from(850 * USDC_UNIT),
+            nonce: U256::from(3_912_476_162u64),
+            deadline: 1_791_621_690,
+        }
+    }
+
+    #[test]
+    fn a_withdrawal_is_signed_by_the_wallet_and_says_where_it_goes() {
+        // The type the Exchange hashes, as its `withdrawToCoreBySig` accepted it in a
+        // read-only simulation against production.
+        assert_eq!(
+            WithdrawToCore::eip712_encode_type(),
+            "WithdrawToCore(address user,uint256 amount,uint256 nonce,uint64 deadline)"
+        );
+        let message = withdrawal();
+        let intent = sign_withdraw_to_core(&signer(MASTER_KEY), &message).unwrap();
+        let signed = &intent.signed;
+        assert_eq!(
+            intent.body(),
+            serde_json::json!({
+                "action": "withdrawToCore",
+                "signed": {
+                    "user": "0x70997970c51812dc3a010c7d01b50e0d17dc79c8",
+                    "amount": "850000000",
+                    "nonce": "3912476162",
+                    "deadline": "1791621690",
+                    "v": signed["v"],
+                    "r": signed["r"],
+                    "s": signed["s"],
+                },
+                "withdrawal": { "route": "hypercore" },
+            })
+        );
+        assert_eq!((intent.user, intent.deadline), (MASTER, 1_791_621_690));
+
+        // The signature in the body is the wallet's over the EIP-712 digest.
+        let text = |field: &str| signed[field].as_str().unwrap();
+        let signature =
+            Signature::new(text("r").parse().unwrap(), text("s").parse().unwrap(), text("v") == "28");
+        let digest = message.eip712_signing_hash(&exchange_domain());
+        assert_eq!(signature.recover_address_from_prehash(&digest).unwrap(), MASTER);
+    }
+
+    #[test]
+    fn a_withdrawal_signed_by_a_session_key_is_refused() {
+        let error = sign_withdraw_to_core(&signer(SESSION_KEY), &withdrawal()).unwrap_err();
+        assert!(matches!(error, SealError::WrongSigner { expected, .. } if expected == MASTER));
+    }
+
+    #[test]
+    fn only_a_withdrawal_carries_the_withdrawal_field() {
+        let message =
+            Close { user: MASTER, positionIds: vec![U256::from(1)], nonce: U256::from(1), deadline: 1 };
+        let close = sign_close(&signer(SESSION_KEY), &message).unwrap();
+        assert_eq!(close.withdrawal, None);
+        assert!(close.body().get("withdrawal").is_none());
     }
 
     #[test]

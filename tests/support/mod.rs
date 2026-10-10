@@ -8,6 +8,12 @@
 
 #![allow(dead_code)]
 
+mod funding;
+
+// Not every test binary that shares this module scripts the funding side.
+#[allow(unused_imports)]
+pub use funding::{SendBehavior, Sweep};
+
 use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::convert::Infallible;
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -119,6 +125,8 @@ struct World {
     accounts: HashMap<Address, Account>,
     scripts: HashMap<(Address, String), VecDeque<Behavior>>,
     received: Vec<Received>,
+    /// HyperCore balances, Hyperliquid sends and the relayer's sweeping.
+    funding: funding::Funding,
     next_position_id: u64,
     stream_up: bool,
     held: bool,
@@ -220,6 +228,7 @@ impl World {
     fn step(&mut self) {
         let (mid, held, delay) = (self.mid, self.held, self.execution_delay);
         let next_id = &mut self.next_position_id;
+        let funding = &mut self.funding;
         for account in self.accounts.values_mut() {
             let due: Vec<Position> = {
                 let (ready, waiting) = std::mem::take(&mut account.unindexed)
@@ -244,9 +253,12 @@ impl World {
                     continue;
                 }
                 let operation = account.operations.remove(index);
+                // Withdrawals and registrations are the funding side's to execute.
+                let Some(operation) = funding.execute(account, operation) else { continue };
                 execute(account, operation, mid, next_id);
             }
         }
+        funding::step(self);
     }
 }
 
@@ -380,7 +392,7 @@ fn identify(action: &str, signed: &Value) -> Option<(B256, Address, u64)> {
             deadline,
         }
         .eip712_signing_hash(&exchange_domain()),
-        _ => return None,
+        _ => funding::digest(action, signed)?,
     };
     let signature = Signature::new(text("r")?.parse().ok()?, text("s")?.parse().ok()?, text("v")? == "28");
     let signer = signature.recover_address_from_prehash(&digest).ok()?;
@@ -418,8 +430,18 @@ async fn intents(State(world): State<Shared>, Json(body): Json<Value>) -> Respon
             json!({ "code": "admission_rejected", "reason": "noDeposit" }),
         );
     };
-    if !account.session_keys.iter().any(|(key, expiry)| *key == signer && *expiry > unix_seconds()) {
+    // A withdrawal or a registration takes the wallet's own key; a trade takes a
+    // registered session key, and the wallet's own key is refused for it.
+    let authorized = if funding::signed_by_the_wallet(action) {
+        signer == wallet
+    } else {
+        account.session_keys.iter().any(|(key, expiry)| *key == signer && *expiry > unix_seconds())
+    };
+    if !authorized {
         return rejection(StatusCode::FORBIDDEN, json!({ "code": "unauthorized_intent" }));
+    }
+    if let Some(refusal) = funding::refusal(action, &body, account) {
+        return refusal;
     }
     if action == "openPosition" && signed["size"].as_str().unwrap().parse::<U256>().unwrap() > account.balance
     {
@@ -498,7 +520,10 @@ async fn rpc(State(world): State<Shared>, Json(request): Json<Value>) -> Json<Va
     let to = call["to"].as_str().and_then(|to| to.parse::<Address>().ok());
     let data = call["data"].as_str().and_then(|data| data.parse::<alloy::primitives::Bytes>().ok());
     let returned = match (request["method"].as_str(), to, data) {
-        (Some("eth_call"), Some(to), Some(data)) => eth_call(&world.lock().unwrap(), to, &data),
+        (Some("eth_call"), Some(to), Some(data)) => {
+            let world = world.lock().unwrap();
+            funding::eth_call(&world, to, &data).or_else(|| eth_call(&world, to, &data))
+        }
         _ => None,
     };
     Json(match returned {
@@ -553,6 +578,7 @@ impl Sim {
             accounts: HashMap::new(),
             scripts: HashMap::new(),
             received: Vec::new(),
+            funding: funding::Funding::default(),
             next_position_id: 1,
             stream_up: true,
             held: true,
@@ -562,6 +588,7 @@ impl Sim {
         }));
         let app = Router::new()
             .route("/intents", post(intents))
+            .route("/funding/deposits/check", post(funding::check_deposit))
             .route("/state/trading", get(trading_state))
             .route("/state/user/live", get(live))
             .route("/query/protocol/queue-summary", get(queue_summary))
@@ -781,6 +808,26 @@ pub fn fast() -> Timing {
             retry_min: Duration::from_millis(30),
             retry_max: Duration::from_millis(120),
         },
+        funding: funding::fast(),
+    }
+}
+
+/// What a scenario starts from. The default is two accounts with 2,000 USD
+/// each, registered session keys and no wallet keys.
+#[derive(Debug, Clone, Copy)]
+pub struct Setup {
+    pub long_usd: u64,
+    pub short_usd: u64,
+    /// The bot holds each wallet's own key: the wallet automation is on and
+    /// both keys were unlocked.
+    pub wallet_keys: bool,
+    /// Whether the bot's session keys are registered with the exchange.
+    pub registered: bool,
+}
+
+impl Default for Setup {
+    fn default() -> Self {
+        Self { long_usd: 2_000, short_usd: 2_000, wallet_keys: false, registered: true }
     }
 }
 
@@ -792,15 +839,27 @@ pub fn session_keys(long: Address, short: Address) -> UnlockedKeys {
     UnlockedKeys { long: account(long), short: account(short) }
 }
 
+/// The same for two wallets whose own keys the bot holds as well. A wallet's
+/// own key is the key of its address, so these accounts are new wallets.
+pub fn keys_with_wallets() -> UnlockedKeys {
+    let account = || {
+        let wallet = PrivateKeySigner::random();
+        let (owner, session) = (wallet.address(), PrivateKeySigner::random());
+        AccountKeys { owner, session, wallet: WalletKey::Loaded(wallet) }
+    };
+    UnlockedKeys { long: account(), short: account() }
+}
+
 /// The simulator, two funded accounts with registered session keys, and the bot.
 pub struct Harness {
     pub sim: Sim,
     pub long: Address,
     pub short: Address,
     pub store: Store,
-    /// What the bot is started with; a scenario may change either before it starts the bot.
+    /// What the bot is started with; a scenario may change any of them before it starts the bot.
     pub config: Config,
     pub keys: Arc<UnlockedKeys>,
+    pub timing: Timing,
     dir: TempDir,
     bot: Option<(oneshot::Sender<()>, JoinHandle<Result<()>>)>,
 }
@@ -815,13 +874,23 @@ pub const TTL: Duration = Duration::from_secs(2);
 impl Harness {
     /// Starts the simulator and the accounts, but not the bot.
     pub async fn prepare() -> Self {
+        Self::prepare_with(Setup::default()).await
+    }
+
+    /// Like `prepare`, from the given starting point.
+    pub async fn prepare_with(setup: Setup) -> Self {
         let sim = Sim::start(ENTRY).await;
         let dir = tempfile::tempdir().unwrap();
-        let long = Address::with_last_byte(1);
-        let short = Address::with_last_byte(2);
-        let keys = Arc::new(session_keys(long, short));
-        for account in [&keys.long, &keys.short] {
-            sim.add_account(account.owner, account.session.address(), 2_000);
+        let keys = Arc::new(match setup.wallet_keys {
+            true => keys_with_wallets(),
+            false => session_keys(Address::with_last_byte(1), Address::with_last_byte(2)),
+        });
+        let (long, short) = (keys.long.owner, keys.short.owner);
+        for (account, balance_usd) in [(&keys.long, setup.long_usd), (&keys.short, setup.short_usd)] {
+            sim.add_account(account.owner, account.session.address(), balance_usd);
+            if !setup.registered {
+                sim.set_session_key(account.owner, None);
+            }
         }
         let config = Args::try_parse_from([
             "papertrade",
@@ -842,7 +911,7 @@ impl Harness {
         .unwrap()
         .config;
         let store = Store::open(&config.database()).await.unwrap();
-        Self { sim, long, short, store, config, keys, dir, bot: None }
+        Self { sim, long, short, store, config, keys, timing: fast(), dir, bot: None }
     }
 
     /// The simulator, the accounts and a running bot.
@@ -857,11 +926,13 @@ impl Harness {
         let (config, store, quote) = (self.config.clone(), self.store.clone(), self.sim.quote());
         let client = Client::with_origin(&self.sim.url).unwrap();
         let (chain, keys) = (self.sim.chain(), self.keys.clone());
+        let (timing, hypercore) = (self.timing, self.sim.hypercore());
         let bot = tokio::spawn(async move {
             let shutdown = async {
                 let _ = stopped.await;
             };
-            bot::run_with(&config, store, client, chain, move |_, _| quote, fast(), keys, shutdown).await
+            let price = move |_, _: &mut tokio::task::JoinSet<()>| quote;
+            bot::run_with(&config, store, client, chain, price, timing, keys, hypercore, shutdown).await
         });
         self.bot = Some((stop, bot));
     }
@@ -881,6 +952,7 @@ impl Harness {
             price,
             fast(),
             self.keys.clone(),
+            self.sim.hypercore(),
             std::future::pending(),
         )
         .await
@@ -903,7 +975,7 @@ impl Harness {
                 let dead = starts <= dead_feeds;
                 let (config, store, quote, chain) = (config.clone(), store.clone(), sim.quote(), sim.chain());
                 let client = Client::with_origin(&sim.url).unwrap();
-                let keys = keys.clone();
+                let (keys, hypercore) = (keys.clone(), sim.hypercore());
                 async move {
                     let price = move |_, tasks: &mut tokio::task::JoinSet<()>| {
                         if dead {
@@ -911,7 +983,7 @@ impl Harness {
                         }
                         quote
                     };
-                    bot::start_with(&config, store, client, chain, price, fast(), keys).await
+                    bot::start_with(&config, store, client, chain, price, fast(), keys, hypercore).await
                 }
             };
             bot::keep_running(start, Duration::from_millis(100), stop).await
