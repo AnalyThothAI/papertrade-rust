@@ -32,8 +32,9 @@ use papertrade::market::Quote;
 use papertrade::protocol::chain::Chain;
 use papertrade::protocol::client::Client;
 use papertrade::protocol::deployment::{EXCHANGE, usd};
-use papertrade::protocol::intents::{Close, OpenPosition, exchange_domain};
+use papertrade::protocol::intents::{Close, OpenPosition, RegisterSessionKey, exchange_domain};
 use papertrade::protocol::stream::StreamTiming;
+use papertrade::status::Snapshot;
 use papertrade::store::Store;
 use serde_json::{Value, json};
 use tempfile::TempDir;
@@ -261,6 +262,14 @@ fn execute(account: &mut Account, operation: Operation, mid: u64, next_id: &mut 
         return account.publish(ended("failed"));
     }
     let signed = &operation.signed;
+    if operation.action == "registerSessionKey" {
+        // From here on the key may trade for the account, until it expires.
+        let key: Address = signed["key"].as_str().unwrap().parse().unwrap();
+        let expiry: u64 = signed["expiry"].as_str().unwrap().parse().unwrap();
+        account.session_keys.retain(|(known, _)| *known != key);
+        account.session_keys.push((key, expiry));
+        return account.publish(ended("succeeded"));
+    }
     if operation.action == "openPosition" {
         let margin: U256 = signed["size"].as_str().unwrap().parse().unwrap();
         let position = Position {
@@ -380,6 +389,15 @@ fn identify(action: &str, signed: &Value) -> Option<(B256, Address, u64)> {
             deadline,
         }
         .eip712_signing_hash(&exchange_domain()),
+        "registerSessionKey" => RegisterSessionKey {
+            user: text("user")?.parse().ok()?,
+            key: text("key")?.parse().ok()?,
+            expiry: text("expiry")?.parse().ok()?,
+            feeAddress: text("feeAddress")?.parse().ok()?,
+            nonce: text("nonce")?.parse().ok()?,
+            deadline,
+        }
+        .eip712_signing_hash(&exchange_domain()),
         _ => return None,
     };
     let signature = Signature::new(text("r")?.parse().ok()?, text("s")?.parse().ok()?, text("v")? == "28");
@@ -418,7 +436,14 @@ async fn intents(State(world): State<Shared>, Json(body): Json<Value>) -> Respon
             json!({ "code": "admission_rejected", "reason": "noDeposit" }),
         );
     };
-    if !account.session_keys.iter().any(|(key, expiry)| *key == signer && *expiry > unix_seconds()) {
+    // A wallet registers its session keys itself. A trade takes a session key the
+    // wallet has registered, and nothing else: not even the wallet's own key.
+    let authorized = if action == "registerSessionKey" {
+        signer == wallet
+    } else {
+        account.session_keys.iter().any(|(key, expiry)| *key == signer && *expiry > unix_seconds())
+    };
+    if !authorized {
         return rejection(StatusCode::FORBIDDEN, json!({ "code": "unauthorized_intent" }));
     }
     if action == "openPosition" && signed["size"].as_str().unwrap().parse::<U256>().unwrap() > account.balance
@@ -587,13 +612,14 @@ impl Sim {
         self.world.lock().unwrap()
     }
 
-    pub fn add_account(&self, wallet: Address, session_key: Address, balance_usd: u64) {
+    /// A funded account whose wallet has registered no session key yet.
+    pub fn add_account(&self, wallet: Address, balance_usd: u64) {
         let account = Account {
             address: wallet,
             revision: 1,
             queue_revision: 0,
             balance: usd(balance_usd),
-            session_keys: vec![(session_key, unix_seconds() + 30 * 86_400)],
+            session_keys: Vec::new(),
             positions: Vec::new(),
             operations: Vec::new(),
             unindexed: Vec::new(),
@@ -751,6 +777,19 @@ where
     }
 }
 
+/// The first stored status for which `wanted` holds. The bot rewrites its status
+/// about once a second, so this can take that long.
+pub async fn status_when(h: &Harness, what: &str, wanted: impl Fn(&Snapshot) -> bool) -> Snapshot {
+    let (started, within) = (Instant::now(), Duration::from_secs(5));
+    loop {
+        if let Some(status) = h.store.read_status().await.unwrap().filter(&wanted) {
+            return status;
+        }
+        assert!(started.elapsed() < within, "timed out after {within:?} waiting for a status with: {what}");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
 /// Asserts that `holds` stays true for the whole of `during`.
 pub async fn steadily(what: &str, during: Duration, mut holds: impl FnMut() -> bool) {
     let started = Instant::now();
@@ -815,13 +854,22 @@ pub const TTL: Duration = Duration::from_secs(2);
 impl Harness {
     /// Starts the simulator and the accounts, but not the bot.
     pub async fn prepare() -> Self {
+        let harness = Self::unregistered(Address::with_last_byte(1), Address::with_last_byte(2)).await;
+        for account in [&harness.keys.long, &harness.keys.short] {
+            harness.sim.set_session_key(account.owner, Some(account.session.address()));
+        }
+        harness
+    }
+
+    /// Starts the simulator with these two wallets' accounts: funded, but the
+    /// exchange knows no session key of theirs. The keys the harness holds are
+    /// as unknown to it as any; a scenario registers them or brings its own.
+    pub async fn unregistered(long: Address, short: Address) -> Self {
         let sim = Sim::start(ENTRY).await;
         let dir = tempfile::tempdir().unwrap();
-        let long = Address::with_last_byte(1);
-        let short = Address::with_last_byte(2);
         let keys = Arc::new(session_keys(long, short));
-        for account in [&keys.long, &keys.short] {
-            sim.add_account(account.owner, account.session.address(), 2_000);
+        for wallet in [long, short] {
+            sim.add_account(wallet, 2_000);
         }
         let config = Args::try_parse_from([
             "papertrade",
