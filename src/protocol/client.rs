@@ -8,7 +8,9 @@ use serde_json::Value;
 
 use super::deployment::ORIGIN;
 use super::intents::SignedIntent;
-use super::wire::{IntentFailure, IntentReceipt, QueueSummary, Trade, TradePage, TradingState};
+use super::wire::{
+    IntentFailure, IntentReceipt, MintCurve, ProtocolSummary, QueueSummary, Trade, TradePage, TradingState,
+};
 
 const TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -62,6 +64,11 @@ impl Client {
     /// Total the LP owes to queued winners, 18-decimal USD.
     pub async fn queue_total(&self) -> reqwest::Result<U256> {
         Ok(self.get::<QueueSummary>("/query/protocol/queue-summary").await?.total.0)
+    }
+
+    /// Where the PAPER mint curve stands, from the protocol summary.
+    pub async fn mint_curve(&self) -> reqwest::Result<MintCurve> {
+        Ok(self.get::<ProtocolSummary>("/query/protocol/summary").await?.paper)
     }
 
     /// The wallet's most recent settled positions, newest first.
