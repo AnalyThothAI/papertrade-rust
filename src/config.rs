@@ -22,7 +22,8 @@ pub struct Config {
     #[arg(long, env = "PT_SHORT_ACCOUNT", global = true)]
     pub short_account: Option<Address>,
 
-    /// Where session keys live, as <wallet>.key.
+    /// Where keys live: <wallet>.key as `run` reads it, and the encrypted
+    /// <wallet>.session.json and <wallet>.wallet.json that `keys init` writes.
     #[arg(long, env = "PT_KEYS_DIR", default_value = "./secrets", global = true)]
     pub keys_dir: PathBuf,
 
@@ -56,6 +57,12 @@ pub struct Config {
     /// Decide and record, never submit.
     #[arg(long, env = "PT_DRY_RUN", default_value_t = true, action = ArgAction::Set, global = true)]
     pub dry_run: bool,
+
+    /// Let the bot sign with the two wallets' own keys: register and renew
+    /// session keys, move funds between the accounts. Off, those keys are
+    /// neither asked for nor read, whatever the keys directory holds.
+    #[arg(long, env = "PT_WALLET_AUTOMATION", default_value_t = false, action = ArgAction::Set, global = true)]
+    pub wallet_automation: bool,
 }
 
 impl Config {
@@ -122,7 +129,7 @@ mod tests {
     fn defaults_to_a_dry_run_of_the_minimum_size_btc_round() {
         let config = parse(&[]);
         config.validate().unwrap();
-        assert!(config.dry_run);
+        assert!(config.dry_run && !config.wallet_automation);
         assert_eq!((config.coin.as_str(), config.intent_ttl_seconds), ("BTC", 120));
         assert_eq!(
             config.strategy(),
@@ -134,8 +141,17 @@ mod tests {
 
     #[test]
     fn switches_take_explicit_values() {
-        let config = parse(&["--dry-run", "false", "--require-empty-queue", "false", "--long-account", A]);
-        assert!(!config.dry_run && !config.require_empty_queue);
+        let config = parse(&[
+            "--dry-run",
+            "false",
+            "--require-empty-queue",
+            "false",
+            "--wallet-automation",
+            "true",
+            "--long-account",
+            A,
+        ]);
+        assert!(!config.dry_run && !config.require_empty_queue && config.wallet_automation);
         assert_eq!(config.wallet(Side::Long).unwrap(), A.parse::<Address>().unwrap());
     }
 
