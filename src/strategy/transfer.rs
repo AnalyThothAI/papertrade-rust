@@ -82,9 +82,9 @@ pub struct Transfer {
     pub attempt_at_ms: i64,
     /// The sender's HyperCore USDC just before the latest withdrawal or send.
     pub core_baseline: Option<U256>,
-    /// The sender's Papertrade balance just before the latest withdrawal.
+    /// What the sender held on Papertrade just before the latest withdrawal.
     pub sender_baseline: Option<U256>,
-    /// The receiver's Papertrade balance just before the first send.
+    /// What the receiver held on Papertrade just before the first send.
     pub receiver_baseline: Option<U256>,
     /// The latest withdrawal intent.
     pub withdraw_intent: Option<B256>,
@@ -176,9 +176,11 @@ pub struct Observed {
     pub now_ms: i64,
     /// The sender's HyperCore USDC.
     pub sender_core: Option<Reading>,
-    /// The sender's available Papertrade balance.
+    /// What the sender holds on Papertrade: its available balance and the
+    /// margins parked in its positions, so that opening or closing a position
+    /// does not pass for money leaving or arriving.
     pub sender_balance: Option<U256>,
-    /// The receiver's available Papertrade balance.
+    /// What the receiver holds on Papertrade, counted the same way.
     pub receiver_balance: Option<U256>,
     /// The latest withdrawal intent, while the transfer is in `withdraw`.
     pub withdrawal: Option<Withdrawal>,

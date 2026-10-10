@@ -608,7 +608,12 @@ mod tests {
     }
 
     fn leg_view(account: &AccountState) -> LegView<'_> {
-        LegView { account: Some(account), session_key: KEY, awaiting: Awaiting::Nothing }
+        LegView {
+            account: Some(account),
+            session_key: KEY,
+            awaiting: Awaiting::Nothing,
+            reserved: U256::ZERO,
+        }
     }
 
     #[test]
@@ -641,8 +646,6 @@ mod tests {
                     queue_total: Some(U256::ZERO),
                     mid: Some(mid),
                     may_open: true,
-                    transfer: None,
-                    can_rebalance: false,
                 };
                 decide(&view, &params, &market)
             };
