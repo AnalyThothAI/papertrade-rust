@@ -32,6 +32,10 @@ pub fn account() -> AccountState {
         queue_revision: U256::ZERO,
         available_balance: usd(1_500),
         queued: U256::ZERO,
+        funding_totals: Some(crate::protocol::wire::FundingTotals {
+            deposited: usd(1_500),
+            withdrawn: U256::ZERO,
+        }),
         session_keys: BTreeMap::from([(KEY, NOW + 20 * 86_400)]),
         positions: Vec::new(),
         operations: Vec::new(),

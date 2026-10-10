@@ -16,6 +16,7 @@ pub use funding::{SendBehavior, Sweep};
 
 use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::convert::Infallible;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -44,7 +45,7 @@ use papertrade::status::Snapshot;
 use papertrade::store::Store;
 use serde_json::{Value, json};
 use tempfile::TempDir;
-use tokio::sync::{broadcast, oneshot, watch};
+use tokio::sync::{Notify, broadcast, oneshot, watch};
 use tokio::task::JoinHandle;
 
 const TRADING_STATE: &str = include_str!("../fixtures/trading-state.json");
@@ -59,6 +60,8 @@ pub enum Behavior {
     Reject(&'static str, &'static str),
     /// Answer with a server error and do not take it: it never executes.
     Drop,
+    /// An unrelated success receipt; this request never executes.
+    WrongReceipt,
     /// Take it and execute it, but answer with a server error.
     AcceptSilently,
     /// Queue it, then let it fail when it executes.
@@ -107,6 +110,9 @@ struct Account {
     revision: u64,
     queue_revision: u64,
     balance: U256,
+    deposited: U256,
+    withdrawn: U256,
+    cashflows_visible: bool,
     session_keys: Vec<(Address, u64)>,
     positions: Vec<Position>,
     operations: Vec<Operation>,
@@ -118,6 +124,7 @@ struct Account {
     clock_lag: u64,
     trades: Vec<Value>,
     frames: broadcast::Sender<Frame>,
+    held_frames: Option<Vec<Frame>>,
 }
 
 struct World {
@@ -126,6 +133,8 @@ struct World {
     accounts: HashMap<Address, Account>,
     scripts: HashMap<(Address, String), VecDeque<Behavior>>,
     received: Vec<Received>,
+    replies: HashMap<String, Arc<ReplyGate>>,
+    history_readable: bool,
     /// HyperCore balances, Hyperliquid sends and the relayer's sweeping.
     funding: funding::Funding,
     next_position_id: u64,
@@ -136,6 +145,28 @@ struct World {
     fees_readable: bool,
     /// What the LP owes to queued winners.
     queue_total: U256,
+}
+
+/// Holds a request's reply after the simulator has processed it. The world
+/// mutex is never held while waiting, so positions and account streams go on.
+#[derive(Default)]
+struct ReplyGate {
+    held: AtomicBool,
+    released: Notify,
+}
+
+impl ReplyGate {
+    async fn wait(&self) {
+        loop {
+            let notified = self.released.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if !self.held.load(Ordering::Acquire) {
+                return;
+            }
+            notified.await;
+        }
+    }
 }
 
 fn unix_seconds() -> u64 {
@@ -202,6 +233,9 @@ impl Account {
         fields.insert("accountRevision".into(), json!(self.revision));
         fields.insert("operations".into(), self.operations.iter().map(Self::operation_tuple).collect());
         fields.insert("openPositions".into(), self.positions.iter().map(Self::position_tuple).collect());
+        if self.cashflows_visible {
+            fields.insert("lifetime".into(), self.lifetime());
+        }
         frame.to_string()
     }
 
@@ -214,13 +248,26 @@ impl Account {
             "accountRevision": self.revision,
             "baseAccountRevision": base,
             "state": self.scalars(),
+            "lifetime": self.lifetime(),
             "addedPositions": [],
             "removedPositionIds": [],
             "addedOperations": [],
             "removedOperationIds": [],
         });
         frame.as_object_mut().unwrap().extend(changes.as_object().unwrap().clone());
-        let _ = self.frames.send(Frame::Data(frame.to_string()));
+        if !self.cashflows_visible {
+            frame.as_object_mut().unwrap().remove("lifetime");
+        }
+        let frame = Frame::Data(frame.to_string());
+        if let Some(held) = &mut self.held_frames {
+            held.push(frame);
+        } else {
+            let _ = self.frames.send(frame);
+        }
+    }
+
+    fn lifetime(&self) -> Value {
+        json!({ "depositedRaw": self.deposited.to_string(), "withdrawnRaw": self.withdrawn.to_string() })
     }
 }
 
@@ -425,6 +472,15 @@ fn rejection(status: StatusCode, body: Value) -> Response {
 }
 
 async fn intents(State(world): State<Shared>, Json(body): Json<Value>) -> Response {
+    let gate = world.lock().unwrap().replies.get(body["action"].as_str().unwrap_or("")).cloned();
+    let response = process_intent(&world, &body);
+    if let Some(gate) = gate {
+        gate.wait().await;
+    }
+    response
+}
+
+fn process_intent(world: &Shared, body: &Value) -> Response {
     let (Some(action), Some(signed)) = (body["action"].as_str(), body.get("signed")) else {
         return StatusCode::BAD_REQUEST.into_response();
     };
@@ -459,7 +515,7 @@ async fn intents(State(world): State<Shared>, Json(body): Json<Value>) -> Respon
     if !authorized {
         return rejection(StatusCode::FORBIDDEN, json!({ "code": "unauthorized_intent" }));
     }
-    if let Some(refusal) = funding::refusal(action, &body, account) {
+    if let Some(refusal) = funding::refusal(action, body, account) {
         return refusal;
     }
     if action == "openPosition" && signed["size"].as_str().unwrap().parse::<U256>().unwrap() > account.balance
@@ -471,6 +527,13 @@ async fn intents(State(world): State<Shared>, Json(body): Json<Value>) -> Respon
             return rejection(StatusCode::CONFLICT, json!({ "code": code, "reason": reason }));
         }
         Behavior::Drop => return (StatusCode::BAD_GATEWAY, "upstream connect error").into_response(),
+        Behavior::WrongReceipt => {
+            return Json(json!({
+                "intentId": B256::repeat_byte(0xee), "state": "queued",
+                "queueRevision": account.queue_revision.to_string(),
+            }))
+            .into_response();
+        }
         _ => {}
     }
     let operation = Operation {
@@ -514,10 +577,22 @@ async fn protocol_summary() -> Json<Value> {
     Json(serde_json::from_str(PROTOCOL_SUMMARY).unwrap())
 }
 
-async fn trades(State(world): State<Shared>, Path(wallet): Path<Address>) -> Json<Value> {
+async fn trades(
+    State(world): State<Shared>,
+    Path(wallet): Path<Address>,
+    Query(query): Query<HashMap<String, String>>,
+) -> Response {
     let world = world.lock().unwrap();
+    if !world.history_readable {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    }
     let items = world.accounts.get(&wallet).map(|account| account.trades.clone()).unwrap_or_default();
-    Json(json!({ "items": items, "nextCursor": null }))
+    let start = query.get("cursor").and_then(|s| s.parse::<usize>().ok()).unwrap_or(0);
+    let limit = query.get("limit").and_then(|s| s.parse::<usize>().ok()).unwrap_or(75);
+    let end = (start + limit).min(items.len());
+    let page = items.get(start..end).unwrap_or_default();
+    let cursor = (end < items.len()).then(|| end.to_string());
+    Json(json!({ "items": page, "nextCursor": cursor })).into_response()
 }
 
 /// The Exchange's win, loss and liquidation fee rates: 2% each, as on mainnet.
@@ -597,6 +672,8 @@ impl Sim {
             accounts: HashMap::new(),
             scripts: HashMap::new(),
             received: Vec::new(),
+            replies: HashMap::new(),
+            history_readable: true,
             funding: funding::Funding::default(),
             next_position_id: 1,
             stream_up: true,
@@ -640,6 +717,9 @@ impl Sim {
             revision: 1,
             queue_revision: 0,
             balance: usd(balance_usd),
+            deposited: usd(balance_usd),
+            withdrawn: U256::ZERO,
+            cashflows_visible: true,
             session_keys: Vec::new(),
             positions: Vec::new(),
             operations: Vec::new(),
@@ -648,6 +728,7 @@ impl Sim {
             clock_lag: 0,
             trades: Vec::new(),
             frames: broadcast::channel(256).0,
+            held_frames: None,
         };
         self.world().accounts.insert(wallet, account);
     }
@@ -722,6 +803,19 @@ impl Sim {
         }
     }
 
+    /// Delays this account's patches without breaking its healthy connection.
+    pub fn hold_account_frames(&self, wallet: Address) {
+        self.world().accounts.get_mut(&wallet).unwrap().held_frames = Some(Vec::new());
+    }
+
+    pub fn release_account_frames(&self, wallet: Address) {
+        let mut world = self.world();
+        let account = world.accounts.get_mut(&wallet).unwrap();
+        for frame in account.held_frames.take().unwrap_or_default() {
+            let _ = account.frames.send(frame);
+        }
+    }
+
     /// Sets what the LP owes to queued winners: the payout queue is empty at zero.
     pub fn set_queue_total(&self, total: U256) {
         self.world().queue_total = total;
@@ -730,6 +824,61 @@ impl Sim {
     /// Makes the Exchange's fee getters revert, or answer again.
     pub fn set_fees_readable(&self, readable: bool) {
         self.world().fees_readable = readable;
+    }
+
+    pub fn set_history_readable(&self, readable: bool) {
+        self.world().history_readable = readable;
+    }
+
+    pub fn set_cashflows_visible(&self, wallet: Address, visible: bool) {
+        self.world().accounts.get_mut(&wallet).unwrap().cashflows_visible = visible;
+    }
+
+    /// An exchange settlement while the bot is offline, without changing cashflows.
+    pub fn settle_positions(&self, wallet: Address) {
+        let mut world = self.world();
+        let mid = world.mid;
+        let account = world.accounts.get_mut(&wallet).unwrap();
+        let positions = std::mem::take(&mut account.positions);
+        for position in &positions {
+            let (credit, trade) = settle(wallet, position, mid, "PositionClosed");
+            account.balance += credit;
+            account.trades.insert(0, trade);
+        }
+        let removed: Vec<Value> = positions.iter().map(|p| json!(p.id.to_string())).collect();
+        account.publish(json!({ "removedPositionIds": removed }));
+    }
+
+    pub fn seed_settled_trades(&self, wallet: Address, count: u64) {
+        let mut world = self.world();
+        let mid = world.mid;
+        for _ in 0..count {
+            let id = world.next_position_id;
+            world.next_position_id += 1;
+            let position = Position {
+                id,
+                is_long: true,
+                entry: mid,
+                margin: usd(500),
+                leverage: 20,
+                intent_id: B256::with_last_byte(1),
+            };
+            let (_, trade) = settle(wallet, &position, mid, "PositionClosed");
+            world.accounts.get_mut(&wallet).unwrap().trades.insert(0, trade);
+        }
+    }
+
+    pub fn hold_replies(&self, action: &str) {
+        let mut world = self.world();
+        let gate = world.replies.entry(action.to_owned()).or_default();
+        gate.held.store(true, Ordering::Release);
+    }
+
+    pub fn release_replies(&self, action: &str) {
+        if let Some(gate) = self.world().replies.get(action) {
+            gate.held.store(false, Ordering::Release);
+            gate.released.notify_waiters();
+        }
     }
 
     /// Liquidates the wallet's positions: they vanish and the margin is gone.

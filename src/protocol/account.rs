@@ -5,7 +5,7 @@ use std::collections::BTreeMap;
 use alloy::primitives::{Address, U256};
 use serde_json::Value;
 
-use super::wire::{IntentOutcome, Operation, Position, WalletPatch, WalletSnapshot};
+use super::wire::{FundingTotals, IntentOutcome, Operation, Position, WalletPatch, WalletSnapshot};
 
 /// Amounts are 18-decimal USD.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -18,6 +18,8 @@ pub struct AccountState {
     pub available_balance: U256,
     /// Winnings the LP still owes: waiting in the payout queue.
     pub queued: U256,
+    /// In the same version as the balances: actual cashflows, without trading PnL.
+    pub funding_totals: Option<FundingTotals>,
     /// Session key address → expiry in unix seconds.
     pub session_keys: BTreeMap<Address, u64>,
     pub positions: Vec<Position>,
@@ -60,6 +62,9 @@ pub fn apply_frame(
                 patch.base_account_revision, previous.account_revision
             )));
         }
+        if patch.account_revision <= patch.base_account_revision {
+            return Err(FrameError::OutOfSync("patch does not advance the account revision".into()));
+        }
         if patch.address != previous.address {
             return Err(FrameError::OutOfSync(format!(
                 "patch is for {}, stream is for {}",
@@ -88,6 +93,7 @@ fn from_snapshot(snapshot: WalletSnapshot) -> AccountState {
         queue_revision: snapshot.queue_revision.0,
         available_balance: snapshot.funds.available_balance.0,
         queued: snapshot.queued.0,
+        funding_totals: snapshot.funding_totals,
         session_keys: session_key_map(snapshot.session_keys),
         positions: snapshot.open_positions,
         operations: snapshot.operations,
@@ -119,6 +125,7 @@ fn patched(previous: &AccountState, patch: WalletPatch) -> AccountState {
         queue_revision: state.queue_revision.map_or(previous.queue_revision, |value| value.0),
         available_balance: state.funds.map_or(previous.available_balance, |funds| funds.available_balance.0),
         queued: state.queued.map_or(previous.queued, |value| value.0),
+        funding_totals: patch.funding_totals.or(previous.funding_totals),
         session_keys: state.session_keys.map_or_else(|| previous.session_keys.clone(), session_key_map),
         positions,
         operations,
@@ -286,5 +293,50 @@ mod tests {
         let mut foreign = patch(1, json!({}));
         foreign["address"] = json!("0x00000000000000000000000000000000000000bb");
         assert!(matches!(apply_frame(Some(&state), foreign), Err(FrameError::OutOfSync(_))));
+    }
+
+    #[test]
+    fn cashflow_totals_are_folded_with_the_same_funds_revision_and_inherited_when_absent() {
+        let original = start();
+        let cash = original.funding_totals.unwrap();
+        assert_eq!(cash.withdrawn, U256::ZERO);
+        let next = apply_frame(Some(&original), patch(1, json!({
+            "lifetime": { "depositedRaw": (cash.deposited + U256::from(10)).to_string(), "withdrawnRaw": "2" },
+            "state": { "funds": { "availableBalance": "7" } }
+        }))).unwrap().unwrap().state;
+        assert_eq!(next.account_revision, 2);
+        assert_eq!(next.available_balance, U256::from(7));
+        assert_eq!(
+            next.funding_totals,
+            Some(FundingTotals { deposited: cash.deposited + U256::from(10), withdrawn: U256::from(2) })
+        );
+        let inherited = apply_frame(Some(&next), patch(2, json!({}))).unwrap().unwrap().state;
+        assert_eq!(inherited.funding_totals, next.funding_totals);
+    }
+
+    #[test]
+    fn missing_cashflow_evidence_is_unknown_and_null_or_partial_evidence_is_invalid() {
+        let mut missing = snapshot();
+        missing.as_object_mut().unwrap().remove("lifetime");
+        let state = apply_frame(None, missing).unwrap().unwrap().state;
+        assert_eq!(state.funding_totals, None);
+        assert_eq!(state.available_balance, U256::from(BALANCE));
+        for lifetime in [Value::Null, json!({ "depositedRaw": "0" })] {
+            assert!(matches!(
+                apply_frame(Some(&start()), patch(1, json!({"lifetime": lifetime}))),
+                Err(FrameError::Invalid(_))
+            ));
+            let mut full = snapshot();
+            full["lifetime"] = lifetime;
+            assert!(matches!(apply_frame(None, full), Err(FrameError::Invalid(_))));
+        }
+    }
+
+    #[test]
+    fn a_patch_cannot_replace_cash_totals_without_advancing_its_revision() {
+        let mut frame =
+            patch(1, json!({ "lifetime": { "depositedRaw": "999999999999999999999", "withdrawnRaw": "0" } }));
+        frame["accountRevision"] = json!(1);
+        assert!(matches!(apply_frame(Some(&start()), frame), Err(FrameError::OutOfSync(_))));
     }
 }

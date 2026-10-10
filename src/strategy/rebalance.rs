@@ -9,7 +9,7 @@
 
 use std::fmt;
 
-use alloy::primitives::U256;
+use alloy::primitives::{Address, U256};
 
 use super::decide::{Mode, Side};
 use super::transfer::{Stage, Transfer};
@@ -111,8 +111,10 @@ pub fn funds(long: &Holding, short: &Holding, margin: U256, buffer: U256) -> Fun
 /// arrival being seen the amount is therefore held back twice, which can only
 /// delay an open. A stuck transfer reserves nothing: its withdrawal can no
 /// longer execute.
-pub fn reserved(transfer: &Transfer, side: Side) -> U256 {
-    if transfer.from == side && transfer.stage == Stage::Withdraw {
+pub fn reserved(transfer: &Transfer, wallet: Address) -> U256 {
+    // An old row cannot prove which current side owns the possible debit.
+    // Reserve on either current wallet until its original withdrawal is ended.
+    if transfer.stage == Stage::Withdraw && transfer.from_wallet.is_none_or(|owner| owner == wallet) {
         usd(transfer.amount_usdc)
     } else {
         U256::ZERO
@@ -129,6 +131,8 @@ pub enum Hold {
     SenderBusy,
     /// A transfer is signed with both wallets' own keys, and they are not both here.
     NoWalletKeys,
+    /// The account stream has not supplied actual deposit/withdrawal totals.
+    CashflowsUnavailable,
     /// Only a bot that is opening rounds starts one.
     NotRunning(Mode),
     TradingStateUnavailable,
@@ -152,6 +156,7 @@ impl fmt::Display for Hold {
             Hold::TransferActive => f.write_str("another transfer has not finished"),
             Hold::SenderBusy => f.write_str("the sending account has an intent in flight"),
             Hold::NoWalletKeys => f.write_str("the wallets' own keys are not both unlocked"),
+            Hold::CashflowsUnavailable => f.write_str("account cashflow totals unavailable"),
             Hold::NotRunning(mode) => write!(f, "the bot is in {} mode", mode.as_str()),
             Hold::TradingStateUnavailable => f.write_str("trading state unavailable"),
             Hold::WithdrawalsPaused => f.write_str("the relayer has withdrawToCore paused"),
@@ -170,6 +175,7 @@ pub struct Readiness<'a> {
     pub sender_busy: bool,
     /// Both wallets' own keys are unlocked.
     pub wallet_keys: bool,
+    pub cashflows_available: bool,
     pub mode: Mode,
     /// `None` when the trading state is not known right now.
     pub trading: Option<&'a TradingState>,
@@ -188,6 +194,9 @@ pub fn hold(ready: &Readiness<'_>) -> Option<Hold> {
     }
     if !ready.wallet_keys {
         return Some(Hold::NoWalletKeys);
+    }
+    if !ready.cashflows_available {
+        return Some(Hold::CashflowsUnavailable);
     }
     if ready.mode != Mode::Run {
         return Some(Hold::NotRunning(ready.mode));
@@ -355,20 +364,41 @@ mod tests {
 
     #[test]
     fn a_transfer_reserves_its_amount_from_the_sender_until_the_withdrawal_has_arrived() {
-        let planned = Transfer::new(1, Side::Long, Side::Short, 850, 0);
-        assert_eq!(reserved(&planned, Side::Long), usd(850));
-        assert_eq!(reserved(&planned, Side::Short), U256::ZERO);
+        let (sender, receiver) = (Address::with_last_byte(1), Address::with_last_byte(2));
+        let planned = Transfer {
+            from_wallet: Some(sender),
+            to_wallet: Some(receiver),
+            ..Transfer::new(1, Side::Long, Side::Short, 850, 0)
+        };
+        assert_eq!(reserved(&planned, sender), usd(850));
+        assert_eq!(reserved(&planned, receiver), U256::ZERO);
         // Signed and submitted: still the whole amount, whatever the balance shows.
         let withdrawing = Transfer { attempts: 1, sender_baseline: Some(usd(2_000)), ..planned.clone() };
-        assert_eq!(reserved(&withdrawing, Side::Long), usd(850));
+        assert_eq!(reserved(&withdrawing, sender), usd(850));
         // Once it has reached HyperCore, or cannot leave any more, nothing.
         for stage in [Stage::Send, Stage::Credit, Stage::Done, Stage::Stuck] {
             let later = Transfer { stage, ..withdrawing.clone() };
-            assert_eq!(
-                (reserved(&later, Side::Long), reserved(&later, Side::Short)),
-                (U256::ZERO, U256::ZERO)
-            );
+            assert_eq!((reserved(&later, sender), reserved(&later, receiver)), (U256::ZERO, U256::ZERO));
         }
+    }
+
+    #[test]
+    fn reservations_follow_wallet_identity_and_unknown_old_owners_reserve_both_accounts() {
+        let (sender, receiver) = (Address::with_last_byte(1), Address::with_last_byte(2));
+        let planned = Transfer {
+            from_wallet: Some(sender),
+            to_wallet: Some(receiver),
+            ..Transfer::new(1, Side::Long, Side::Short, 850, 0)
+        };
+        // Reassigning a wallet's long/short role does not move the reservation.
+        let swapped_roles = Transfer { from: Side::Short, to: Side::Long, ..planned.clone() };
+        assert_eq!(reserved(&swapped_roles, sender), usd(850));
+        assert_eq!(reserved(&swapped_roles, receiver), U256::ZERO);
+        assert_eq!(reserved(&planned, Address::with_last_byte(3)), U256::ZERO);
+        let unknown = Transfer { from_wallet: None, to_wallet: None, attempts: 1, ..planned };
+        assert_eq!(reserved(&unknown, sender), usd(850));
+        assert_eq!(reserved(&unknown, receiver), usd(850));
+        assert_eq!(reserved(&Transfer { stage: Stage::Stuck, ..unknown }, sender), U256::ZERO);
     }
 
     #[test]
@@ -378,6 +408,7 @@ mod tests {
             transfer_active: false,
             sender_busy: false,
             wallet_keys: true,
+            cashflows_available: true,
             mode: Mode::Run,
             trading: Some(&open),
             dry_run: false,
@@ -386,6 +417,10 @@ mod tests {
         assert_eq!(hold(&Readiness { transfer_active: true, ..ready }), Some(Hold::TransferActive));
         assert_eq!(hold(&Readiness { sender_busy: true, ..ready }), Some(Hold::SenderBusy));
         assert_eq!(hold(&Readiness { wallet_keys: false, ..ready }), Some(Hold::NoWalletKeys));
+        assert_eq!(
+            hold(&Readiness { cashflows_available: false, ..ready }),
+            Some(Hold::CashflowsUnavailable)
+        );
         assert_eq!(hold(&Readiness { mode: Mode::Pause, ..ready }), Some(Hold::NotRunning(Mode::Pause)));
         assert_eq!(hold(&Readiness { mode: Mode::Flatten, ..ready }), Some(Hold::NotRunning(Mode::Flatten)));
         assert_eq!(hold(&Readiness { trading: None, ..ready }), Some(Hold::TradingStateUnavailable));
@@ -403,6 +438,7 @@ mod tests {
             transfer_active: true,
             sender_busy: true,
             wallet_keys: false,
+            cashflows_available: true,
             mode: Mode::Pause,
             trading: None,
             dry_run: true,

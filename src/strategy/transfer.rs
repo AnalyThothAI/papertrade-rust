@@ -21,7 +21,7 @@
 use std::fmt;
 use std::time::Duration;
 
-use alloy::primitives::{B256, U256};
+use alloy::primitives::{Address, B256, U256};
 
 use super::decide::Side;
 use super::inflight::is_failure;
@@ -72,6 +72,10 @@ pub struct Transfer {
     pub id: i64,
     pub from: Side,
     pub to: Side,
+    /// Owners captured when the transfer was created, never inferred on recovery.
+    /// Old rows lack this evidence and cannot be rebound to today's configuration.
+    pub from_wallet: Option<Address>,
+    pub to_wallet: Option<Address>,
     /// Whole USDC.
     pub amount_usdc: u64,
     pub stage: Stage,
@@ -82,10 +86,12 @@ pub struct Transfer {
     pub attempt_at_ms: i64,
     /// The sender's HyperCore USDC just before the latest withdrawal or send.
     pub core_baseline: Option<U256>,
-    /// What the sender held on Papertrade just before the latest withdrawal.
+    /// Cumulative actual withdrawals before the latest attempt (equity on legacy rows).
     pub sender_baseline: Option<U256>,
-    /// What the receiver held on Papertrade just before the first send.
+    /// Cumulative actual deposits before the first send (equity on legacy rows).
     pub receiver_baseline: Option<U256>,
+    /// False only for records written with the former equity-based evidence.
+    pub cashflow_baselines: bool,
     /// The latest withdrawal intent.
     pub withdraw_intent: Option<B256>,
     /// Nonce of the Hyperliquid send. Every attempt of one transfer carries the
@@ -104,6 +110,8 @@ impl Transfer {
             id,
             from,
             to,
+            from_wallet: None,
+            to_wallet: None,
             amount_usdc,
             stage: Stage::Withdraw,
             started_at_ms: now_ms,
@@ -112,6 +120,7 @@ impl Transfer {
             core_baseline: None,
             sender_baseline: None,
             receiver_baseline: None,
+            cashflow_baselines: true,
             withdraw_intent: None,
             send_nonce: None,
             checked_at_ms: None,
@@ -121,6 +130,12 @@ impl Transfer {
 
     fn amount(&self) -> U256 {
         usd(self.amount_usdc)
+    }
+
+    /// Cash baselines are meaningful only for their original two owners.
+    /// Unknown owners, changed wallets and swapped roles cannot authorize a step.
+    pub fn matches_wallets(&self, from_wallet: Address, to_wallet: Address) -> bool {
+        self.from_wallet == Some(from_wallet) && self.to_wallet == Some(to_wallet)
     }
 }
 
@@ -176,12 +191,14 @@ pub struct Observed {
     pub now_ms: i64,
     /// The sender's HyperCore USDC.
     pub sender_core: Option<Reading>,
-    /// What the sender holds on Papertrade: its available balance and the
-    /// margins parked in its positions, so that opening or closing a position
-    /// does not pass for money leaving or arriving.
-    pub sender_balance: Option<U256>,
-    /// What the receiver holds on Papertrade, counted the same way.
-    pub receiver_balance: Option<U256>,
+    /// Cumulative actual cash debited from the sender on Papertrade, not equity.
+    pub sender_withdrawn: Option<U256>,
+    /// Chain time through which the sender cash counter was indexed.
+    pub sender_indexed_at_ms: Option<i64>,
+    /// Cumulative actual cash credited to the receiver on Papertrade.
+    pub receiver_deposited: Option<U256>,
+    /// Chain time through which the receiver's cash counter was indexed.
+    pub receiver_indexed_at_ms: Option<i64>,
     /// The latest withdrawal intent, while the transfer is in `withdraw`.
     pub withdrawal: Option<Withdrawal>,
 }
@@ -232,18 +249,91 @@ pub enum Step {
     Stuck(Transfer),
 }
 
+/// Checks the ownership of persisted evidence before observing today's wallets.
+/// A changed configuration never rewrites owners or advances a transfer. Old
+/// unknown withdrawals keep their reservation until the journal proves an end
+/// and both current accounts' minimum indexed time covers the settlement wait.
+pub fn wallet_guard(
+    transfer: &Transfer,
+    from_wallet: Address,
+    to_wallet: Address,
+    withdrawal: Option<Withdrawal>,
+    indexed_at_ms: Option<i64>,
+    now_ms: i64,
+    limits: &Limits,
+) -> Option<Step> {
+    if transfer.matches_wallets(from_wallet, to_wallet) {
+        return None;
+    }
+    if transfer.from_wallet.is_some() && transfer.to_wallet.is_some() {
+        return Some(Step::Wait(
+            "this transfer belongs to different wallet owners; restore its original wallet configuration to resume".into(),
+        ));
+    }
+    if transfer.stage == Stage::Withdraw && transfer.attempts > 0 {
+        if let Some(Withdrawal::Ended { at_ms, .. }) = withdrawal
+            && now_ms.saturating_sub(at_ms) >= millis(limits.stuck_after)
+            && indexed_at_ms
+                .is_some_and(|indexed| indexed >= at_ms.saturating_add(millis(limits.stuck_after)))
+        {
+            return Some(stuck(transfer,
+                "legacy transfer does not record its wallet owners; its withdrawal ended, so reconcile the original wallets before abandoning it; owners cannot be bound automatically".into()));
+        }
+        return Some(Step::Wait(
+            "legacy transfer does not record its wallet owners; waiting for its recorded withdrawal's fate and retaining its reservation; owners cannot be bound automatically".into(),
+        ));
+    }
+    Some(stuck(transfer,
+        "legacy transfer does not record its wallet owners; reconcile the original wallets before abandoning it; owners cannot be bound automatically".into()))
+}
+
 pub fn next_step(transfer: &Transfer, seen: &Observed, limits: &Limits) -> Step {
     // A baseline taken from an old reading, or a conclusion drawn from one,
     // would be about a balance that may have changed since.
     let max_age = millis(limits.reading_max_age);
     let sender_core = seen.sender_core.filter(|reading| seen.now_ms - reading.at_ms <= max_age);
     let seen = &Observed { sender_core, ..*seen };
+    if !transfer.cashflow_baselines
+        && let Some(step) = legacy(transfer, seen, limits)
+    {
+        return step;
+    }
     match transfer.stage {
         Stage::Withdraw => withdraw(transfer, seen, limits),
         Stage::Send => send(transfer, seen, limits),
         Stage::Credit => credit(transfer, seen, limits),
         Stage::Done => Step::Wait("the transfer is complete".into()),
         Stage::Stuck => Step::Wait("the transfer is stuck".into()),
+    }
+}
+
+/// Old equity baselines are never compared with cash counters. An unattempted
+/// action may capture a new baseline; a legacy withdrawal still in flight must
+/// retain its reservation until its fate is known or Core proves arrival.
+fn legacy(transfer: &Transfer, seen: &Observed, limits: &Limits) -> Option<Step> {
+    match transfer.stage {
+        Stage::Withdraw if transfer.attempts == 0 => None,
+        Stage::Withdraw => {
+            if transfer.core_baseline.is_some_and(|baseline| {
+                seen.sender_core.is_some_and(|core| core.amount >= baseline + transfer.amount())
+            }) {
+                return Some(Step::Advance(Transfer {
+                    stage: Stage::Send, attempts: 0, attempt_at_ms: seen.now_ms,
+                    core_baseline: None, sender_baseline: None, receiver_baseline: None,
+                    cashflow_baselines: true, note: None, ..transfer.clone()
+                }));
+            }
+            if let Some(Withdrawal::Ended { at_ms, .. }) = seen.withdrawal
+                && seen.now_ms - at_ms >= millis(limits.stuck_after)
+            {
+                return Some(stuck(transfer, "legacy withdrawal has no cumulative cash baseline; reconcile its funds before abandoning it".into()));
+            }
+            Some(Step::Wait("waiting for the legacy withdrawal's fate and HyperCore arrival; its equity baseline cannot authorize a retry".into()))
+        }
+        Stage::Send if transfer.attempts == 0 => None,
+        Stage::Send | Stage::Credit => Some(stuck(transfer,
+            "legacy transfer has no pre-send cumulative deposit baseline; reconcile its funds before abandoning it".into())),
+        Stage::Done | Stage::Stuck => None,
     }
 }
 
@@ -255,12 +345,13 @@ fn withdraw(transfer: &Transfer, seen: &Observed, limits: &Limits) -> Step {
             attempt_at_ms: seen.now_ms,
             core_baseline: Some(core.amount),
             sender_baseline: Some(held),
+            cashflow_baselines: true,
             withdraw_intent: None,
             ..transfer.clone()
         })
     };
     if transfer.attempts == 0 {
-        return match (seen.sender_core, seen.sender_balance) {
+        return match (seen.sender_core, seen.sender_withdrawn) {
             (Some(core), Some(held)) => attempt(core, held),
             _ => Step::Wait(format!("reading the {from} account's balances before withdrawing")),
         };
@@ -269,14 +360,22 @@ fn withdraw(transfer: &Transfer, seen: &Observed, limits: &Limits) -> Step {
         return incomplete(transfer);
     };
     if seen.sender_core.is_some_and(|core| core.amount >= baseline + amount) {
-        return Step::Advance(Transfer {
-            stage: Stage::Send,
-            attempts: 0,
-            attempt_at_ms: seen.now_ms,
-            core_baseline: None,
-            note: None,
-            ..transfer.clone()
-        });
+        // Core can become visible before the account stream's debit patch.
+        // Keep the reservation until the same account version as the available
+        // balance proves that it no longer includes this withdrawal's money.
+        if seen.sender_withdrawn.is_some_and(|withdrawn| withdrawn >= held_before + amount) {
+            return Step::Advance(Transfer {
+                stage: Stage::Send,
+                attempts: 0,
+                attempt_at_ms: seen.now_ms,
+                core_baseline: None,
+                note: None,
+                ..transfer.clone()
+            });
+        }
+        return Step::Wait(
+            "the withdrawal arrived on HyperCore; waiting for the sender account's cash debit and retaining its reservation".into(),
+        );
     }
     let (at_ms, succeeded) = match seen.withdrawal {
         None => return Step::Wait("looking up the withdrawal".into()),
@@ -284,12 +383,15 @@ fn withdraw(transfer: &Transfer, seen: &Observed, limits: &Limits) -> Step {
         Some(Withdrawal::Ended { at_ms, succeeded }) => (at_ms, succeeded),
     };
     // The withdrawal can no longer execute. It did nothing only if both of the
-    // sender's balances say so: read well after it ended, HyperCore holds no
-    // more than before and Papertrade holds no less.
+    // sender's cash facts say so: indexed well after it ended, HyperCore holds no
+    // more than before and the cumulative Exchange withdrawal count is unchanged.
     let core_unmoved = seen
         .sender_core
         .filter(|core| core.at_ms >= at_ms + millis(limits.settle) && core.amount <= baseline);
-    let still_held = seen.sender_balance.filter(|held| *held >= held_before);
+    let still_held = seen.sender_withdrawn.filter(|withdrawn| {
+        *withdrawn == held_before
+            && seen.sender_indexed_at_ms.is_some_and(|indexed| indexed >= at_ms + millis(limits.settle))
+    });
     if let (false, Some(core), Some(held)) = (succeeded, core_unmoved, still_held) {
         if transfer.attempts < limits.max_attempts {
             return attempt(core, held);
@@ -323,7 +425,7 @@ fn send(transfer: &Transfer, seen: &Observed, limits: &Limits) -> Step {
     let (from, amount) = (transfer.from, transfer.amount());
     if transfer.attempts == 0 {
         let (Some(core), Some(receiver), Ok(nonce)) =
-            (seen.sender_core, seen.receiver_balance, u64::try_from(seen.now_ms))
+            (seen.sender_core, seen.receiver_deposited, u64::try_from(seen.now_ms))
         else {
             return Step::Wait("reading both accounts' balances before sending on Hyperliquid".into());
         };
@@ -332,6 +434,7 @@ fn send(transfer: &Transfer, seen: &Observed, limits: &Limits) -> Step {
             attempt_at_ms: seen.now_ms,
             core_baseline: Some(core.amount),
             receiver_baseline: Some(receiver),
+            cashflow_baselines: true,
             send_nonce: Some(nonce),
             ..transfer.clone()
         });
@@ -385,13 +488,20 @@ fn send(transfer: &Transfer, seen: &Observed, limits: &Limits) -> Step {
 fn credit(transfer: &Transfer, seen: &Observed, limits: &Limits) -> Step {
     let (from, to) = (transfer.from, transfer.to);
     let Some(baseline) = transfer.receiver_baseline else { return incomplete(transfer) };
-    let Some(balance) = seen.receiver_balance else {
+    let Some(balance) = seen.receiver_deposited else {
         return Step::Wait(format!("reading the {to} account's balance"));
     };
     if balance + usd(CREDIT_TOLERANCE_USDC) >= baseline + transfer.amount() {
         return Step::Advance(Transfer { stage: Stage::Done, note: None, ..transfer.clone() });
     }
-    if seen.now_ms - transfer.attempt_at_ms >= millis(limits.stuck_after) {
+    if balance < baseline {
+        return Step::Wait("the receiver cashflow counter is older than the recorded baseline".into());
+    }
+    if seen.now_ms - transfer.attempt_at_ms >= millis(limits.stuck_after)
+        && seen.receiver_indexed_at_ms.is_some_and(|indexed| {
+            indexed >= transfer.attempt_at_ms.saturating_add(millis(limits.stuck_after))
+        })
+    {
         return stuck(
             transfer,
             format!(
@@ -448,7 +558,15 @@ mod tests {
 
     /// Nothing is known.
     fn at(now_ms: i64) -> Observed {
-        Observed { now_ms, sender_core: None, sender_balance: None, receiver_balance: None, withdrawal: None }
+        Observed {
+            now_ms,
+            sender_core: None,
+            sender_withdrawn: None,
+            sender_indexed_at_ms: Some(now_ms),
+            receiver_deposited: None,
+            receiver_indexed_at_ms: Some(now_ms),
+            withdrawal: None,
+        }
     }
 
     fn core(amount: u64, at_ms: i64) -> Option<Reading> {
@@ -522,7 +640,7 @@ mod tests {
         for seen in [
             at(START),
             Observed { sender_core: core(5, START), ..at(START) },
-            Observed { sender_balance: Some(usd(2_000)), ..at(START) },
+            Observed { sender_withdrawn: Some(usd(2_000)), ..at(START) },
         ] {
             assert_eq!(waits(&fresh(), seen), "reading the long account's balances before withdrawing");
         }
@@ -530,8 +648,11 @@ mod tests {
 
     #[test]
     fn the_first_withdrawal_records_its_time_and_both_baselines_before_it_is_signed() {
-        let seen =
-            Observed { sender_core: core(5, START + 40), sender_balance: Some(usd(2_000)), ..at(START + 50) };
+        let seen = Observed {
+            sender_core: core(5, START + 40),
+            sender_withdrawn: Some(usd(2_000)),
+            ..at(START + 50)
+        };
         assert_eq!(
             step(&fresh(), seen),
             Step::Withdraw(Transfer {
@@ -545,8 +666,12 @@ mod tests {
     }
 
     #[test]
-    fn the_withdrawal_is_complete_once_hypercore_holds_the_amount_more() {
-        let arrived = Observed { sender_core: core(855, START + 4_000), ..at(START + 4_100) };
+    fn the_withdrawal_is_complete_once_hypercore_arrival_and_account_debit_are_both_known() {
+        let arrived = Observed {
+            sender_core: core(855, START + 4_000),
+            sender_withdrawn: Some(usd(2_850)),
+            ..at(START + 4_100)
+        };
         assert_eq!(
             step(&withdrawing(), arrived),
             Step::Advance(Transfer {
@@ -565,6 +690,26 @@ mod tests {
     }
 
     #[test]
+    fn core_arrival_without_the_account_debit_keeps_the_withdrawal_reservation() {
+        let transfer = Transfer {
+            from_wallet: Some(Address::with_last_byte(1)),
+            to_wallet: Some(Address::with_last_byte(2)),
+            ..withdrawing()
+        };
+        let arrived = Observed { sender_core: core(855, START + 4_000), ..at(START + 4_100) };
+        for withdrawn in [None, Some(usd(2_000)), Some(usd(2_850) - U256::from(1))] {
+            let seen = Observed { sender_withdrawn: withdrawn, ..arrived };
+            assert!(matches!(step(&transfer, seen), Step::Wait(_)));
+            assert_eq!(
+                crate::strategy::rebalance::reserved(&transfer, transfer.from_wallet.unwrap()),
+                usd(AMOUNT)
+            );
+        }
+        let debited = Observed { sender_withdrawn: Some(usd(2_850)), ..arrived };
+        assert!(matches!(step(&transfer, debited), Step::Advance(next) if next.stage == Stage::Send));
+    }
+
+    #[test]
     fn one_unit_less_than_the_amount_is_not_an_arrival() {
         let short = Reading { amount: usd(855) - U256::from(1), at_ms: START + 4_000 };
         let seen = Observed {
@@ -579,7 +724,7 @@ mod tests {
     fn a_withdrawal_that_may_still_execute_is_waited_for_however_long_it_takes() {
         let seen = Observed {
             sender_core: core(5, START + 3_000_000),
-            sender_balance: Some(usd(2_000)),
+            sender_withdrawn: Some(usd(2_000)),
             withdrawal: Some(Withdrawal::InFlight),
             ..at(START + 3_000_000)
         };
@@ -595,7 +740,7 @@ mod tests {
         let read_at = START + 1_000 + SETTLE;
         Observed {
             sender_core: core(5, read_at),
-            sender_balance: Some(usd(2_000)),
+            sender_withdrawn: Some(usd(2_000)),
             withdrawal: ended(START + 1_000),
             ..at(read_at + 10)
         }
@@ -622,9 +767,9 @@ mod tests {
             // HyperCore received something, though not the full amount.
             Observed { sender_core: core(6, START + 1_000 + SETTLE), ..nothing_moved() },
             // Papertrade no longer holds what it did: the withdrawal took it.
-            Observed { sender_balance: Some(usd(2_000) - U256::from(1)), ..nothing_moved() },
+            Observed { sender_withdrawn: Some(usd(2_000) - U256::from(1)), ..nothing_moved() },
             // A balance is unknown.
-            Observed { sender_balance: None, ..nothing_moved() },
+            Observed { sender_withdrawn: None, ..nothing_moved() },
             Observed { sender_core: None, ..nothing_moved() },
         ];
         for seen in cases {
@@ -666,7 +811,7 @@ mod tests {
         let ended_at = START + 1_000;
         let executed = |now_ms: i64| Observed {
             sender_core: core(5, now_ms),
-            sender_balance: Some(usd(1_150)),
+            sender_withdrawn: Some(usd(1_150)),
             withdrawal: Some(Withdrawal::Ended { at_ms: ended_at, succeeded: true }),
             ..at(now_ms)
         };
@@ -698,7 +843,7 @@ mod tests {
         for seen in [
             at(START),
             Observed { sender_core: core(855, START), ..at(START) },
-            Observed { receiver_balance: Some(usd(300)), ..at(START) },
+            Observed { receiver_deposited: Some(usd(300)), ..at(START) },
         ] {
             assert_eq!(
                 waits(&arrived(), seen),
@@ -711,7 +856,7 @@ mod tests {
     fn the_first_send_records_its_time_its_baselines_and_its_nonce_before_it_goes_out() {
         let seen = Observed {
             sender_core: core(855, START + 90),
-            receiver_balance: Some(usd(300)),
+            receiver_deposited: Some(usd(300)),
             ..at(START + 100)
         };
         assert_eq!(
@@ -798,7 +943,7 @@ mod tests {
 
     #[test]
     fn the_relayer_is_asked_to_check_the_deposit_address_at_once_and_then_at_intervals() {
-        let waiting = |now_ms: i64| Observed { receiver_balance: Some(usd(300)), ..at(now_ms) };
+        let waiting = |now_ms: i64| Observed { receiver_deposited: Some(usd(300)), ..at(now_ms) };
         assert_eq!(
             step(&crediting(), waiting(START + 10)),
             Step::CheckDeposit(Transfer { checked_at_ms: Some(START + 10), ..crediting() })
@@ -818,21 +963,21 @@ mod tests {
     fn the_credit_is_complete_once_the_receiver_holds_the_amount_more_less_one_usdc() {
         let done = Step::Advance(Transfer { stage: Stage::Done, ..crediting() });
         for balance in [usd(1_150), usd(1_149), usd(5_000)] {
-            let seen = Observed { receiver_balance: Some(balance), ..at(START + 2_000) };
+            let seen = Observed { receiver_deposited: Some(balance), ..at(START + 2_000) };
             assert_eq!(step(&crediting(), seen), done);
         }
         // One unit below the tolerance is not a credit.
-        let seen = Observed { receiver_balance: Some(usd(1_149) - U256::from(1)), ..at(START + 2_000) };
+        let seen = Observed { receiver_deposited: Some(usd(1_149) - U256::from(1)), ..at(START + 2_000) };
         assert!(matches!(step(&crediting(), seen), Step::CheckDeposit(_)));
         // A credit is taken whenever it shows up, even after the time allowed.
-        let late = Observed { receiver_balance: Some(usd(1_150)), ..at(START + 2 * STUCK_AFTER) };
+        let late = Observed { receiver_deposited: Some(usd(1_150)), ..at(START + 2 * STUCK_AFTER) };
         assert_eq!(step(&crediting(), late), done);
     }
 
     #[test]
     fn a_credit_that_does_not_come_in_time_becomes_stuck() {
         let checked = Transfer { checked_at_ms: Some(START + STUCK_AFTER - 2_000), ..crediting() };
-        let waiting = |now_ms: i64| Observed { receiver_balance: Some(usd(300)), ..at(now_ms) };
+        let waiting = |now_ms: i64| Observed { receiver_deposited: Some(usd(300)), ..at(now_ms) };
         assert!(matches!(step(&checked, waiting(START + STUCK_AFTER - 1)), Step::Wait(_)));
         assert_eq!(
             stuck_note(&checked, waiting(START + STUCK_AFTER)),
@@ -851,7 +996,7 @@ mod tests {
         let now = START + 2 * STUCK_AFTER;
         let (aged, stale) = (now - MAX_AGE, now - MAX_AGE - 1);
         let balances =
-            Observed { sender_balance: Some(usd(2_000)), receiver_balance: Some(usd(300)), ..at(now) };
+            Observed { sender_withdrawn: Some(usd(2_000)), receiver_deposited: Some(usd(300)), ..at(now) };
 
         // No baseline is taken from it, for a withdrawal or for a send.
         let seen = Observed { sender_core: core(5, stale), ..balances };
@@ -910,8 +1055,8 @@ mod tests {
         for transfer in cases {
             let everything = Observed {
                 sender_core: core(5_000, START),
-                sender_balance: Some(usd(5_000)),
-                receiver_balance: Some(usd(5_000)),
+                sender_withdrawn: Some(usd(5_000)),
+                receiver_deposited: Some(usd(5_000)),
                 withdrawal: ended(START),
                 ..at(START)
             };
@@ -923,7 +1068,7 @@ mod tests {
     fn a_finished_or_stuck_transfer_asks_for_nothing() {
         for stage in [Stage::Done, Stage::Stuck] {
             let transfer = Transfer { stage, ..crediting() };
-            let seen = Observed { receiver_balance: Some(usd(300)), ..at(START + 2 * STUCK_AFTER) };
+            let seen = Observed { receiver_deposited: Some(usd(300)), ..at(START + 2 * STUCK_AFTER) };
             assert!(matches!(step(&transfer, seen), Step::Wait(_)));
         }
     }
@@ -954,5 +1099,139 @@ mod tests {
         }
         assert_eq!(Stage::parse("abandoned"), None);
         assert_eq!(Stage::Credit.to_string(), "credit");
+    }
+
+    #[test]
+    fn transfer_evidence_only_matches_its_persisted_wallet_owners() {
+        let (from, to, other) =
+            (Address::with_last_byte(1), Address::with_last_byte(2), Address::with_last_byte(3));
+        let owned = Transfer { from_wallet: Some(from), to_wallet: Some(to), ..fresh() };
+        assert!(owned.matches_wallets(from, to));
+        assert!(!owned.matches_wallets(to, from));
+        assert!(!owned.matches_wallets(other, to));
+        assert!(!owned.matches_wallets(from, other));
+        assert!(!fresh().matches_wallets(from, to));
+        assert!(!Transfer { from_wallet: None, ..owned.clone() }.matches_wallets(from, to));
+        assert!(!Transfer { to_wallet: None, ..owned }.matches_wallets(from, to));
+    }
+
+    #[test]
+    fn a_changed_wallet_configuration_waits_without_rebinding_or_advancing() {
+        let (from, to) = (Address::with_last_byte(1), Address::with_last_byte(2));
+        let owned = Transfer { from_wallet: Some(from), to_wallet: Some(to), ..crediting() };
+        assert_eq!(wallet_guard(&owned, from, to, None, None, START, &limits()), None);
+        for (current_from, current_to) in [(to, from), (Address::with_last_byte(3), to)] {
+            assert!(matches!(
+                wallet_guard(&owned, current_from, current_to, None, Some(START + STUCK_AFTER), START + STUCK_AFTER, &limits()),
+                Some(Step::Wait(note)) if note.contains("restore its original wallet configuration")
+            ));
+        }
+        assert_eq!(owned.stage, Stage::Credit);
+    }
+
+    #[test]
+    fn unbound_withdrawals_keep_waiting_until_their_recorded_fate_is_safe() {
+        let (from, to) = (Address::with_last_byte(1), Address::with_last_byte(2));
+        let legacy = withdrawing();
+        let guard = |fate, now| wallet_guard(&legacy, from, to, fate, Some(now), now, &limits());
+        assert!(matches!(guard(None, START + STUCK_AFTER * 2), Some(Step::Wait(_))));
+        assert!(matches!(guard(Some(Withdrawal::InFlight), START + STUCK_AFTER * 2), Some(Step::Wait(_))));
+        for succeeded in [false, true] {
+            let fate = Some(Withdrawal::Ended { at_ms: START, succeeded });
+            assert!(matches!(guard(fate, START + STUCK_AFTER - 1), Some(Step::Wait(_))));
+            assert!(matches!(
+                guard(fate, START + STUCK_AFTER),
+                Some(Step::Stuck(next)) if next.from_wallet.is_none() && next.to_wallet.is_none()
+            ));
+        }
+        let ended = Some(Withdrawal::Ended { at_ms: START, succeeded: false });
+        for indexed in [None, Some(START), Some(START + STUCK_AFTER - 1)] {
+            assert!(matches!(
+                wallet_guard(&legacy, from, to, ended, indexed, START + STUCK_AFTER * 2, &limits()),
+                Some(Step::Wait(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn unbound_unattempted_and_sent_transfers_need_operator_reconciliation() {
+        let (from, to) = (Address::with_last_byte(1), Address::with_last_byte(2));
+        for transfer in [fresh(), sending(), crediting(), Transfer { from_wallet: Some(from), ..sending() }] {
+            assert!(matches!(
+                wallet_guard(&transfer, from, to, None, None, START, &limits()),
+                Some(Step::Stuck(next)) if next.from_wallet == transfer.from_wallet
+                    && next.to_wallet == transfer.to_wallet && next.send_nonce == transfer.send_nonce
+            ));
+        }
+    }
+
+    #[test]
+    fn stale_sender_cash_evidence_cannot_authorize_a_withdrawal_retry() {
+        let mut seen = nothing_moved();
+        seen.sender_indexed_at_ms = Some(START);
+        assert!(matches!(step(&withdrawing(), seen), Step::Wait(_)));
+        seen.sender_indexed_at_ms = None;
+        assert!(matches!(step(&withdrawing(), seen), Step::Wait(_)));
+        seen.sender_indexed_at_ms = Some(seen.now_ms);
+        assert!(matches!(step(&withdrawing(), seen), Step::Withdraw(_)));
+        // A reset or decrease in a cumulative counter is not negative evidence.
+        seen.sender_withdrawn = Some(usd(1_999));
+        assert!(matches!(step(&withdrawing(), seen), Step::Wait(_)));
+        seen.sender_withdrawn = Some(usd(2_001));
+        assert!(matches!(step(&withdrawing(), seen), Step::Wait(_)));
+    }
+
+    #[test]
+    fn legacy_unknown_withdrawals_keep_the_reservation_until_a_safe_fate() {
+        let legacy = Transfer { cashflow_baselines: false, ..withdrawing() };
+        let mut seen = at(START + 1_000_000);
+        seen.withdrawal = Some(Withdrawal::InFlight);
+        assert!(matches!(step(&legacy, seen), Step::Wait(_)));
+        assert_eq!(crate::strategy::rebalance::reserved(&legacy, Address::with_last_byte(1)), usd(AMOUNT));
+        seen.withdrawal = ended(START);
+        assert!(matches!(step(&legacy, seen), Step::Stuck(_)));
+    }
+
+    #[test]
+    fn legacy_withdrawals_can_continue_only_when_hypercore_proves_arrival() {
+        let legacy = Transfer { cashflow_baselines: false, ..withdrawing() };
+        let seen = Observed { sender_core: core(855, START), ..at(START) };
+        let Step::Advance(next) = step(&legacy, seen) else {
+            panic!("Core proves the legacy withdrawal arrived")
+        };
+        assert_eq!(next.stage, Stage::Send);
+        assert!(next.cashflow_baselines);
+        assert_eq!(next.receiver_baseline, None);
+        assert!(
+            matches!(step(&next, Observed {sender_core: core(855, START), receiver_deposited:Some(usd(300)), ..at(START)}), Step::Send(next) if next.receiver_baseline == Some(usd(300)) && next.cashflow_baselines)
+        );
+    }
+
+    #[test]
+    fn legacy_sent_transfers_never_reinterpret_equity_as_a_cash_baseline() {
+        for transfer in [sending(), crediting()] {
+            let legacy = Transfer { cashflow_baselines: false, ..transfer };
+            let seen = Observed { receiver_deposited: Some(usd(9_999)), ..at(START) };
+            assert!(
+                matches!(step(&legacy, seen), Step::Stuck(next) if !next.cashflow_baselines && next.send_nonce == legacy.send_nonce)
+            );
+        }
+        let unattempted = Transfer { stage: Stage::Send, attempts: 0, cashflow_baselines: false, ..fresh() };
+        let seen =
+            Observed { sender_core: core(855, START), receiver_deposited: Some(usd(300)), ..at(START) };
+        assert!(matches!(step(&unattempted,seen),Step::Send(next) if next.cashflow_baselines));
+    }
+    #[test]
+    fn an_old_receiver_index_cannot_turn_an_unconfirmed_credit_into_stuck() {
+        let mut seen = Observed {
+            receiver_deposited: Some(usd(300)),
+            receiver_indexed_at_ms: Some(START),
+            ..at(START + 1_000_000)
+        };
+        assert!(!matches!(step(&crediting(), seen), Step::Stuck(_)));
+        seen.receiver_indexed_at_ms = Some(seen.now_ms);
+        assert!(matches!(step(&crediting(), seen), Step::Stuck(_)));
+        seen.receiver_deposited = Some(usd(299));
+        assert!(matches!(step(&crediting(), seen), Step::Wait(_)));
     }
 }

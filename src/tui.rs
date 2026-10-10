@@ -16,8 +16,8 @@ use ratatui::{DefaultTerminal, Frame};
 use tokio::time::interval;
 
 use crate::status::{LegSnapshot, RoundEstimate, Snapshot};
-use crate::store::{EventRow, Store, Totals, now_ms};
-use crate::strategy::decide::{Mode, Phase};
+use crate::store::{EventRow, LedgerSync, Store, Totals, now_ms};
+use crate::strategy::decide::{Mode, Phase, Side};
 
 const REFRESH: Duration = Duration::from_millis(500);
 /// The bot rewrites its status about once a second; older than this means it is not running.
@@ -34,16 +34,27 @@ struct Screen {
     mode: Mode,
     events: Vec<EventRow>,
     totals: Totals,
+    ledger_sync: Vec<(Side, Option<LedgerSync>)>,
 }
 
 impl Screen {
     async fn load(store: &Store) -> Result<Self> {
+        let status = store.read_status().await?;
+        let mut wallets = Vec::new();
+        let mut ledger_sync = Vec::new();
+        if let Some(status) = &status {
+            for leg in &status.legs {
+                wallets.push(leg.wallet.clone());
+                ledger_sync.push((leg.side, store.ledger_sync(&leg.wallet).await?));
+            }
+        }
         Ok(Self {
             now_ms: now_ms(),
-            status: store.read_status().await?,
+            status,
             mode: store.mode().await?,
             events: store.recent_events(200).await?,
-            totals: store.totals().await?,
+            totals: store.totals_for_wallets(&wallets).await?,
+            ledger_sync,
         })
     }
 }
@@ -106,7 +117,7 @@ fn draw(frame: &mut Frame, screen: &Screen) {
         Constraint::Length(9),
         Constraint::Length(7),
         Constraint::Length(bordered(funds.len())),
-        Constraint::Length(3),
+        Constraint::Length(5),
         Constraint::Min(4),
         Constraint::Length(1),
     ])
@@ -126,7 +137,7 @@ fn draw(frame: &mut Frame, screen: &Screen) {
         panel(frame, area, &title, account_lines(leg, screen.now_ms, Room::Panel));
     }
     panel(frame, funds_area, " Funds ", funds);
-    panel(frame, ledger, " Ledger ", vec![ledger_line(&screen.totals)]);
+    panel(frame, ledger, " Ledger ", ledger_lines(screen, Room::Panel));
     panel(frame, timeline, TIMELINE, timeline_lines(&screen.events, timeline.height));
     frame.render_widget(Line::from(" q quit · p pause/resume · flatten: `papertrade flatten`").dim(), footer);
 }
@@ -454,18 +465,79 @@ fn funds_lines(status: &Snapshot, now_ms: i64) -> Vec<Line<'static>> {
     lines
 }
 
-fn ledger_line(totals: &Totals) -> Line<'static> {
+fn ledger_line(totals: &Totals, current: bool) -> Line<'static> {
     let cost = totals.cost_per_paper().map_or("n/a".to_owned(), |cost| format!("{cost:.5} USD/PAPER"));
     Line::from(vec![
-        dim("settled positions "),
+        dim(if current { "settled positions " } else { "recorded positions " }),
         strong(totals.trades.to_string()),
         dim("  net "),
         strong(format!("{:+.2} USD", totals.net_pnl_usd)),
         dim("  PAPER "),
         strong(format!("{:.0}", totals.paper_minted)),
-        dim("  actual cost "),
+        dim(if current { "  actual cost " } else { "  recorded cost " }),
         strong(cost),
     ])
+}
+
+/// A zero total is confirmed only after both histories were read. Cached rows
+/// remain useful after a failure, but their cost is labelled as recorded until
+/// both wallets have a recent, complete successful sync.
+fn ledger_lines(screen: &Screen, room: Room) -> Vec<Line<'static>> {
+    let known = screen.ledger_sync.len() == 2
+        && screen
+            .ledger_sync
+            .iter()
+            .all(|(_, sync)| sync.as_ref().is_some_and(|sync| sync.last_success_ms.is_some()));
+    let current = known
+        && screen
+            .ledger_sync
+            .iter()
+            .all(|(_, sync)| sync.as_ref().is_some_and(|sync| sync.complete && sync.is_fresh(screen.now_ms)));
+    let mut lines = vec![if known {
+        ledger_line(&screen.totals, current)
+    } else {
+        Line::from("history unknown · waiting for both accounts to synchronize").yellow()
+    }];
+    for (side, sync) in &screen.ledger_sync {
+        let Some(sync) = sync else {
+            lines.push(Line::from(format!("{side} history unknown · no successful sync")).yellow());
+            continue;
+        };
+        let Some(success) = sync.last_success_ms else {
+            lines.push(
+                Line::from(format!("{side} history unknown · last request failed; see `status`")).yellow(),
+            );
+            if room == Room::Report
+                && let Some(error) = &sync.latest_error
+            {
+                lines.push(Line::from(format!("{side} history error: {error}")).yellow());
+            }
+            continue;
+        };
+        let freshness = if sync.is_fresh(screen.now_ms) {
+            "fresh"
+        } else if sync.latest_error.is_some() {
+            "stale: request failed"
+        } else {
+            "stale"
+        };
+        let coverage = if sync.complete { "complete" } else { "incomplete: older history unverified" };
+        let mut line = Line::from(format!(
+            "{side} synced {} UTC · {} ago · {freshness} · {coverage}",
+            clock(success),
+            age(screen.now_ms - success)
+        ));
+        if !sync.is_fresh(screen.now_ms) || !sync.complete {
+            line = line.yellow();
+        }
+        lines.push(line);
+        if room == Room::Report
+            && let Some(error) = &sync.latest_error
+        {
+            lines.push(Line::from(format!("{side} history error: {error}")).yellow());
+        }
+    }
+    lines
 }
 
 /// As many of the newest events as fit a bordered panel of this height.
@@ -510,7 +582,7 @@ fn text(screen: &Screen) -> String {
         );
     }
     section("Funds".to_owned(), funds_lines(status, screen.now_ms));
-    section("Ledger".to_owned(), vec![ledger_line(&screen.totals)]);
+    section("Ledger".to_owned(), ledger_lines(screen, Room::Report));
     section(
         "Timeline (UTC, newest first)".to_owned(),
         screen.events.iter().take(REPORT_EVENTS).map(event_line).collect(),
@@ -642,6 +714,21 @@ mod tests {
                 summary: "hedged; price is inside the target".into(),
             }],
             totals: Totals { trades: 12, net_pnl_usd: -81.6, paper_minted: 58_800.0 },
+            ledger_sync: Side::BOTH
+                .into_iter()
+                .map(|side| {
+                    (
+                        side,
+                        Some(LedgerSync {
+                            last_success_ms: Some(NOW - 1_000),
+                            attempted_at_ms: NOW - 1_000,
+                            complete: true,
+                            max_age_ms: 180_000,
+                            latest_error: None,
+                        }),
+                    )
+                })
+                .collect(),
         }
     }
 
@@ -744,6 +831,60 @@ mod tests {
         let report = text(&screen);
         assert!(report.contains("mode      pause (dry run)\n"), "{report}");
         assert!(report.contains("bot       NOT RUNNING · last seen 1m ago\n"), "{report}");
+    }
+
+    #[test]
+    fn an_unsynchronized_ledger_does_not_claim_a_confirmed_zero() {
+        let mut screen = hedged_screen();
+        screen.totals = Totals::default();
+        screen.ledger_sync = Side::BOTH.into_iter().map(|side| (side, None)).collect();
+        both_show(&screen, &["history unknown", "long history unknown", "short history unknown"]);
+        for shown in [render(&screen), text(&screen)] {
+            assert!(!shown.contains("settled positions 0") && !shown.contains("actual cost"), "{shown}");
+        }
+
+        // A failed first request is still unknown, rather than an empty history.
+        screen.ledger_sync[0].1 = Some(LedgerSync {
+            last_success_ms: None,
+            attempted_at_ms: NOW,
+            complete: false,
+            max_age_ms: 180_000,
+            latest_error: Some("HTTP 503".into()),
+        });
+        both_show(&screen, &["long history unknown · last request failed"]);
+        assert!(text(&screen).contains("long history error: HTTP 503"));
+    }
+
+    #[test]
+    fn failed_expired_or_incomplete_histories_only_show_recorded_cost() {
+        let mut screen = hedged_screen();
+        screen.ledger_sync[0].1.as_mut().unwrap().latest_error = Some("HTTP 503".into());
+        both_show(
+            &screen,
+            &[
+                "recorded positions 12",
+                "recorded cost 0.00139 USD/PAPER",
+                "long synced 10-10 08:46:39 UTC · 1s ago · stale: request failed · complete",
+                "short synced 10-10 08:46:39 UTC · 1s ago · fresh · complete",
+            ],
+        );
+        assert!(text(&screen).contains("long history error: HTTP 503"));
+        assert!(!render(&screen).contains("actual cost") && !text(&screen).contains("actual cost"));
+
+        let sync = screen.ledger_sync[0].1.as_mut().unwrap();
+        sync.latest_error = None;
+        sync.max_age_ms = 999;
+        both_show(&screen, &["long synced 10-10 08:46:39 UTC · 1s ago · stale · complete", "recorded cost"]);
+
+        let sync = screen.ledger_sync[0].1.as_mut().unwrap();
+        sync.max_age_ms = 180_000;
+        sync.complete = false;
+        both_show(&screen, &["fresh · incomplete: older history unverified", "recorded cost"]);
+        assert!(!render(&screen).contains("actual cost") && !text(&screen).contains("actual cost"));
+
+        screen.ledger_sync[0].1.as_mut().unwrap().complete = true;
+        screen.totals = Totals::default();
+        both_show(&screen, &["settled positions 0  net +0.00 USD  PAPER 0  actual cost n/a"]);
     }
 
     #[test]
@@ -1028,12 +1169,14 @@ mod tests {
             "transfer short → long 25000.00 USD · stage withdraw · 45s elapsed",
             "waiting for the withdrawal to reach the wallet's Hyperliquid account",
             "settled positions 12",
+            "long synced 10-10 08:46:39 UTC · 1s ago · fresh · complete",
+            "short synced 10-10 08:46:39 UTC · 1s ago · fresh · complete",
             "q quit · p pause/resume",
         ] {
             assert!(dashboard.contains(expected), "missing {expected:?} in:\n{dashboard}");
         }
         let events = dashboard.lines().filter(|line| line.contains(" decision event ")).count();
-        assert!(events >= 8, "only {events} timeline entries fit in:\n{dashboard}");
+        assert!(events >= 6, "only {events} timeline entries fit in:\n{dashboard}");
     }
 
     #[test]
@@ -1060,11 +1203,19 @@ mod tests {
             "mode      pause\n",
             "bot       live\n",
             "at target   -100.00    +86.38    -13.61     9800.00   0.001389",
-            "settled positions 0  net +0.00 USD  PAPER 0  actual cost n/a",
+            "history unknown · waiting for both accounts to synchronize",
             "mode     operator set mode to pause",
         ] {
             assert!(report.contains(expected), "missing {expected:?} in:\n{report}");
         }
+        for wallet in [LONG, SHORT] {
+            store.record_ledger_success(wallet.parse().unwrap(), true, 180_000).await.unwrap();
+        }
+        let confirmed = super::report(&store).await.unwrap();
+        assert!(
+            confirmed.contains("settled positions 0  net +0.00 USD  PAPER 0  actual cost n/a"),
+            "{confirmed}"
+        );
     }
 
     #[test]

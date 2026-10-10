@@ -234,6 +234,7 @@ impl Funding {
         }
         // It leaves the Exchange now and reaches the wallet's HyperCore account a little later.
         account.balance -= amount;
+        account.withdrawn += amount;
         let delay = self.core_delay.unwrap_or(HELD);
         self.due.push((Instant::now() + delay, None, account.address, amount - self.arrival_fee));
         account.publish(ended("succeeded"));
@@ -272,6 +273,7 @@ pub(super) fn step(world: &mut World) {
             funding.core.insert(proxy, U256::ZERO);
             funding.arrived.remove(&proxy);
             account.balance += held - funding.sweep_fee;
+            account.deposited += held - funding.sweep_fee;
             account.publish(json!({}));
         }
     }
@@ -295,11 +297,18 @@ pub(super) async fn check_deposit(State(world): State<Shared>, Json(body): Json<
     let Some(wallet) = body["user"].as_str().and_then(|user| user.parse::<Address>().ok()) else {
         return StatusCode::BAD_REQUEST.into_response();
     };
-    let mut world = world.lock().unwrap();
-    let funding = &mut world.funding;
-    funding.checked.insert(wallet, Instant::now());
-    *funding.check_count.entry(wallet).or_default() += 1;
-    Json(json!({ "proxy": funding.decoy.unwrap_or_else(|| proxy_of(wallet)) })).into_response()
+    let (gate, proxy) = {
+        let mut world = world.lock().unwrap();
+        let gate = world.replies.get("checkDeposit").cloned();
+        let funding = &mut world.funding;
+        funding.checked.insert(wallet, Instant::now());
+        *funding.check_count.entry(wallet).or_default() += 1;
+        (gate, funding.decoy.unwrap_or_else(|| proxy_of(wallet)))
+    };
+    if let Some(gate) = gate {
+        gate.wait().await;
+    }
+    Json(json!({ "proxy": proxy })).into_response()
 }
 
 // --- Hyperliquid -----------------------------------------------------------------
@@ -319,43 +328,53 @@ impl HyperCore for SimHyperCore {
 
     fn send<'a>(&'a self, key: &'a WalletSigner, send: &'a DepositSend) -> BoxFuture<'a, Result<()>> {
         Box::pin(async move {
-            let mut world = self.world.lock().unwrap();
-            let funding = &mut world.funding;
-            let behavior = funding.send_script.pop_front().unwrap_or(SendBehavior::Deliver);
-            let (from, amount) = (send.from(), usd(send.amount_usdc()));
-            let mut record = HlSend {
-                from,
-                destination: send.destination(),
-                amount_usdc: send.amount_usdc(),
-                nonce: send.nonce(),
-                at: Instant::now(),
-                taken: false,
+            let (result, gate) = {
+                let mut world = self.world.lock().unwrap();
+                let gate = world.replies.get("hlSend").cloned();
+                (simulate_send(&mut world.funding, key, send), gate)
             };
-            let refused = match behavior {
-                SendBehavior::Lose => Some("error sending request: connection reset"),
-                SendBehavior::Refuse(reason) => Some(reason),
-                // Hyperliquid's own checks, in its order: who signed, the nonce, the balance.
-                _ if key.address() != from => Some("User or API Wallet does not exist"),
-                _ if !funding.used_nonces.insert((from, send.nonce())) => Some("Nonce already used"),
-                _ if funding.core.get(&from).copied().unwrap_or_default() < amount => {
-                    Some("Insufficient spot balance")
-                }
-                _ => None,
-            };
-            if let Some(reason) = refused {
-                funding.sends.push(record);
-                bail!("{reason}");
+            if let Some(gate) = gate {
+                gate.wait().await;
             }
-            record.taken = true;
-            funding.sends.push(record);
-            let delay = funding.send_delay.unwrap_or(HELD);
-            funding.due.push((Instant::now() + delay, Some(from), send.destination(), amount));
-            if behavior == SendBehavior::DeliverSilently {
-                bail!("error decoding response body: operation timed out");
-            }
-            Ok(())
+            result
         })
     }
+}
+
+fn simulate_send(funding: &mut Funding, key: &WalletSigner, send: &DepositSend) -> Result<()> {
+    let behavior = funding.send_script.pop_front().unwrap_or(SendBehavior::Deliver);
+    let (from, amount) = (send.from(), usd(send.amount_usdc()));
+    let mut record = HlSend {
+        from,
+        destination: send.destination(),
+        amount_usdc: send.amount_usdc(),
+        nonce: send.nonce(),
+        at: Instant::now(),
+        taken: false,
+    };
+    let refused = match behavior {
+        SendBehavior::Lose => Some("error sending request: connection reset"),
+        SendBehavior::Refuse(reason) => Some(reason),
+        // Hyperliquid's own checks, in its order: who signed, the nonce, the balance.
+        _ if key.address() != from => Some("User or API Wallet does not exist"),
+        _ if !funding.used_nonces.insert((from, send.nonce())) => Some("Nonce already used"),
+        _ if funding.core.get(&from).copied().unwrap_or_default() < amount => {
+            Some("Insufficient spot balance")
+        }
+        _ => None,
+    };
+    if let Some(reason) = refused {
+        funding.sends.push(record);
+        bail!("{reason}");
+    }
+    record.taken = true;
+    funding.sends.push(record);
+    let delay = funding.send_delay.unwrap_or(HELD);
+    funding.due.push((Instant::now() + delay, Some(from), send.destination(), amount));
+    if behavior == SendBehavior::DeliverSilently {
+        bail!("error decoding response body: operation timed out");
+    }
+    Ok(())
 }
 
 impl Sim {
