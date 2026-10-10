@@ -86,15 +86,11 @@ pub fn funds(long: &Holding, short: &Holding, margin: U256, buffer: U256) -> Fun
     } else {
         (Side::Short, Side::Long, short, long)
     };
-    // A sender without a position must still be able to open its own leg and
-    // lose the round. One that has a position has posted its margin already,
-    // and what is parked there cannot be withdrawn anyway.
-    let reserve = if sender.locked.is_zero() { comfortable } else { U256::ZERO };
-    let spare = sender.available.saturating_sub(reserve);
     // Half the difference levels them. Whole USDC, rounded down, so the richer
-    // account never ends up the poorer one.
+    // account never ends up the poorer one. What is parked in a position
+    // cannot be withdrawn, so no more is asked for than the sender has free.
     let half = (sender.equity() - receiver.equity()) / U256::from(2);
-    let amount_usdc = u64::try_from(half.min(spare) / usd(1)).unwrap_or(u64::MAX);
+    let amount_usdc = u64::try_from(half.min(sender.available) / usd(1)).unwrap_or(u64::MAX);
     if amount_usdc < MIN_TRANSFER_USDC {
         return Funds::Enough;
     }
@@ -285,8 +281,8 @@ mod tests {
         assert_eq!(judge(flat(0), flat(0)), Funds::Underfunded);
         // A posted margin is part of the total: a lone leg and 499.
         assert_eq!(judge(hedged(0), flat(499)), Funds::Underfunded);
-        // Exactly two margins is not underfunded.
-        assert_eq!(judge(flat(1_000), flat(0)), rebalance(Side::Long, Side::Short, 400));
+        // Exactly two margins is not underfunded: after levelling, both can open once.
+        assert_eq!(judge(flat(1_000), flat(0)), rebalance(Side::Long, Side::Short, 500));
         assert_eq!(judge(just_under(1_000), flat(0)), Funds::Underfunded);
     }
 
@@ -298,22 +294,15 @@ mod tests {
     }
 
     #[test]
-    fn a_sender_without_a_position_keeps_its_margin_and_one_rounds_loss() {
-        // Half the difference is 450, but the long account keeps 600 of its 1,000.
-        assert_eq!(judge(flat(1_000), flat(100)), rebalance(Side::Long, Side::Short, 400));
-        // With exactly its reserve it has nothing to send.
-        assert_eq!(judge(flat(600), flat(450)), Funds::Enough);
-        // What it can spare is counted in whole USDC too: 610.99… spares 10.
-        assert_eq!(judge(just_under(611), flat(400)), rebalance(Side::Long, Side::Short, 10));
-    }
-
-    #[test]
-    fn a_sender_with_a_position_has_posted_its_margin_and_reserves_nothing() {
-        // The same 1,000 against 100, but 500 of it are posted: all that is free can go.
+    fn no_more_is_sent_than_the_sender_has_free() {
+        // Flat or hedged, the same 1,000 against 100 moves half the difference.
+        assert_eq!(judge(flat(1_000), flat(100)), rebalance(Side::Long, Side::Short, 450));
         assert_eq!(judge(hedged(500), flat(100)), rebalance(Side::Long, Side::Short, 450));
-        // It keeps nothing back even where a flat sender could send nothing at all.
+        assert_eq!(judge(flat(600), flat(400)), rebalance(Side::Long, Side::Short, 100));
         assert_eq!(judge(hedged(100), flat(400)), rebalance(Side::Long, Side::Short, 100));
-        assert_eq!(judge(flat(600), flat(400)), Funds::Enough);
+        // Half the difference is 800, but 1,500 of the 1,600 are parked in positions.
+        let parked = Holding { available: usd(100), locked: usd(1_500) };
+        assert_eq!(judge(parked, flat(0)), rebalance(Side::Long, Side::Short, 100));
     }
 
     #[test]
@@ -321,9 +310,6 @@ mod tests {
         // Half the difference is 9.5 USDC: below the 10 the relayer takes.
         assert_eq!(judge(flat(618), flat(599)), Funds::Enough);
         assert_eq!(judge(flat(619), flat(599)), rebalance(Side::Long, Side::Short, 10));
-        // What the sender can spare is 9: the same.
-        assert_eq!(judge(flat(609), flat(400)), Funds::Enough);
-        assert_eq!(judge(flat(610), flat(400)), rebalance(Side::Long, Side::Short, 10));
         // Also when one account is below its margin: no transfer can be made,
         // and the balance check of the open is what holds that back.
         assert_eq!(judge(flat(505), flat(495)), Funds::Enough);

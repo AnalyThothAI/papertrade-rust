@@ -1506,10 +1506,10 @@ mod funding {
         })
         .await;
 
-        // A small deposit: the short account can post its margin. The pair is
-        // still short of a round's loss, and the long account has nothing to
-        // spare. The round opens all the same.
-        h.sim.set_balance(h.short, 500);
+        // A deposit: the short account can post its margin. It is still short
+        // of a round's loss, and the 5 USDC that would level the two are not
+        // worth a transfer. The round opens all the same.
+        h.sim.set_balance(h.short, 590);
         h.hedged().await;
         assert!(withdrawals(&h).is_empty());
     }
