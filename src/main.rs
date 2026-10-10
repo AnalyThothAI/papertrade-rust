@@ -107,7 +107,7 @@ async fn main() -> Result<()> {
             let store = Store::open(&config.database()).await?;
             let _only_one = lock_data_dir(&config)?;
             // Once, here, outside the restarts below: they are handed the same keys.
-            let keys = unlock_keys(&config).await?;
+            let keys = unlock_keys(&config, Terminal).await?;
             let stop = shutdown_signal().shared();
             bot::keep_running(|| bot::start(&config, store.clone(), keys.clone()), RESTART_DELAY, stop).await
         }
@@ -121,7 +121,7 @@ async fn main() -> Result<()> {
             new_session_key(&config, side, valid_for_minutes, &mut Terminal)
         }
         Command::SessionKey(SessionKeyCommand::Submit { side, signature }) => {
-            submit_session_key(&config, side, signature).await
+            submit_session_key(&config, side, signature, &Client::new()?).await
         }
         Command::Keys(KeysCommand::Init) => {
             require_terminal()?;
@@ -177,17 +177,19 @@ async fn status(store: &Store) -> Result<()> {
 /// Asks for the password and decrypts what this run signs with, once. The keys
 /// then stay in memory for as long as the process lives: a restart inside
 /// `keep_running` neither asks again nor reads a file.
-async fn unlock_keys(config: &Config) -> Result<Arc<UnlockedKeys>> {
+async fn unlock_keys(
+    config: &Config,
+    mut operator: impl Operator + Send + 'static,
+) -> Result<Arc<UnlockedKeys>> {
     // Is there anything to unlock? Asked before the operator is asked for anything.
     for side in Side::BOTH {
         keystore::require(&config.keys_dir, config.wallet(side)?, KeyRole::Session)?;
     }
-    require_terminal()?;
     // The prompt blocks and deriving the file key takes a moment: one blocking
     // task at start, so neither ever happens on the loop's threads.
     let unlocking = config.clone();
     let (keys, took) = tokio::task::spawn_blocking(move || -> Result<_> {
-        let password = Terminal.secret(&format!("Password for {}: ", unlocking.keys_dir.display()))?;
+        let password = operator.secret(&format!("Password for {}: ", unlocking.keys_dir.display()))?;
         let started = Instant::now();
         Ok((keystore::unlock(&unlocking, &password)?, started.elapsed()))
     })
@@ -255,7 +257,12 @@ fn write_registration(
     Ok((key, path))
 }
 
-async fn submit_session_key(config: &Config, side: Side, signature: Signature) -> Result<()> {
+async fn submit_session_key(
+    config: &Config,
+    side: Side,
+    signature: Signature,
+    relayer: &Client,
+) -> Result<()> {
     let wallet = config.wallet(side)?;
     let path = session_keys::registration_path(&config.keys_dir, wallet);
     let document = serde_json::from_str(
@@ -264,7 +271,7 @@ async fn submit_session_key(config: &Config, side: Side, signature: Signature) -
     let message = register_session_key_from_document(&document)
         .with_context(|| format!("{} is not a registration request", path.display()))?;
     let intent = seal_register_session_key(&message, signature)?;
-    let receipt = Client::new()?.submit_intent(&intent).await?;
+    let receipt = relayer.submit_intent(&intent).await?;
     println!("Relayer accepted the registration: {} ({}).", receipt.state, receipt.intent_id);
     println!("This was a real request; PT_DRY_RUN applies to `run` only.");
     println!("`papertrade status` shows the key as valid once it has executed.");
@@ -311,12 +318,15 @@ impl Operator for Terminal {
     }
 
     fn secret(&mut self, prompt: &str) -> Result<Zeroizing<String>> {
+        require_terminal()?;
         Ok(Zeroizing::new(rpassword::prompt_password(prompt).context("reading from the terminal")?))
     }
 }
 
 /// A password or a key is typed at a terminal. It is not taken from a pipe, an
 /// argument or the environment, where it would end up in a script or a history.
+/// Every hidden prompt asks this; the commands that would first print
+/// something ask it before they do.
 fn require_terminal() -> Result<()> {
     ensure!(
         std::io::stdin().is_terminal(),
@@ -407,15 +417,28 @@ fn init_keys(config: &Config, operator: &mut dyn Operator) -> Result<()> {
     Ok(())
 }
 
+/// The simulated exchange of the scenario tests. The tests at the end of this
+/// file take the commands above through it: from new keys to traded rounds.
+#[cfg(test)]
+#[path = "../tests/support/mod.rs"]
+mod support;
+
 #[cfg(test)]
 mod tests {
     use std::collections::VecDeque;
     use std::path::Path;
 
+    use alloy::dyn_abi::TypedData;
     use alloy::primitives::hex;
+    use alloy::signers::SignerSync;
     use alloy::signers::local::PrivateKeySigner;
+    use alloy::sol_types::SolStruct;
+    use papertrade::protocol::client::SubmitError;
     use papertrade::protocol::deployment::SESSION_KEY_TTL_SECONDS;
+    use papertrade::protocol::intents::exchange_domain;
+    use papertrade::strategy::decide::Phase;
 
+    use super::support::{ENTRY, Harness, TARGET, TTL, eventually, eventually_stored, status_when};
     use super::*;
 
     const PASSWORD: &str = "correct horse battery staple";
@@ -678,5 +701,158 @@ mod tests {
         let after = files(dir.path());
         assert!(keys.iter().all(|key| after.contains(key)) && after.len() == keys.len() + 1);
         assert_kept_secret(&shown, dir.path(), &[PASSWORD]);
+    }
+
+    // From here on: the whole way, against the simulated exchange. The commands
+    // are the ones above, each called as `main` calls it, with an operator who
+    // types from a script and a relayer that is the simulator. The wallets and
+    // every key are made for the run.
+
+    const SOON: Duration = Duration::from_secs(5);
+
+    /// What `cast wallet sign --data --from-file <request>` does: the wallet
+    /// hashes the typed data it is shown and signs that.
+    fn wallet_signs(request: &Path, wallet: &PrivateKeySigner) -> Signature {
+        let typed: TypedData = serde_json::from_str(&fs::read_to_string(request).unwrap()).unwrap();
+        wallet.sign_hash_sync(&typed.eip712_signing_hash().unwrap()).unwrap()
+    }
+
+    /// Nothing the bot wrote to its data directory holds one of these.
+    fn assert_not_in_the_database(h: &Harness, secrets: &[&str]) {
+        for entry in fs::read_dir(&h.config.data_dir).unwrap() {
+            let (name, content) =
+                (entry.as_ref().unwrap().file_name(), fs::read(entry.unwrap().path()).unwrap());
+            let content = String::from_utf8_lossy(&content);
+            for secret in secrets {
+                assert!(!content.contains(secret.trim_start_matches("0x")), "{name:?} holds a secret");
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn from_new_keys_to_traded_rounds_on_the_simulated_exchange() {
+        // Two wallets made for this run, funded on the exchange, with no session
+        // key registered. Their own keys stay with the operator: the wallets sign
+        // the registrations below and nothing of theirs reaches the bot's side.
+        let wallets = Wallets::random();
+        let (long, short) = (wallets.long.address(), wallets.short.address());
+        let mut h = Harness::unregistered(long, short).await;
+        let dir = tempfile::tempdir().unwrap();
+        h.config.keys_dir = dir.path().join("secrets");
+        let relayer = Client::with_origin(&h.sim.url).unwrap();
+
+        // `keys init`: one password, two new session keys, nothing sent.
+        init_keys(&h.config, &mut Script::typing(&[PASSWORD, PASSWORD])).unwrap();
+
+        // `run`: unlocked once. Its first start loses a feed, so the bot that goes on
+        // is one started again inside the process. The exchange has not heard of the
+        // session keys: it waits.
+        h.keys = unlock_keys(&h.config, Script::typing(&[PASSWORD])).await.unwrap();
+        h.start_self_healing_bot(1);
+        let waiting = status_when(&h, "the wait for a registration", |status| {
+            status.summary.ends_with("session key is not registered or expires soon")
+        })
+        .await;
+        assert!(waiting.legs.iter().all(|leg| leg.account.as_ref().unwrap().session_key_expiry.is_none()));
+        assert!(h.sim.received().is_empty(), "something was sent before any key was registered");
+
+        // For each account: `session-key new`, the wallet's signature, `session-key submit`.
+        for (side, wallet) in [(Side::Long, &wallets.long), (Side::Short, &wallets.short)] {
+            new_session_key(&h.config, side, 60, &mut Script::typing(&[PASSWORD])).unwrap();
+            let request = session_keys::registration_path(&h.config.keys_dir, wallet.address());
+            submit_session_key(&h.config, side, wallet_signs(&request, wallet), &relayer).await.unwrap();
+        }
+
+        // The bot that was waiting, with the keys it unlocked when it started, finds
+        // them registered and trades a round: opened, held, closed at the target, booked.
+        h.hedged().await;
+        let hedged = status_when(&h, "the open round", |status| status.phase == Phase::Hedged).await;
+        for (leg, keys) in hedged.legs.iter().zip([&h.keys.long, &h.keys.short]) {
+            assert_eq!(leg.session_key, format!("{:#x}", keys.session.address()));
+            assert!(leg.account.as_ref().unwrap().session_key_expiry.is_some(), "{leg:?}");
+            assert!(!leg.has_wallet_key && leg.wallet_key_problem.is_none(), "{leg:?}");
+        }
+        h.sim.set_mid(ENTRY + TARGET);
+        h.flat().await;
+        eventually_stored("both settled positions are in the ledger", SOON, || async {
+            h.store.totals().await.unwrap().trades == 2
+        })
+        .await;
+        assert!(h.opens() >= 2 && h.closes() == 2, "{} opens, {} closes", h.opens(), h.closes());
+
+        // Stopped, and started as a new process would be: the password once more,
+        // the same files, the same two keys, and the next round. Nothing is
+        // registered a second time.
+        h.stop_bot().await.unwrap();
+        let before = [h.keys.long.session.address(), h.keys.short.session.address()];
+        h.keys = unlock_keys(&h.config, Script::typing(&[PASSWORD])).await.unwrap();
+        assert_eq!([h.keys.long.session.address(), h.keys.short.session.address()], before);
+        h.start_bot();
+        eventually("the next round opens", TTL + SOON, || h.opens() == 4).await;
+        h.hedged().await;
+        let registrations = |wallet| h.sim.count(wallet, "registerSessionKey");
+        assert_eq!((registrations(long), registrations(short)), (1, 1));
+
+        // What is on disk: two encrypted keys and the two public requests. No
+        // password and no key, there or in the database.
+        assert_eq!(names(&h.config.keys_dir).len(), 4, "{:?}", names(&h.config.keys_dir));
+        let sessions = [&h.keys.long.session, &h.keys.short.session].map(|key| hex::encode(key.to_bytes()));
+        let secrets = [PASSWORD, &sessions[0], &sessions[1]];
+        assert_kept_secret("", &h.config.keys_dir, &secrets);
+        assert_not_in_the_database(&h, &secrets);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn with_the_wallets_own_keys_unlocked_the_same_keys_register_and_trade() {
+        let wallets = Wallets::random();
+        let (long_key, short_key) = (Wallets::typed(&wallets.long), Wallets::typed(&wallets.short));
+        let mut h = Harness::unregistered(wallets.long.address(), wallets.short.address()).await;
+        let dir = tempfile::tempdir().unwrap();
+        h.config.keys_dir = dir.path().join("secrets");
+        h.config.wallet_automation = true;
+        let relayer = Client::with_origin(&h.sim.url).unwrap();
+
+        // `keys init` with the automation on: the session keys are made, the
+        // wallets' own keys are typed in. Then one password unlocks all four.
+        let mut operator = Script::typing(&[PASSWORD, PASSWORD, &long_key, &short_key]);
+        init_keys(&h.config, &mut operator).unwrap();
+        h.keys = unlock_keys(&h.config, Script::typing(&[PASSWORD])).await.unwrap();
+
+        // The registration the wallet automation is to make by itself (issue #4),
+        // made here by hand from the parts it will be handed: the unlocked wallet
+        // key signs for the unlocked session key, and the exchange takes it.
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+        for side in Side::BOTH {
+            let keys = h.keys.get(side);
+            let wallet = keys.wallet.signer().expect("the wallet's own key is unlocked");
+            let request = session_keys::registration(keys.owner, keys.session.address(), now, 3_600);
+            let signature = wallet.sign_hash_sync(&request.eip712_signing_hash(&exchange_domain())).unwrap();
+            let registration = seal_register_session_key(&request, signature).unwrap();
+
+            // The exchange holds a registration to the wallet's signature: the same
+            // one over another key is not that wallet's word.
+            let mut forged = registration.clone();
+            forged.signed["key"] = format!("{:#x}", Address::repeat_byte(0x66)).into();
+            let refused = relayer.submit_intent(&forged).await.unwrap_err();
+            assert!(
+                matches!(&refused, SubmitError::Rejected { code, .. } if code == "unauthorized_intent"),
+                "{refused:?}"
+            );
+            relayer.submit_intent(&registration).await.unwrap();
+        }
+
+        h.start_bot();
+        h.hedged().await;
+        let hedged = status_when(&h, "the open round", |status| status.phase == Phase::Hedged).await;
+        assert!(hedged.legs.iter().all(|leg| leg.has_wallet_key && leg.wallet_key_problem.is_none()));
+        h.sim.set_mid(ENTRY - TARGET);
+        h.flat().await;
+        assert_eq!((h.opens(), h.closes()), (2, 2));
+
+        // Four encrypted files, and the wallets' keys nowhere in the clear.
+        assert_eq!(names(&h.config.keys_dir).len(), 4, "{:?}", names(&h.config.keys_dir));
+        let secrets = [PASSWORD, long_key.as_str(), short_key.as_str()];
+        assert_kept_secret(&operator.shown(), &h.config.keys_dir, &secrets);
+        assert_not_in_the_database(&h, &secrets);
     }
 }

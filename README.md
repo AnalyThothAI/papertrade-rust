@@ -376,7 +376,7 @@ Papertrade 的资金托管在 HyperCore 上：提现只会落到提现钱包自�
 | 状态 | 无持久化，全部从账户状态推导 | 同样推导决策；另把意图、事件、成交写入 SQLite |
 | 重启安全 | 启动后等一个意图有效期再开仓 | 从预写日志恢复在途意图，无需等待 |
 | 单腿裸露 | 另一条腿无应答时等到它过期（最长约 150 秒） | 10 秒后平掉已成交的腿 |
-| 端到端测试 | 无 | 模拟交易所 + 75 个场景 |
+| 端到端测试 | 无 | 模拟交易所 + 端到端场景（回合、重启接管、再平衡、密钥全链路） |
 | 密钥存放 | 明文文件 | 加密文件，启动时输入一次密码；两个版本的密钥目录不通用 |
 | 资金调拨 | 人工 | 打开 `PT_WALLET_AUTOMATION` 后自动注册 session key、自动再平衡；否则提示人工 |
 | 可见性 | 日志 + `status` 命令 | 终端面板、`status`、时间线、台账、任意 SQLite 工具 |
@@ -412,10 +412,10 @@ cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test
 | `src/store.rs`、`migrations/` | SQLite 存储与表结构 |
 | `src/status.rs` | 写入数据库的状态快照 |
 | `src/bot.rs`、`src/bot/funding.rs` | 运行循环；其中注册 session key 和执行转账的部分。接收已解锁的密钥，自己不读密钥文件 |
-| `src/main.rs` | 命令行：`keys init` 向导、`run` 启动时的一次解锁、其余命令 |
+| `src/main.rs` | 命令行：`keys init` 向导、`run` 启动时的一次解锁、其余命令。文件末尾的测试把这些命令串成完整链路，在模拟交易所上从新生成的密钥一直跑到成交和重启接管 |
 | `src/tui.rs` | 终端面板，以及 `status` 的纯文本输出 |
 | `tests/fixtures/` | 生产环境抓取的真实响应、TypeScript 版生成的签名金标准、官方估值函数的对照表 |
-| `tests/support/` | 模拟交易所：同样的接口，会校验签名、排队、执行，并能按脚本制造拒绝、无应答、延迟、强平、断流；也模拟 HyperCore 余额、Hyperliquid 转账和存入地址的归集 |
+| `tests/support/` | 模拟交易所：同样的接口，会校验签名、排队、执行，受理主钱包签名的 session key 注册，并能按脚本制造拒绝、无应答、延迟、强平、断流；也模拟 HyperCore 余额、Hyperliquid 转账和存入地址的归集 |
 | `tests/rounds.rs`、`tests/restart.rs` | 真实机器人对模拟交易所的端到端场景；密钥在内存里生成后注入 |
 | `tests/keystore.rs` | 密钥文件：加密、解密、不覆盖、不泄露，全部用随机生成的空钱包 |
 | `tests/cli.rs` | 编译出的程序在没有终端时的行为：哪些命令不需要密码，哪些必须拒绝 |

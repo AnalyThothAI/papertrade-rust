@@ -10,9 +10,9 @@ use alloy::signers::local::PrivateKeySigner;
 use papertrade::keystore::{self, WalletKey};
 use papertrade::protocol::deployment::usd;
 use papertrade::session_keys;
-use papertrade::status::{EstimateSnapshot, FeesSnapshot, RoundEstimate, RoundSnapshot, Snapshot};
+use papertrade::status::{EstimateSnapshot, FeesSnapshot, RoundEstimate, RoundSnapshot};
 use papertrade::strategy::decide::{Mode, Phase};
-use support::{Behavior, ENTRY, Harness, TARGET, TTL, eventually, eventually_stored, steadily};
+use support::{Behavior, ENTRY, Harness, TARGET, TTL, eventually, eventually_stored, status_when, steadily};
 
 const SOON: Duration = Duration::from_secs(5);
 const A_WHILE: Duration = Duration::from_millis(600);
@@ -22,19 +22,6 @@ fn exposure(harness: &Harness, wallet: alloy::primitives::Address) -> Duration {
     let received = harness.sim.received();
     let at = |action: &str| received.iter().find(|r| r.wallet == wallet && r.action == action).unwrap().at;
     at("closePositions") - at("openPosition")
-}
-
-/// The first stored status for which `wanted` holds. The bot rewrites its status
-/// about once a second, so this can take that long.
-async fn status_when(h: &Harness, what: &str, wanted: impl Fn(&Snapshot) -> bool) -> Snapshot {
-    let started = std::time::Instant::now();
-    loop {
-        if let Some(status) = h.store.read_status().await.unwrap().filter(&wanted) {
-            return status;
-        }
-        assert!(started.elapsed() < SOON, "timed out after {SOON:?} waiting for a status with: {what}");
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
 }
 
 #[tokio::test(flavor = "multi_thread")]
