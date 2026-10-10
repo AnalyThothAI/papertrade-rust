@@ -15,6 +15,10 @@ use crate::status::Snapshot;
 use crate::strategy::decide::{Mode, Side};
 use crate::strategy::inflight::{Inflight, Kind, is_failure};
 
+/// How often opening the database is tried, and the pause in between.
+const OPEN_ATTEMPTS: u32 = 10;
+const OPEN_RETRY: std::time::Duration = std::time::Duration::from_millis(100);
+
 pub fn now_ms() -> i64 {
     let elapsed = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default();
     i64::try_from(elapsed.as_millis()).unwrap_or(i64::MAX)
@@ -84,7 +88,24 @@ impl Store {
             // A process crash still loses nothing. Only a power cut can drop the last
             // commits, and an intent journaled that late has expired before the host is back.
             .synchronous(SqliteSynchronous::Normal);
-        Self::connect(SqlitePoolOptions::new().connect_with(options).await?).await
+        // The bot and a viewer are often started together. On a database that is
+        // new or needs migrating, both set it up at once and SQLite refuses one of
+        // them outright instead of making it wait. By the time that one tries
+        // again the other has finished, so trying again is all it takes.
+        let mut attempt = 1;
+        loop {
+            let opened = match SqlitePoolOptions::new().connect_with(options.clone()).await {
+                Ok(pool) => Self::connect(pool).await,
+                Err(error) => Err(error.into()),
+            };
+            match opened {
+                Err(_) if attempt < OPEN_ATTEMPTS => {
+                    attempt += 1;
+                    tokio::time::sleep(OPEN_RETRY).await;
+                }
+                opened => return opened,
+            }
+        }
     }
 
     #[cfg(test)]
@@ -365,6 +386,20 @@ mod tests {
             user_paid_fee_raw: Dec(U256::ZERO),
             paper_minted_raw: Dec(usd(paper)),
             paper_mint_basis_raw: Dec(U256::ZERO),
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn two_processes_can_open_a_new_database_at_the_same_time() {
+        // Separate pools stand in for the bot and a viewer started together.
+        for _ in 0..20 {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("papertrade.db");
+            let (first, second, third) =
+                tokio::join!(Store::open(&path), Store::open(&path), Store::open(&path));
+            for store in [first, second, third] {
+                assert_eq!(store.unwrap().mode().await.unwrap(), Mode::Run);
+            }
         }
     }
 
