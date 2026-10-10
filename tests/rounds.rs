@@ -324,6 +324,118 @@ async fn flatten_closes_the_round_now_and_resume_starts_the_next() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn stop_closes_both_legs_then_ends_the_run_and_the_next_start_runs() {
+    let mut h = Harness::start().await;
+    h.hedged().await;
+    h.store.set_mode(Mode::Stop).await.unwrap();
+    // The run ends by its own doing: nobody presses Ctrl-C.
+    tokio::time::timeout(SOON, h.bot_ended()).await.expect("the run ends once nothing is open").unwrap();
+    assert_eq!((h.opens(), h.closes()), (2, 2));
+    for wallet in [h.long, h.short] {
+        assert!(h.sim.positions(wallet).is_empty() && h.sim.queued(wallet) == 0);
+    }
+
+    // The request is used up, the last status says how the run ended, and the
+    // timeline has the whole of it.
+    assert_eq!(h.store.mode().await.unwrap(), Mode::Run);
+    let last = h.store.read_status().await.unwrap().unwrap();
+    assert_eq!(
+        (last.decision.as_str(), last.summary.as_str(), last.phase),
+        ("exit", "stop: nothing is open; the run ends", Phase::Flat)
+    );
+    let timeline: Vec<String> =
+        h.store.recent_events(20).await.unwrap().into_iter().map(|event| event.summary).collect();
+    for expected in [
+        "operator set mode to stop",
+        "stop: close long then short",
+        "stop: nothing is open; the run ends",
+        "the stop is done: nothing is open and the run has ended; mode back to run",
+    ] {
+        assert!(timeline.iter().any(|event| event == expected), "{expected:?} is not in {timeline:#?}");
+    }
+
+    // Whoever starts it again means it to run.
+    h.start_bot();
+    h.hedged().await;
+    assert_eq!(h.opens(), 4);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn stop_with_nothing_open_ends_the_run_at_once_and_opens_nothing() {
+    let mut h = Harness::prepare().await;
+    // Flat for as long as the relayer refuses opens.
+    h.sim.pause("openPosition");
+    h.start_bot();
+    status_when(&h, "a flat bot", |status| status.phase == Phase::Flat).await;
+    h.store.set_mode(Mode::Stop).await.unwrap();
+    tokio::time::timeout(SOON, h.bot_ended()).await.expect("the run ends").unwrap();
+    assert!(h.sim.received().is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn stop_does_not_end_the_run_while_an_unanswered_open_could_still_execute() {
+    let mut h = Harness::prepare().await;
+    h.sim.script(h.long, "openPosition", &[Behavior::Drop]);
+    h.sim.script(h.short, "openPosition", &[Behavior::Drop]);
+    h.start_bot();
+    eventually("both opens are sent", SOON, || h.opens() == 2).await;
+    h.store.set_mode(Mode::Stop).await.unwrap();
+    // Nothing is open, yet either open could still execute until its deadline:
+    // a run that ended now would leave that position to nobody.
+    steadily("the run goes on while they could", Duration::from_millis(1_200), || !h.bot_has_ended()).await;
+    tokio::time::timeout(TTL + SOON, h.bot_ended()).await.expect("it ends once they have expired").unwrap();
+    assert_eq!((h.opens(), h.closes()), (2, 0));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn stop_keeps_at_it_while_closes_are_refused_and_ends_when_they_go_through() {
+    let mut h = Harness::start().await;
+    h.hedged().await;
+    h.sim.pause("closePositions");
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    h.store.set_mode(Mode::Stop).await.unwrap();
+    steadily("with positions it cannot close the run goes on", A_WHILE, || {
+        !h.bot_has_ended() && h.closes() == 0
+    })
+    .await;
+    h.sim.unpause("closePositions");
+    tokio::time::timeout(SOON, h.bot_ended()).await.expect("the run ends once flat").unwrap();
+    assert_eq!(h.closes(), 2);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn resume_calls_a_stop_off() {
+    let mut h = Harness::start().await;
+    h.hedged().await;
+    h.sim.pause("closePositions");
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    h.store.set_mode(Mode::Stop).await.unwrap();
+    status_when(&h, "the stop under way", |status| status.mode == Mode::Stop).await;
+    // Before it could close anything, the operator thinks better of it.
+    h.store.set_mode(Mode::Run).await.unwrap();
+    h.sim.unpause("closePositions");
+    steadily("the round is kept and the run goes on", A_WHILE, || !h.bot_has_ended() && h.closes() == 0)
+        .await;
+    h.sim.set_mid(ENTRY + TARGET);
+    h.flat().await;
+    h.stop_bot().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stop_is_carried_through_by_the_start_that_follows_a_failure() {
+    let mut h = Harness::start().await;
+    h.hedged().await;
+    // The stop is asked, and the bot dies before it has acted on it. The start
+    // that follows inside the process finds it still asked.
+    h.kill_bot().await;
+    h.store.set_mode(Mode::Stop).await.unwrap();
+    h.start_bot();
+    tokio::time::timeout(SOON, h.bot_ended()).await.expect("the run ends once flat").unwrap();
+    assert_eq!((h.opens(), h.closes()), (2, 2));
+    assert_eq!(h.store.mode().await.unwrap(), Mode::Run);
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn pause_finishes_the_open_round_and_starts_no_new_one() {
     let h = Harness::start().await;
     h.hedged().await;
@@ -1311,6 +1423,42 @@ mod funding {
 
         h.store.set_mode(Mode::Run).await.unwrap();
         eventually("running again, the transfer is started", SOON, || withdrawals(&h).len() == 2).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_run_asked_to_stop_sees_the_transfer_under_way_through_before_it_ends() {
+        let mut h = Harness::prepare_with(lopsided()).await;
+        h.sim.set_sweep(Sweep::Never);
+        h.start_bot();
+        in_stage(&h, Stage::Credit).await;
+        h.store.set_mode(Mode::Stop).await.unwrap();
+        // Nothing is open, but the funds are in neither account.
+        let waiting = status_when(&h, "the stop waiting for the transfer", |status| {
+            status.summary == "stop: nothing is open; the transfer under way is seen through first"
+        })
+        .await;
+        assert_eq!(waiting.decision, "exit");
+        steadily("the run goes on until the transfer has ended", A_WHILE, || !h.bot_has_ended()).await;
+
+        h.sim.set_sweep(Sweep::After(Duration::ZERO));
+        tokio::time::timeout(SOON, h.bot_ended()).await.expect("the run ends once the transfer has").unwrap();
+        assert_eq!(h.store.active_transfer().await.unwrap(), None);
+        assert_eq!((h.sim.balance(h.long), h.sim.balance(h.short)), (usd(LEVELLED), usd(LEVELLED)));
+        // Stopping began nothing: no round, and no second transfer.
+        assert_eq!((h.opens(), withdrawals(&h).len()), (0, 1));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_stuck_transfer_does_not_keep_a_run_from_stopping() {
+        let mut h = Harness::prepare_with(lopsided()).await;
+        h.timing.funding.transfer.stuck_after = Duration::from_millis(500);
+        h.sim.set_sweep(Sweep::Never);
+        h.start_bot();
+        in_stage(&h, Stage::Stuck).await;
+        // It waits for the operator; the operator does not wait for it.
+        h.store.set_mode(Mode::Stop).await.unwrap();
+        tokio::time::timeout(SOON, h.bot_ended()).await.expect("the run ends").unwrap();
+        assert_eq!(transfer_stage(&h).await, Some(Stage::Stuck));
     }
 
     // --- when a transfer may start -------------------------------------------------

@@ -19,7 +19,7 @@ papertrade-rust 是 [Papertrade](https://docs.papertrade.xyz/)（HyperEVM 上的
 - **决策与执行**：常驻进程 `papertrade run` 每 250 ms 用一个纯函数判断该等待、开仓还是平仓，签名后经中继提交。
 - **本地账本**：SQLite 里有意图预写日志、时间线和成交台账。重启后从账户状态和日志接管，不重复开仓。
 - **可见**：终端面板 `tui` 和纯文本 `status` 显示它看到什么、打算做什么、做过什么，以及每一轮的成本与 PAPER 预估。
-- **可干预**：`pause` / `resume` / `flatten` 随时改变它的行为，不需要停进程。
+- **可干预**：`pause` / `resume` / `flatten` 随时改变它的行为，不需要停进程；`stop` 让它两边平仓后自己退出。
 - **密钥加密存放**：session key 和可选的主钱包私钥以密文落盘，启动时在终端输入一次密码解锁。
 - **可选的资金自动化**：主钱包私钥在场时自动注册和续期 session key；再单独打开再平衡，才会在两个账户之间自动转移资金。变量不设时两者都关闭；示例配置 `.env.example` 打开了前者。
 
@@ -220,12 +220,12 @@ flowchart LR
 | `legs` | 含义 | 机器人的动作 |
 | :--- | :--- | :--- |
 | `unknown` | 至少一个账户的状态不可用 | 等待 |
-| `flat` | 两户都没有仓位 | [开仓条件](#decision)全部满足时两腿同时开仓；`pause` 和 `flatten` 模式下不开 |
+| `flat` | 两户都没有仓位 | [开仓条件](#decision)全部满足时两腿同时开仓；`pause`、`flatten` 和 `stop` 模式下不开，`stop` 模式下 `run` 在这时退出 |
 | `hedged` | 两户各有一个方向正确的仓位 | 中间价距两腿开仓均价达到阈值时平仓，亏损腿先平 |
 | `one leg (long)` / `one leg (short)` | 只有一户有仓位 | 立刻平掉它，不看价格 |
 | `unexpected positions` | 出现策略不管理的仓位：同一户多于一个、别的市场或方向不对 | 不动，等人工处理或 `flatten` |
 
-两条规则优先于上表：有开平仓意图在中继排队或刚发出不到 10 秒时，任何状态下都先等待；`flatten` 模式下平掉两户的所有仓位（包括预期之外的），不开仓。
+两条规则优先于上表：有开平仓意图在中继排队或刚发出不到 10 秒时，任何状态下都先等待；`flatten` 和 `stop` 模式下平掉两户的所有仓位（包括预期之外的），不开仓。
 
 <a id="quickstart"></a>
 
@@ -382,17 +382,28 @@ PT_REBALANCE=false
 ./target/release/papertrade pause      # 不再开新一轮；已开的一轮照常持有到目标
 ./target/release/papertrade resume     # 恢复开仓
 ./target/release/papertrade flatten    # 立刻平掉两个账户的所有仓位，之后不开仓，直到 resume
+./target/release/papertrade stop       # 平掉两个账户的所有仓位，空仓后 run 自己退出
 ```
 
-- 这三条命令只把模式写进数据库，不碰密钥、不问密码。真正去平仓的是正在运行的 `run`：**`run` 没在运行时，`flatten` 不会平掉任何仓位。**
-- 模式保存在数据库里，重启后仍然有效。`flatten` 之后要 `resume` 才会再开仓。
-- 面板里按 `p` 在 `run` 和 `pause` 之间切换（处于 `flatten` 时按 `p` 等于 `resume`）。`flatten` 故意不做成一个按键。
-- `flatten` 同样只能经中继平仓，中继暂停平仓时它也平不掉。
+- 这些命令只把模式写进数据库，不碰密钥、不问密码。真正去平仓的是正在运行的 `run`：**`run` 没在运行时，`flatten` 不会平掉任何仓位。**
+- `pause` 和 `flatten` 保存在数据库里，重启后仍然有效。`flatten` 之后要 `resume` 才会再开仓。
+- 面板里按 `p` 在 `run` 和 `pause` 之间切换（处于 `flatten` 或 `stop` 时按 `p` 等于 `resume`）。`flatten` 故意不做成一个按键。
+- `flatten` 和 `stop` 同样只能经中继平仓，中继暂停平仓时它们也平不掉。
+
+`stop` 是"平仓并停止"，只对**正在运行**的 `run` 有效：
+
+- 它像 `flatten` 一样平掉两户的所有仓位、不再开仓，然后在**确实空仓、也不会再有仓位出现**时让 `run` 自己退出（退出码 0）。时间线上依次是 `stop: close …`、`stop: nothing is open; the run ends`。
+- 它不会带着仓位退出。平不掉（中继暂停平仓、session key 失效、账户状态读不到）时它一直试，`status` 显示卡在哪；想放弃平仓直接停，按 `Ctrl-C`。
+- 有开仓发出去却没得到答复时，它等到那笔开仓在链上过期才退出：否则它可能在没人看着的时候成交。
+- 有一笔转账正在两个账户之间进行时，它等这笔转账结束再退出，因为这时钱在两户之外。卡住（`stuck`）的转账不等。dry run 不推进转账，也就不等。
+- `resume` 可以在它退出之前把它取消。它退出之后请求就用掉了：下次 `run` 正常运行。`run` 在完成之前就被杀掉的话，下次 `run` 启动时会丢弃这个没完成的请求并说明。
+- `run` 没在运行时 `stop` 会被拒绝，不会留下一个请求去结束下一次启动。
+- dry run 不会平仓：有仓位时 `stop` 只显示它想平，不会退出。
 
 ### 停止与重启
 
 - **停止**：在 `run` 的终端按 `Ctrl-C`。它做完当前这一拍后退出；还有仓位时会警告 `stopping with open positions; nothing is watching them now`。它只停进程，**不平仓**。还在启动或等着重新开始时按，会立刻退出；在密码提示处按，是取消这次启动，显示 `Error: interrupted`。
-- **停之前先空仓**：`run` 不在时没有任何东西看着仓位，一条腿被强平后另一条腿不会被平掉。要长时间停机，先 `pause` 等这一轮走完，或 `flatten`，看到 `legs` 为 `flat` 再停。
+- **停之前先空仓**：`run` 不在时没有任何东西看着仓位，一条腿被强平后另一条腿不会被平掉。要长时间停机，用 `papertrade stop`（平仓后自己退出），或者先 `pause` 等这一轮走完，看到 `legs` 为 `flat` 再按 `Ctrl-C`。
 - **重启**：随时可以，再次 `run` 并输入密码即可。它从账户状态、意图日志和未完成的转账记录接管，不依赖内存。
 - **升级**：`git pull --ff-only && cargo build --release`，然后停掉 `run` 再启动。数据库迁移在打开时自动执行；被新版本打开过的数据库，旧的二进制会拒绝打开。
 
@@ -449,7 +460,7 @@ session key 注册后 30 天有效，面板的 LONG / SHORT 区显示剩余时�
 - 转出方没有在途的开仓或平仓。
 - 两个钱包的私钥都已解锁。
 - 两个账户的累计入金/提现字段都已知；缺失时显示 `account cashflow totals unavailable`，只暂停发起再平衡。
-- 机器人处于 `run` 模式（不是 `pause` 或 `flatten`）。
+- 机器人处于 `run` 模式（不是 `pause`、`flatten` 或 `stop`）。
 - 中继没有暂停 `withdrawToCore`。
 
 ### 与交易的关系
@@ -555,6 +566,7 @@ flowchart LR
 | `pause` | 不再开新一轮；已开的一轮照常持有到目标 | 不要 | 否 |
 | `resume` | 恢复开仓 | 不要 | 否 |
 | `flatten` | 让正在运行的 `run` 立刻平掉两个账户的所有仓位，之后不开仓，直到 `resume` | 不要 | 否 |
+| `stop` | 让正在运行的 `run` 平掉两个账户的所有仓位，空仓后自己退出；`run` 没在运行时拒绝 | 不要 | 否 |
 | `rebalance abandon` | 结束一笔卡住（`stuck`）的转账；只改记录，不动资金 | 不要 | 否 |
 
 要密码的命令只从终端读取密码，没有终端时直接拒绝。
@@ -590,7 +602,7 @@ flowchart LR
 
 - 先确认两把 session key 的密文都在，再问一次密码，解密后放在内存里，直到进程退出。之后的每一拍、每一次进程内重新开始，都用这同一份，不再读文件、不再解密。
 - 缺 session key、密码错、文件损坏：明确报错后退出，不会自己生成新密钥。
-- `tui`、`status`、`pause`、`resume`、`flatten`、`rebalance abandon` 只读写数据库，不碰密钥。
+- `tui`、`status`、`pause`、`resume`、`flatten`、`stop`、`rebalance abandon` 只读写数据库，不碰密钥。
 
 所有密文用同一个密码加密，各自有随机的 salt 和 IV。这套加密保护的是**落在磁盘上的文件**：备份、误提交、磁盘被拷走时，拿到文件的人还需要密码。它不保护已经解锁的进程：能读这个进程内存的程序、以同一用户运行的恶意软件、键盘记录，都不在它的防护范围内。
 
@@ -764,7 +776,7 @@ flowchart LR
 
 | 区域 | 内容 |
 | :--- | :--- |
-| 顶栏 | 模式（`RUN` / `PAUSE` / `FLATTEN`）、是否 dry run、机器人是否在线（快照超过 5 秒没更新即视为没在运行）、两腿状态、当前决定及原因 |
+| 顶栏 | 模式（`RUN` / `PAUSE` / `FLATTEN` / `STOP`）、是否 dry run、机器人是否在线（快照超过 5 秒没更新即视为没在运行）、两腿状态、当前决定及原因 |
 | Market | 中间价、开仓价（两腿均价）、这一轮已持有多久、偏离与进度条、两侧的平仓触发价、两条腿的强平价、派彩队列、交易是否暂停、中继拒收哪些动作 |
 | Estimate | 当前铸造率、三项费率、“到目标时”与“现在平仓”两组数字 |
 | LONG / SHORT | 可用余额、排队款、session key 剩余时间（没注册显示 `NOT REGISTERED`，过期显示 `EXPIRED`）、主钱包私钥在这次运行里是 `loaded`、`off` 还是 `UNAVAILABLE`、在途意图数、仓位 |
@@ -782,7 +794,7 @@ flowchart LR
 
 | 表 | 内容 |
 | :--- | :--- |
-| `control` | 操作员模式：`run` / `pause` / `flatten`，一行 |
+| `control` | 操作员模式：`run` / `pause` / `flatten` / `stop`，一行 |
 | `status` | 机器人当前看到和打算做的事（JSON 快照），约每秒重写，一行 |
 | `events` | 时间线：每次决策变化、每个意图的提交结果、每笔结算、每次模式变更、转账的每一步 |
 | `intents` | 意图预写日志：请求原文、有效期、状态（`signed → accepted / rejected / unknown → settled`）、中继报告的结果。开仓、平仓、提现、session key 注册都在这里 |

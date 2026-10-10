@@ -20,8 +20,6 @@ use crate::store::{EventRow, LedgerSync, Store, Totals, now_ms};
 use crate::strategy::decide::{Mode, Phase, Side};
 
 const REFRESH: Duration = Duration::from_millis(500);
-/// The bot rewrites its status about once a second; older than this means it is not running.
-const STALE_MS: i64 = 5_000;
 /// How many timeline entries `status` prints.
 const REPORT_EVENTS: usize = 10;
 /// What stands in for a value that is not known.
@@ -158,6 +156,7 @@ fn draw_header(frame: &mut Frame, area: Rect, screen: &Screen) {
         Mode::Run => Span::from(" RUN ").black().on_green(),
         Mode::Pause => Span::from(" PAUSE ").black().on_yellow(),
         Mode::Flatten => Span::from(" FLATTEN ").white().on_red(),
+        Mode::Stop => Span::from(" STOP ").white().on_red(),
     };
     let mut title = vec![Span::from(" papertrade ").bold(), mode];
     let mut decision = Line::from("the bot has not reported yet").dim();
@@ -187,7 +186,7 @@ fn draw_header(frame: &mut Frame, area: Rect, screen: &Screen) {
 /// `None` while the bot is reporting; otherwise how long it has been silent.
 fn liveness(status: &Snapshot, now_ms: i64) -> Option<String> {
     let silent_ms = now_ms - status.at_ms;
-    (silent_ms > STALE_MS).then(|| format!("NOT RUNNING · last seen {} ago", age(silent_ms)))
+    (!status.is_live(now_ms)).then(|| format!("NOT RUNNING · last seen {} ago", age(silent_ms)))
 }
 
 fn dim(text: impl Into<String>) -> Span<'static> {
@@ -885,6 +884,19 @@ mod tests {
         screen.ledger_sync[0].1.as_mut().unwrap().complete = true;
         screen.totals = Totals::default();
         both_show(&screen, &["settled positions 0  net +0.00 USD  PAPER 0  actual cost n/a"]);
+    }
+
+    #[test]
+    fn a_stop_under_way_shows_as_the_mode_and_as_what_the_bot_is_doing() {
+        let mut screen = hedged_screen();
+        screen.mode = Mode::Stop;
+        let status = status(&mut screen);
+        status.mode = Mode::Stop;
+        status.decision = "close".into();
+        status.summary = "stop: close long then short".into();
+        both_show(&screen, &["stop: close long then short"]);
+        assert!(render(&screen).contains(" STOP "), "{}", render(&screen));
+        assert!(text(&screen).contains("mode      stop\n"), "{}", text(&screen));
     }
 
     #[test]

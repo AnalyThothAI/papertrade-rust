@@ -72,6 +72,10 @@ pub enum Mode {
     Pause,
     /// Close every position now, open nothing.
     Flatten,
+    /// Close every position now, open nothing, and end the run once nothing is
+    /// open and nothing can still open. Asked of a running bot; it is used up
+    /// when that bot ends.
+    Stop,
 }
 
 impl Mode {
@@ -80,6 +84,7 @@ impl Mode {
             Mode::Run => "run",
             Mode::Pause => "pause",
             Mode::Flatten => "flatten",
+            Mode::Stop => "stop",
         }
     }
 }
@@ -205,6 +210,8 @@ pub enum CloseReason {
     Unhedged,
     /// The operator asked for everything to be closed.
     Flatten,
+    /// The operator asked for everything to be closed and the run to end.
+    Stop,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -220,13 +227,16 @@ pub enum Decision {
         /// In submission order.
         closes: Vec<CloseOrder>,
     },
+    /// The operator asked the run to stop, nothing is open and nothing can still
+    /// open: the run may end.
+    Exit,
 }
 
 impl Decision {
     /// Whether carrying it out sends an intent for this account.
     pub fn sends_for(&self, side: Side) -> bool {
         match self {
-            Decision::Wait(_) => false,
+            Decision::Wait(_) | Decision::Exit => false,
             Decision::Open { .. } => true,
             Decision::Close { closes, .. } => closes.iter().any(|close| close.side == side),
         }
@@ -315,7 +325,7 @@ pub fn decide(view: &View<'_>, params: &StrategyParams, market: &Market) -> Deci
         return Decision::Wait(Wait::IntentPending);
     }
 
-    if view.mode == Mode::Flatten {
+    if matches!(view.mode, Mode::Flatten | Mode::Stop) {
         let closes: Vec<CloseOrder> = [(Side::Long, long), (Side::Short, short)]
             .into_iter()
             .filter(|(_, account)| !account.positions.is_empty())
@@ -329,10 +339,20 @@ pub fn decide(view: &View<'_>, params: &StrategyParams, market: &Market) -> Deci
                     .collect(),
             })
             .collect();
+        let stopping = view.mode == Mode::Stop;
         if closes.is_empty() {
-            return Decision::Wait(Wait::Flattened);
+            // A run that ended while an open could still execute would leave the
+            // position it makes to nobody.
+            let unresolved =
+                view.long.awaiting != Awaiting::Nothing || view.short.awaiting != Awaiting::Nothing;
+            return match (stopping, unresolved) {
+                (false, _) => Decision::Wait(Wait::Flattened),
+                (true, true) => Decision::Wait(Wait::IntentUnresolved),
+                (true, false) => Decision::Exit,
+            };
         }
-        return close(view, CloseReason::Flatten, closes);
+        let reason = if stopping { CloseReason::Stop } else { CloseReason::Flatten };
+        return close(view, reason, closes);
     }
 
     let (Ok(long_leg), Ok(short_leg)) =
@@ -931,6 +951,81 @@ mod tests {
             ..Scenario::hedged(ENTRY)
         };
         assert_eq!(scenario.wait(), Wait::ClosesPaused);
+    }
+
+    // --- stop ----------------------------------------------------------------
+
+    #[test]
+    fn stop_closes_everything_as_flatten_does_and_says_it_is_stopping() {
+        let scenario = Scenario { mode: Mode::Stop, ..Scenario::hedged(ENTRY) };
+        assert_eq!(
+            scenario.decide(),
+            Decision::Close {
+                reason: CloseReason::Stop,
+                closes: vec![close_of(Side::Long, 7), close_of(Side::Short, 8)],
+            }
+        );
+        // Positions the bot did not expect are closed too, and no price is needed.
+        let scenario = Scenario {
+            mode: Mode::Stop,
+            long: Some(holding(vec![position(7, false), position(9, true)])),
+            mid: None,
+            ..Default::default()
+        };
+        let Decision::Close { reason: CloseReason::Stop, closes } = scenario.decide() else {
+            panic!("expected a close: {:?}", scenario.decide())
+        };
+        assert_eq!(closes[0].position_ids, [U256::from(7), U256::from(9)]);
+    }
+
+    #[test]
+    fn stop_ends_the_run_once_nothing_is_open_and_nothing_can_still_open() {
+        let stopping = || Scenario { mode: Mode::Stop, ..Default::default() };
+        assert_eq!(stopping().decide(), Decision::Exit);
+        // Nothing that keeps a flat bot from opening keeps it from ending.
+        let idle = Scenario { trading: None, queue_total: None, mid: None, may_open: false, ..stopping() };
+        assert_eq!(idle.decide(), Decision::Exit);
+        assert!(!Decision::Exit.sends_for(Side::Long) && !Decision::Exit.sends_for(Side::Short));
+
+        // An open that went unanswered could still execute: its position would be
+        // left to nobody. And one that is expected is waited for as always.
+        let doubtful = Scenario { awaiting: Some((Side::Short, Awaiting::Doubtful)), ..stopping() };
+        assert_eq!(doubtful.wait(), Wait::IntentUnresolved);
+        let expected = Scenario { awaiting: Some((Side::Long, Awaiting::Expected)), ..stopping() };
+        assert_eq!(expected.wait(), Wait::IntentPending);
+        // And never blind.
+        assert_eq!(Scenario { short: None, ..stopping() }.wait(), Wait::AccountStateUnavailable);
+    }
+
+    #[test]
+    fn stop_does_not_end_the_run_while_a_position_cannot_be_closed() {
+        let refused = Scenario {
+            mode: Mode::Stop,
+            trading: Some(trading_state(&["closePositions"])),
+            ..Scenario::hedged(ENTRY)
+        };
+        assert_eq!(refused.wait(), Wait::ClosesPaused);
+        // One leg left: still a close, not an end.
+        let one_left = Scenario {
+            mode: Mode::Stop,
+            short: Some(holding(vec![position(8, false)])),
+            ..Default::default()
+        };
+        assert_eq!(
+            one_left.decide(),
+            Decision::Close { reason: CloseReason::Stop, closes: vec![close_of(Side::Short, 8)] }
+        );
+    }
+
+    #[test]
+    fn no_other_mode_ends_the_run() {
+        for mode in [Mode::Run, Mode::Pause, Mode::Flatten] {
+            for scenario in
+                [Scenario { mode, ..Default::default() }, Scenario { mode, ..Scenario::hedged(ENTRY) }]
+            {
+                assert_ne!(scenario.decide(), Decision::Exit, "{mode:?}");
+            }
+        }
     }
 
     // --- intents that went unanswered ---------------------------------------

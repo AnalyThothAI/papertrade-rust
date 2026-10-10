@@ -427,7 +427,15 @@ impl Running {
                 // Without its feeds the bot would wait forever on stale data. Better to
                 // stop loudly: the caller starts a fresh run.
                 Some(ended) = tasks.join_next() => bail!("a background task stopped: {ended:?}"),
-                _ = ticks.tick() => bot.tick().await,
+                _ = ticks.tick() => {
+                    if bot.tick().await == Tick::Ended {
+                        // The request is used up: the next start runs.
+                        info!("stopped as the operator asked: nothing is open");
+                        let finished = bot.store.finish_stop().await;
+                        bot.best_effort("marking the stop as done", finished);
+                        return Ok(());
+                    }
+                }
             }
         }
         if bot.open_position_count > 0 {
@@ -437,8 +445,16 @@ impl Running {
     }
 }
 
+/// How a tick left the run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Tick {
+    Continue,
+    /// The operator asked the run to stop, and it has: see [`Decision::Exit`].
+    Ended,
+}
+
 impl Bot {
-    async fn tick(&mut self) {
+    async fn tick(&mut self) -> Tick {
         self.collect_funding();
         while let Ok(outcome) = self.outcomes.try_recv() {
             // Started is sent before HTTP; once its outcome arrives, collect
@@ -517,12 +533,21 @@ impl Bot {
             self.best_effort("recording a decision", recorded);
             self.reported.clone_from(&summary);
         }
-        if changed || self.status_at.elapsed() >= STATUS_INTERVAL {
+        let ending = decision == Decision::Exit && !self.transfer_holds_exit();
+        if changed || ending || self.status_at.elapsed() >= STATUS_INTERVAL {
             let mut snapshot =
                 self.snapshot(&decision, summary, &accounts, trading.as_ref(), queue_total, mid);
             self.describe_funding(&mut snapshot, funds.as_ref());
+            if ending {
+                // Written here and now: the task that writes the status ends with the run.
+                let written = self.store.write_status(&snapshot).await;
+                self.best_effort("writing the last status", written);
+            }
             self.status.send_replace(Some(snapshot));
             self.status_at = Instant::now();
+        }
+        if ending {
+            return Tick::Ended;
         }
         self.report_held_transfer(funds.as_ref());
 
@@ -538,10 +563,11 @@ impl Bot {
 
         if self.dry_run {
             self.dispatch_funding();
-            return;
+            return Tick::Continue;
         }
         match decision {
-            Decision::Wait(_) => {}
+            // An end that a transfer under way is holding back: see `ending` above.
+            Decision::Wait(_) | Decision::Exit => {}
             Decision::Open { instrument_id, margin, leverage } => {
                 self.open(instrument_id, margin, leverage).await;
             }
@@ -560,6 +586,7 @@ impl Bot {
         self.advance_transfer(&accounts);
         self.register_session_keys(&accounts, trading.as_ref());
         self.dispatch_funding();
+        Tick::Continue
     }
 
     /// The database makes the bot durable and visible, but it must never stand
@@ -737,8 +764,13 @@ impl Bot {
                     CloseReason::Target => format!("price reached the target; close {order}"),
                     CloseReason::Unhedged => format!("only the {order} leg is open; close it"),
                     CloseReason::Flatten => format!("flatten: close {order}"),
+                    CloseReason::Stop => format!("stop: close {order}"),
                 }
             }
+            Decision::Exit if self.transfer_holds_exit() => {
+                "stop: nothing is open; the transfer under way is seen through first".to_owned()
+            }
+            Decision::Exit => "stop: nothing is open; the run ends".to_owned(),
         }
     }
 
@@ -822,6 +854,7 @@ impl Bot {
                 Decision::Wait(_) => "wait",
                 Decision::Open { .. } => "open",
                 Decision::Close { .. } => "close",
+                Decision::Exit => "exit",
             }
             .to_owned(),
             summary,

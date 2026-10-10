@@ -232,6 +232,35 @@ impl Store {
         self.record_event("mode", &format!("operator set mode to {}", mode.as_str()), None).await
     }
 
+    /// The bot has done what a `stop` asked of it. The request is used up: the
+    /// next start runs.
+    pub async fn finish_stop(&self) -> Result<bool> {
+        self.leave_stop("the stop is done: nothing is open and the run has ended; mode back to run").await
+    }
+
+    /// Drops a `stop` that the process it was asked of never finished. A stop
+    /// is asked of a running bot; whoever starts a new one means it to run.
+    /// Returns whether there was one.
+    pub async fn drop_unfinished_stop(&self) -> Result<bool> {
+        self.leave_stop("a stop asked of an earlier run was never finished and is dropped; mode back to run")
+            .await
+    }
+
+    async fn leave_stop(&self, why: &str) -> Result<bool> {
+        let left = sqlx::query("UPDATE control SET mode = ?, updated_at_ms = ? WHERE id = 1 AND mode = ?")
+            .bind(Mode::Run.as_str())
+            .bind(now_ms())
+            .bind(Mode::Stop.as_str())
+            .execute(&self.pool)
+            .await?
+            .rows_affected()
+            > 0;
+        if left {
+            self.record_event("mode", why, None).await?;
+        }
+        Ok(left)
+    }
+
     // --- live status ------------------------------------------------------------
 
     pub async fn write_status(&self, snapshot: &Snapshot) -> Result<()> {
@@ -734,6 +763,43 @@ mod tests {
                 assert_eq!(store.unwrap().mode().await.unwrap(), Mode::Run);
             }
         }
+    }
+
+    #[tokio::test]
+    async fn a_stop_is_used_up_when_it_is_done_and_dropped_when_it_was_left_over() {
+        let store = Store::in_memory().await.unwrap();
+        // Nothing to leave: neither touches another mode.
+        for mode in [Mode::Run, Mode::Pause, Mode::Flatten] {
+            store.set_mode(mode).await.unwrap();
+            assert!(!store.finish_stop().await.unwrap() && !store.drop_unfinished_stop().await.unwrap());
+            assert_eq!(store.mode().await.unwrap(), mode);
+        }
+
+        store.set_mode(Mode::Stop).await.unwrap();
+        assert_eq!(store.mode().await.unwrap(), Mode::Stop);
+        assert!(store.finish_stop().await.unwrap());
+        assert_eq!(store.mode().await.unwrap(), Mode::Run);
+        assert!(!store.finish_stop().await.unwrap());
+
+        store.set_mode(Mode::Stop).await.unwrap();
+        assert!(store.drop_unfinished_stop().await.unwrap());
+        assert_eq!(store.mode().await.unwrap(), Mode::Run);
+
+        // Each is on the timeline in its own words, newest first.
+        let timeline: Vec<String> =
+            store.recent_events(2).await.unwrap().into_iter().map(|event| event.summary).collect();
+        assert_eq!(
+            timeline,
+            [
+                "a stop asked of an earlier run was never finished and is dropped; mode back to run",
+                "operator set mode to stop",
+            ]
+        );
+        let all: Vec<String> =
+            store.recent_events(20).await.unwrap().into_iter().map(|event| event.summary).collect();
+        assert!(all.contains(
+            &"the stop is done: nothing is open and the run has ended; mode back to run".to_owned()
+        ));
     }
 
     #[tokio::test]
