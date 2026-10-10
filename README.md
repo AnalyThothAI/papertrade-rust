@@ -33,39 +33,43 @@
 ```bash
 cargo build --release
 cp .env.example .env                       # 填入两个钱包地址
-./target/release/papertrade run            # PT_DRY_RUN=true：只决策和记录，不提交
-./target/release/papertrade tui            # 另开一个终端看面板
+./target/release/papertrade keys init      # 设一个密码，生成并加密两把 session key；不联网
+./target/release/papertrade run            # 输入一次密码。PT_DRY_RUN=true：只决策和记录，不签名、不提交
+./target/release/papertrade tui            # 另开一个终端看面板，不需要密码
 ```
 
 `run` 是一个普通的前台程序：开着它的终端在，它就在。想让它在你断开 SSH 后继续跑，把它放进你自己用的终端复用器（zellij、tmux、screen 都行），这部分不归本工具管。
 
-- **它自己会恢复。** 行情或账户流断了、启动时网络不通，`run` 会在同一个进程里等 5 秒后重新开始，不需要外部看护。`Ctrl-C` 让它做完当前这一拍后退出。
+- **它自己会恢复。** 行情或账户流断了、启动时网络不通，`run` 会在同一个进程里等 5 秒后重新开始，不需要外部看护，也不会再问密码。`Ctrl-C` 让它做完当前这一拍后退出。
+- **密码只在启动时输入一次，而且只从终端输入。** 进程退出后再启动要重新输入。没有终端（管道、重定向的 stdin）时 `run` 直接拒绝启动；终端复用器里的窗口是终端，可以用。
 - **随时可以重启。** 它从账户状态和意图日志接管，不依赖内存。
 - **同一个数据目录只允许一个 `run`**，第二个会被拒绝。
 - 面板和 `status` 在任意终端里随时开关，不影响 `run`。
 
-每个账户注册一把机器人自己的 session key（30 天有效，只能开/平仓，不能提现）：
+`keys init` 生成的 session key（只能开/平仓，不能提现）要由账户的主钱包注册后才能用，30 天有效。本地生成不等于已注册：没注册时机器人只会等待，面板显示 `NOT REGISTERED`。
 
 ```bash
-papertrade session-key new long
-# 按提示用主钱包对生成的 EIP-712 请求签名，例如：
+papertrade session-key new long            # 输入密码，写出注册请求；不发送任何东西
+# 用主钱包对它做 EIP-712 签名，例如：
 #   cast wallet sign --data --from-file secrets/<钱包>.registration.json --interactive
-papertrade session-key submit long --signature 0x…
+papertrade session-key submit long --signature 0x…   # 真实的写请求，不受 PT_DRY_RUN 影响
 ```
 
-session key 文件格式与 TypeScript 版相同，两个仓库可以共用同一个 `secrets/` 目录。
+密钥怎么存、密码管什么、不防什么，见[密钥](#密钥)。
 
 ## 命令
 
 | 命令 | 作用 |
 |---|---|
-| `run` | 运行机器人；交易未开放时只会等待，开放后自动开始 |
+| `keys init` | 把两个账户的密钥加密存好：设密码、生成 session key，开启 `PT_WALLET_AUTOMATION` 时导入主钱包私钥。可重复执行，只补缺的。不联网 |
+| `run` | 运行机器人，启动时输入一次密码；交易未开放时只会等待，开放后自动开始 |
 | `tui` | 终端面板，见[面板](#面板)；`p` 暂停/恢复，`q` 退出 |
 | `status` | 把面板的内容以纯文本打印一次（机器人没在运行时显示最后一次状态和时间） |
 | `pause` | 不再开新一轮；已开的一轮照常持有到目标 |
 | `resume` | 恢复开仓 |
 | `flatten` | 立刻平掉两个账户的所有仓位，之后不开仓，直到 `resume` |
-| `session-key new\|submit <long\|short>` | 创建并注册 session key |
+| `session-key new <long\|short>` | 为已有的 session key 写出注册请求，交给主钱包签名；要输入密码，不发送 |
+| `session-key submit <long\|short>` | 把签好的注册提交给中继。真实写请求，不受 `PT_DRY_RUN` 影响 |
 
 想要网页视图，不需要额外代码：[Datasette](https://datasette.io) 可以直接把数据库变成可浏览、可查询的网站。
 
@@ -80,7 +84,7 @@ uvx datasette data/papertrade.db      # http://127.0.0.1:8001，表 events / int
 | 变量 | 默认 | 含义 |
 |---|---|---|
 | `PT_LONG_ACCOUNT` / `PT_SHORT_ACCOUNT` | — | 做多 / 做空账户的主钱包地址 |
-| `PT_KEYS_DIR` | `./secrets` | session key 目录（`<钱包>.key`，权限 0600） |
+| `PT_KEYS_DIR` | `./secrets` | 密钥目录，里面只有密文，见[密钥](#密钥) |
 | `PT_DATA_DIR` | `./data` | 数据库目录 |
 | `PT_COIN` | `BTC` | 市场 |
 | `PT_NOTIONAL_USD` | `10000` | 每腿仓位价值；协议下限为 10,000 |
@@ -88,7 +92,53 @@ uvx datasette data/papertrade.db      # http://127.0.0.1:8001，表 events / int
 | `PT_CLOSE_BPS` | `100` | 平仓阈值；必须不超过强平距离的一半 |
 | `PT_REQUIRE_EMPTY_QUEUE` | `true` | 仅在 LP 派彩队列为空、且两个账户都没有排队款时开仓 |
 | `PT_INTENT_TTL_SECONDS` | `120` | 每个签名意图的有效期 |
-| `PT_DRY_RUN` | `true` | 只决策和记录，不提交 |
+| `PT_DRY_RUN` | `true` | 只决策和记录，不签名、不提交。对 `run` 里的一切写操作生效 |
+| `PT_WALLET_AUTOMATION` | `false` | 是否让机器人持有并使用两个主钱包自己的私钥。关闭时不询问、不读取，目录里有文件也一样 |
+
+密码和私钥没有对应的变量或参数：它们只从终端输入。
+
+## 密钥
+
+`PT_KEYS_DIR`（默认 `./secrets`，已被 `.gitignore` 忽略）里每把密钥一个文件，文件名是账户主钱包地址的小写形式：
+
+| 文件 | 内容 | 什么时候有 |
+|---|---|---|
+| `<钱包>.session.json` | session key 的密文。只能为该钱包开仓、平仓 | `keys init` 生成 |
+| `<钱包>.wallet.json` | 该钱包自己私钥的密文 | 仅 `PT_WALLET_AUTOMATION=true` 时，由 `keys init` 用不回显的输入导入 |
+| `<钱包>.registration.json` | session key 的注册请求，只有地址和数字，没有秘密 | `session-key new` 写出 |
+
+所有密文用同一个密码加密，各自有随机的 salt 和 IV。密码不写进任何地方：不在 `.env`、参数、数据库、日志里。**忘了密码没有后门**，备份就是复制这个目录，密码自己另外保管。
+
+`keys init` 做的事：
+
+- 目录里还没有密文：让你设一个新密码（输入两次，至少 16 个字符；这只是下限，不代表够强，最好用密码管理器生成的随机密码）。
+- 已经有密文：问一次现有密码，先确认它能解开**每一个**已有文件，否则什么都不改就退出。
+- 缺 session key 就生成一把并加密；`PT_WALLET_AUTOMATION=true` 且缺主钱包私钥时，请你输入它，并核对它推导出的地址就是配置里的那个钱包，不是就拒绝。
+- 只新增文件，从不覆盖、不轮换已有的密钥。所以它可以重复执行：中途断了，或者后来才打开 `PT_WALLET_AUTOMATION`，再跑一次即可。
+- 全程不联网：不注册、不提现、不转账、不下单。
+
+`run` 怎么用它们：
+
+- 先确认两把 session key 的密文都在，再问一次密码，解密后放在内存里，直到进程退出。之后的每一拍、每一次进程内重新开始，都用这同一份，不再读文件、不再解密。
+- 缺 session key、密码错、文件损坏：明确报错后退出，不会自己生成新密钥。
+- `tui`、`status`、`pause`、`resume`、`flatten` 只读写数据库，不碰密钥，不问密码。`flatten` 是让正在运行的 `run` 去平仓，不是这条命令自己去签名。
+
+两种工作模式：
+
+| | `PT_WALLET_AUTOMATION=false`（默认） | `PT_WALLET_AUTOMATION=true` |
+|---|---|---|
+| 这台机器上的密钥 | 两把 session key | 再加两个主钱包的私钥 |
+| 泄露的最坏情况 | 交易余额被恶意交易亏掉；不能提现 | 钱包能做的一切 |
+| 注册 session key | 人工：`session-key new` → 主钱包签名 → `session-key submit` | 计划由机器人自己签（[#4](https://github.com/AnalyThothAI/papertrade-rust/issues/4)） |
+| 资金再平衡 | 人工 | 计划由机器人自己做（#4） |
+
+打开后某个主钱包私钥没能加载（文件缺失、损坏、不是这个钱包的），`run` 照常启动：日志给出原因，面板上该账户显示 `wallet key UNAVAILABLE`，`status` 里有完整原因。它不会用主钱包签任何东西，但 session key 仍然管理和平掉已有仓位。
+
+> 主钱包自动化的业务（自动注册与续期、提现、转账）还没有合并，在 #4 里。目前打开这个开关，机器人只是解锁并报告这两把私钥，没有任何代码用它们签名。在 #4 落地之前请保持 `false`：打开它没有好处，只是让主钱包私钥多一个待的地方。
+
+这套加密保护的是**落在磁盘上的文件**：备份、误提交、磁盘被拷走时，拿到文件的人还需要密码。它不保护已经解锁的进程：能读这个进程内存的程序、以同一用户运行的恶意软件、键盘记录，都不在它的防护范围内。
+
+文件格式是标准的 Web3 Secret Storage V3，由 [alloy](https://github.com/alloy-rs/alloy)（经 `eth-keystore` 0.5.0）读写：`aes-128-ctr`，密钥由 `scrypt` 派生，N=8192、r=8、p=1。这是库的默认参数，不是本项目挑的，而且偏轻（Geth 默认 N=262144）：对弱密码的离线暴力破解几乎不设防，强度全靠密码。读取时只接受这一种格式（V3、`aes-128-ctr`、`scrypt` 且 N 在 8192 到 262144 之间），其余一律拒绝。测试把写出的文件和锁定的依赖版本钉在这组参数上，依赖升级不会悄悄换格式。
 
 ## 它如何决策
 
@@ -160,7 +210,7 @@ uvx datasette data/papertrade.db      # http://127.0.0.1:8001，表 events / int
 | 顶栏 | 模式（`RUN` / `PAUSE` / `FLATTEN`）、是否 dry-run、机器人是否在线（快照超过 5 秒没更新即视为没在运行）、两腿状态、当前决定及原因 |
 | Market | 中间价、开仓价（两腿均价）、这一轮已持有多久、偏离与进度条、两侧的平仓触发价、两条腿的强平价、派彩队列、交易是否暂停、中继拒收哪些动作 |
 | Estimate | 当前铸造率、三项费率、"到目标时"与"现在平仓"两组数字，见[预估](#预估) |
-| LONG / SHORT | 可用余额、排队款、session key 剩余时间、是否有钱包私钥、在途意图数、仓位 |
+| LONG / SHORT | 可用余额、排队款、session key 剩余时间（没注册显示 `NOT REGISTERED`）、主钱包私钥在这次运行里是 `loaded`、`off` 还是 `UNAVAILABLE`、在途意图数、仓位 |
 | Funds | 两户合计与差额、按当前余额还能开几轮、资金结论、转账是自动还是人工；有转账时显示方向、金额、阶段、已用时间和说明（卡住时是原因） |
 | Ledger | 已结算笔数、净盈亏、已得 PAPER、实际每枚成本 |
 | Timeline | 决定变化、每个意图的提交结果、每笔结算、模式变更，新的在上 |
@@ -215,6 +265,7 @@ uvx datasette data/papertrade.db      # http://127.0.0.1:8001，表 events / int
 | 终端面板 | [`ratatui`](https://ratatui.rs) + `crossterm` | 单个二进制、走 SSH 就能看、不暴露端口 |
 | 网页视图 | [Datasette](https://datasette.io)（可选，外部工具） | 现成的 SQLite 网页界面，不值得为两个账户自己写前后端 |
 | 命令行与配置 | `clap`（含环境变量）+ `dotenvy` | 参数、环境变量、`.env` 一套定义 |
+| 密钥加密 | `alloy` 的 keystore（`eth-keystore`）+ [`rpassword`](https://crates.io/crates/rpassword) + [`zeroize`](https://crates.io/crates/zeroize) | 标准 V3 格式，不自己写密码算法；不回显的终端输入；存过密码或私钥的缓冲区用完即清 |
 | 日志与错误 | `tracing`、`anyhow`、`thiserror` | 生态标准 |
 
 ## 与 TypeScript 版的对照
@@ -226,7 +277,8 @@ uvx datasette data/papertrade.db      # http://127.0.0.1:8001，表 events / int
 | 状态 | 无持久化，全部从账户状态推导 | 同样推导决策；另把意图、事件、成交写入 SQLite |
 | 重启安全 | 启动后等一个意图有效期再开仓 | 从预写日志恢复在途意图，无需等待 |
 | 单腿裸露 | 另一条腿无应答时等到它过期（最长约 150 秒） | 10 秒后平掉已成交的腿 |
-| 端到端测试 | 无 | 模拟交易所 + 22 个场景 |
+| 端到端测试 | 无 | 模拟交易所 + 39 个场景 |
+| 密钥存放 | 明文文件 | 加密文件，启动时输入一次密码；两个版本的密钥目录不通用 |
 | 可见性 | 日志 + `status` 命令 | 终端面板、`status`、时间线、台账、任意 SQLite 工具 |
 | 人工干预 | 停进程 | `pause` / `resume` / `flatten` |
 | 部署 | Node 24 + `node_modules` | 单个二进制 |
@@ -252,11 +304,16 @@ cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test
 | `src/protocol/` | 线路协议：部署常量、EIP-712 意图、数据格式、账户状态折叠、中继客户端、账户流 |
 | `src/market.rs` | Hyperliquid 盘口行情 |
 | `src/strategy/` | 决策函数、在途意图跟踪 |
+| `src/keystore.rs` | 密钥文件：路径、加密写入（从不覆盖）、格式检查、解密、地址核对，以及解锁后的 `UnlockedKeys` |
+| `src/session_keys.rs` | session key 的生成和注册请求 |
 | `src/economics.rs` | 预估：平仓估值、铸造率、铸造基数、一轮的成本与 PAPER |
 | `src/store.rs`、`migrations/` | SQLite 存储与表结构 |
 | `src/status.rs` | 写入数据库的状态快照 |
-| `src/bot.rs` | 运行循环 |
+| `src/bot.rs` | 运行循环；接收已解锁的密钥，自己不读密钥文件 |
+| `src/main.rs` | 命令行：`keys init` 向导、`run` 启动时的一次解锁、其余命令 |
 | `src/tui.rs` | 终端面板，以及 `status` 的纯文本输出 |
 | `tests/fixtures/` | 生产环境抓取的真实响应、TypeScript 版生成的签名金标准、官方估值函数的对照表 |
 | `tests/support/` | 模拟交易所：同样的接口，会校验签名、排队、执行，并能按脚本制造拒绝、无应答、延迟、强平、断流 |
-| `tests/rounds.rs` | 真实机器人对模拟交易所的端到端场景 |
+| `tests/rounds.rs`、`tests/restart.rs` | 真实机器人对模拟交易所的端到端场景；密钥在内存里生成后注入 |
+| `tests/keystore.rs` | 密钥文件：加密、解密、不覆盖、不泄露，全部用随机生成的空钱包 |
+| `tests/cli.rs` | 编译出的程序在没有终端时的行为：哪些命令不需要密码，哪些必须拒绝 |

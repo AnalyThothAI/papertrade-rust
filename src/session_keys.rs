@@ -1,55 +1,44 @@
-//! Session keys are the only secrets this bot holds. A session key can open and
-//! close positions for its wallet but cannot withdraw, stake or claim, so the
-//! worst case of a leaked key is losing the trading balance to bad trades.
+//! Session keys: what the bot trades with. A session key can open and close
+//! positions for the wallet that registered it and nothing else: it cannot
+//! withdraw, stake or claim. It is created here, on this machine, and kept
+//! encrypted like every other key (see [`crate::keystore`]).
+//!
+//! Creating one sends nothing. It signs for a wallet only once that wallet has
+//! registered it, and [`registration`] is the request the wallet signs for that.
 
-use std::fs;
-use std::io::Write;
-use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 
 use alloy::primitives::Address;
 use alloy::signers::local::PrivateKeySigner;
-use anyhow::{Context, Result};
+use anyhow::Result;
 use zeroize::Zeroizing;
 
 use crate::keystore::{self, KeyRole};
-
-/// A new random session key.
-fn generate() -> Zeroizing<[u8; 32]> {
-    Zeroizing::new(PrivateKeySigner::random().to_bytes().0)
-}
+use crate::protocol::deployment::SESSION_KEY_TTL_SECONDS;
+use crate::protocol::intents::{NonceSequence, RegisterSessionKey};
 
 /// Creates the owner's session key and stores it encrypted under `password`.
-/// Returns its address, which is what the owner registers. Creating it sends
-/// nothing: the key can sign for the owner only once the owner has registered it.
+/// Returns its address, which is what the owner registers.
 pub fn create(keys_dir: &Path, owner: Address, password: &str) -> Result<Address> {
-    keystore::create(keys_dir, owner, KeyRole::Session, &generate(), password)
+    let secret = Zeroizing::new(PrivateKeySigner::random().to_bytes().0);
+    keystore::create(keys_dir, owner, KeyRole::Session, &secret, password)
 }
 
-pub fn key_path(keys_dir: &Path, wallet: Address) -> PathBuf {
-    keys_dir.join(format!("{wallet:#x}.key"))
-}
-
-pub fn load(keys_dir: &Path, wallet: Address) -> Result<PrivateKeySigner> {
-    let path = key_path(keys_dir, wallet);
-    let key = fs::read_to_string(&path).with_context(|| {
-        format!("no session key at {}; create one with `papertrade session-key new`", path.display())
-    })?;
-    key.trim().parse().with_context(|| format!("{} does not hold a private key", path.display()))
-}
-
-/// Loads the wallet's session key, creating it (owner-readable only) on first use.
-pub fn ensure(keys_dir: &Path, wallet: Address) -> Result<PrivateKeySigner> {
-    fs::DirBuilder::new()
-        .recursive(true)
-        .mode(0o700)
-        .create(keys_dir)
-        .with_context(|| format!("creating {}", keys_dir.display()))?;
-    // `create_new` fails if the file exists, so an existing key is never overwritten.
-    match fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(key_path(keys_dir, wallet)) {
-        Ok(mut file) => writeln!(file, "0x{}", alloy::primitives::hex::encode(generate()))?,
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
-        Err(error) => return Err(error).context("creating the session key file"),
+/// The request by which `owner` registers `key` as its session key, for the
+/// owner's wallet to sign. It can be submitted for `valid_for_seconds` from `now`.
+pub fn registration(owner: Address, key: Address, now: u64, valid_for_seconds: u64) -> RegisterSessionKey {
+    RegisterSessionKey {
+        user: owner,
+        key,
+        expiry: now + SESSION_KEY_TTL_SECONDS,
+        feeAddress: Address::ZERO,
+        nonce: NonceSequence::random().allocate(),
+        deadline: now + valid_for_seconds,
     }
-    load(keys_dir, wallet)
+}
+
+/// Where the registration request waits between `session-key new` and
+/// `session-key submit`. It holds addresses and numbers, no secret.
+pub fn registration_path(keys_dir: &Path, owner: Address) -> PathBuf {
+    keys_dir.join(format!("{owner:#x}.registration.json"))
 }

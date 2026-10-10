@@ -21,7 +21,7 @@ use std::path::{Path, PathBuf};
 
 use alloy::primitives::{Address, B256, hex};
 use alloy::signers::local::PrivateKeySigner;
-use anyhow::{Context, Result, anyhow, bail, ensure};
+use anyhow::{Context, Result, anyhow, ensure};
 use rand08::rngs::OsRng;
 use serde::Deserialize;
 use zeroize::Zeroizing;
@@ -74,36 +74,26 @@ pub fn key_path(keys_dir: &Path, owner: Address, role: KeyRole) -> PathBuf {
     keys_dir.join(format!("{owner:#x}.{role}.json"))
 }
 
-/// Where an earlier version kept the same key in plaintext.
-pub fn plaintext_path(keys_dir: &Path, owner: Address, role: KeyRole) -> PathBuf {
-    keys_dir.join(match role {
-        KeyRole::Session => format!("{owner:#x}.key"),
-        KeyRole::Wallet => format!("{owner:#x}.wallet.key"),
-    })
+/// Whether the owner's key for `role` has been set up.
+pub fn exists(keys_dir: &Path, owner: Address, role: KeyRole) -> Result<bool> {
+    let path = key_path(keys_dir, owner, role);
+    path.try_exists().with_context(|| format!("looking for {}", path.display()))
 }
 
-/// What the keys directory holds of one key.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Stored {
-    Encrypted,
-    /// Only the plaintext file of an earlier version.
-    Plaintext,
-    Missing,
+/// The owner's key file for `role`, which has to be there. Cheap, so it can be
+/// asked before the operator is asked for the password.
+pub fn require(keys_dir: &Path, owner: Address, role: KeyRole) -> Result<PathBuf> {
+    let path = key_path(keys_dir, owner, role);
+    ensure!(
+        exists(keys_dir, owner, role)?,
+        "no encrypted {role} key at {}; `papertrade keys init` sets it up",
+        path.display()
+    );
+    Ok(path)
 }
 
-pub fn stored(keys_dir: &Path, owner: Address, role: KeyRole) -> Result<Stored> {
-    let exists = |path: PathBuf| path.try_exists().with_context(|| format!("looking for {}", path.display()));
-    Ok(if exists(key_path(keys_dir, owner, role))? {
-        Stored::Encrypted
-    } else if exists(plaintext_path(keys_dir, owner, role))? {
-        Stored::Plaintext
-    } else {
-        Stored::Missing
-    })
-}
-
-/// A private key as it is typed or as an earlier version stored it: 64 hex
-/// digits, with or without `0x`. The error never quotes the input.
+/// A private key as it is typed: 64 hex digits, with or without `0x`. The
+/// error never quotes the input.
 pub fn parse_secret(text: &str) -> Result<Zeroizing<[u8; KEY_BYTES]>> {
     let mut secret = Zeroizing::new([0u8; KEY_BYTES]);
     hex::decode_to_slice(text.trim(), secret.as_mut_slice())
@@ -156,31 +146,9 @@ pub fn create(
     Ok(address)
 }
 
-/// Encrypts the plaintext key an earlier version left for this owner, keeping
-/// the key and so its address. The plaintext file is left exactly as it is.
-pub fn migrate_plaintext(keys_dir: &Path, owner: Address, role: KeyRole, password: &str) -> Result<Address> {
-    let path = plaintext_path(keys_dir, owner, role);
-    let text =
-        Zeroizing::new(fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?);
-    let secret = parse_secret(&text).with_context(|| format!("{} was not migrated", path.display()))?;
-    create(keys_dir, owner, role, &secret, password)
-}
-
 /// Decrypts the owner's key for `role`.
 pub fn load(keys_dir: &Path, owner: Address, role: KeyRole, password: &str) -> Result<PrivateKeySigner> {
-    let path = key_path(keys_dir, owner, role);
-    if !path.try_exists().with_context(|| format!("looking for {}", path.display()))? {
-        let plaintext = plaintext_path(keys_dir, owner, role);
-        if plaintext.try_exists().unwrap_or(false) {
-            bail!(
-                "no encrypted {role} key at {}; {} is a plaintext key of an earlier version and is not read. \
-                 `papertrade keys init` encrypts it",
-                path.display(),
-                plaintext.display()
-            );
-        }
-        bail!("no encrypted {role} key at {}; `papertrade keys init` sets it up", path.display());
-    }
+    let path = require(keys_dir, owner, role)?;
     let signer = decrypt(&path, password)?;
     check_owner(owner, role, signer.address())
         .with_context(|| format!("{} was not loaded", path.display()))?;
@@ -459,14 +427,6 @@ mod tests {
         assert_eq!(
             name(key_path(dir, owner, KeyRole::Wallet)),
             "secrets/0x70997970c51812dc3a010c7d01b50e0d17dc79c8.wallet.json"
-        );
-        assert_eq!(
-            name(plaintext_path(dir, owner, KeyRole::Session)),
-            "secrets/0x70997970c51812dc3a010c7d01b50e0d17dc79c8.key"
-        );
-        assert_eq!(
-            name(plaintext_path(dir, owner, KeyRole::Wallet)),
-            "secrets/0x70997970c51812dc3a010c7d01b50e0d17dc79c8.wallet.key"
         );
     }
 }

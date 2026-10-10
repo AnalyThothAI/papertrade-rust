@@ -9,7 +9,7 @@ use alloy::primitives::{Address, hex};
 use alloy::signers::local::PrivateKeySigner;
 use clap::Parser;
 use papertrade::config::Config;
-use papertrade::keystore::{self, KeyRole, Stored, WalletKey};
+use papertrade::keystore::{self, KeyRole, WalletKey};
 use papertrade::session_keys;
 use serde_json::Value;
 use tempfile::TempDir;
@@ -92,11 +92,11 @@ fn keys_dir(long: &Account, short: &Account, wallets: bool) -> TempDir {
 fn a_new_session_key_is_stored_encrypted_and_decrypts_to_the_address_it_was_given() {
     let (dir, account) = (tempfile::tempdir().unwrap(), Account::random());
     let keys_dir = dir.path().join("secrets");
-    assert_eq!(keystore::stored(&keys_dir, account.owner(), KeyRole::Session).unwrap(), Stored::Missing);
+    assert!(!keystore::exists(&keys_dir, account.owner(), KeyRole::Session).unwrap());
 
     let address = session_keys::create(&keys_dir, account.owner(), PASSWORD).unwrap();
     let path = keystore::key_path(&keys_dir, account.owner(), KeyRole::Session);
-    assert_eq!(keystore::stored(&keys_dir, account.owner(), KeyRole::Session).unwrap(), Stored::Encrypted);
+    assert!(keystore::exists(&keys_dir, account.owner(), KeyRole::Session).unwrap());
     // Only the owner can list the directory or read the file, and no draft is left behind.
     assert_eq!((mode(&keys_dir), mode(&path)), (0o700, 0o600));
     assert_eq!(names(&keys_dir), [format!("{:#x}.session.json", account.owner())]);
@@ -313,45 +313,21 @@ fn of_several_writers_of_the_same_key_file_exactly_one_wins() {
 }
 
 #[test]
-fn a_plaintext_key_of_an_earlier_version_keeps_its_address_and_is_left_in_place() {
+fn a_raw_key_in_a_file_is_not_read_in_place_of_an_encrypted_one() {
     let (dir, account) = (tempfile::tempdir().unwrap(), Account::random());
     let (keys_dir, owner) = (dir.path(), account.owner());
-    // As the earlier version wrote a session key: one line of 0x-prefixed hex.
-    let earlier = PrivateKeySigner::random();
-    let plaintext = keystore::plaintext_path(keys_dir, owner, KeyRole::Session);
-    let line = format!("{}\n", hex::encode_prefixed(earlier.to_bytes()));
-    fs::write(&plaintext, &line).unwrap();
-    assert_eq!(keystore::stored(keys_dir, owner, KeyRole::Session).unwrap(), Stored::Plaintext);
+    // A raw key lying next to where the encrypted one belongs: there is no falling back to it.
+    let raw = keys_dir.join(format!("{owner:#x}.key"));
+    fs::write(&raw, format!("{}\n", hex::encode_prefixed(account.secret()))).unwrap();
 
-    // It is not read in place of an encrypted key.
+    assert!(!keystore::exists(keys_dir, owner, KeyRole::Session).unwrap());
     let refused = keystore::load(keys_dir, owner, KeyRole::Session, PASSWORD).unwrap_err().to_string();
-    assert!(refused.contains("is a plaintext key of an earlier version and is not read"), "{refused}");
-    assert!(refused.contains("`papertrade keys init`"), "{refused}");
-
-    let migrated = keystore::migrate_plaintext(keys_dir, owner, KeyRole::Session, PASSWORD).unwrap();
-    assert_eq!(migrated, earlier.address());
-    assert_eq!(keystore::stored(keys_dir, owner, KeyRole::Session).unwrap(), Stored::Encrypted);
+    let path = keystore::key_path(keys_dir, owner, KeyRole::Session);
     assert_eq!(
-        keystore::load(keys_dir, owner, KeyRole::Session, PASSWORD).unwrap().address(),
-        earlier.address()
+        refused,
+        format!("no encrypted session key at {}; `papertrade keys init` sets it up", path.display())
     );
-    assert_eq!(fs::read_to_string(&plaintext).unwrap(), line);
-
-    // A second migration cannot replace the first.
-    let again = keystore::migrate_plaintext(keys_dir, owner, KeyRole::Session, PASSWORD).unwrap_err();
-    assert!(again.to_string().ends_with("already exists; it is not replaced"), "{again:#}");
-
-    // A plaintext wallet key is held to its owner like any other wallet key.
-    let wallet_plaintext = keystore::plaintext_path(keys_dir, owner, KeyRole::Wallet);
-    fs::write(&wallet_plaintext, &line).unwrap();
-    let refused = keystore::migrate_plaintext(keys_dir, owner, KeyRole::Wallet, PASSWORD).unwrap_err();
-    assert!(format!("{refused:#}").contains("not of the wallet"), "{refused:#}");
-    // And a file that holds no key is refused without being quoted.
-    fs::write(&wallet_plaintext, "0xnot-a-key-but-private-anyway").unwrap();
-    let refused = keystore::migrate_plaintext(keys_dir, owner, KeyRole::Wallet, PASSWORD).unwrap_err();
-    let refused = format!("{refused:#}");
-    assert!(refused.contains("not a private key") && !refused.contains("private-anyway"), "{refused}");
-    assert_eq!(keystore::stored(keys_dir, owner, KeyRole::Wallet).unwrap(), Stored::Plaintext);
+    assert_eq!(keystore::require(keys_dir, owner, KeyRole::Session).unwrap_err().to_string(), refused);
 }
 
 #[test]
