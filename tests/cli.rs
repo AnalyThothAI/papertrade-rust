@@ -222,6 +222,16 @@ fn ctrl_c_at_the_password_prompt_ends_run_and_leaves_the_terminal_whole() {
     assert!(shown.contains("ended with 1"), "{shown}");
     assert!(terminal_is_whole(&shown), "the terminal was left changed:\n{shown}");
     assert!(!shown.contains("bot started"), "{shown}");
+
+    // In a terminal `run` means to show its dashboard there, so its log is a file
+    // beside the database from the first line on. With `--no-tui` the log is the
+    // terminal's, and no file is made.
+    let log = dir.path().join("data/papertrade.log");
+    assert!(log.exists(), "the run in a terminal did not send its log to {}", log.display());
+    std::fs::remove_file(&log).unwrap();
+    let shown = in_a_terminal(dir.path(), "run --no-tui", "Password for ./secrets: ", b"\x03");
+    assert!(shown.contains("Error: interrupted") && terminal_is_whole(&shown), "{shown}");
+    assert!(!log.exists());
 }
 
 #[test]

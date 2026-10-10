@@ -33,9 +33,16 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
-    /// Run the bot. Asks once for the password that unlocks its keys. With
-    /// PT_DRY_RUN=true it decides and records but never signs or submits.
-    Run,
+    /// Run the bot. Asks once for the password that unlocks its keys, then
+    /// shows the dashboard in the terminal it was started in, with its log in
+    /// <data dir>/papertrade.log. With PT_DRY_RUN=true it decides and records
+    /// but never signs or submits.
+    Run {
+        /// Do not show the dashboard: write the log to the terminal instead. This
+        /// is also what happens when the output is not a terminal.
+        #[arg(long)]
+        no_tui: bool,
+    },
     /// Live terminal dashboard of what the bot sees, intends and has done.
     Tui,
     /// Print the bot's latest status once.
@@ -103,11 +110,10 @@ async fn main() -> Result<()> {
     config.validate()?;
 
     match command {
-        Command::Run => {
-            tracing_subscriber::fmt()
-                .with_writer(std::io::stderr)
-                .with_ansi(std::io::stderr().is_terminal())
-                .init();
+        Command::Run { no_tui } => {
+            // The dashboard takes the terminal over, so with it the log goes to a file.
+            let dashboard = !no_tui && std::io::stdout().is_terminal();
+            let log = start_logging(&config, dashboard)?;
             let store = Store::open(&config.database()).await?;
             let _only_one = lock_data_dir(&config)?;
             if store.drop_unfinished_stop().await? {
@@ -118,7 +124,36 @@ async fn main() -> Result<()> {
             let stop = shutdown_signal(interrupts()?).shared();
             // Once, here, outside the restarts below: they are handed the same keys.
             let keys = unlock_keys(&config, Terminal).await?;
-            bot::keep_running(|| bot::start(&config, store.clone(), keys.clone()), RESTART_DELAY, stop).await
+            let start = || bot::start(&config, store.clone(), keys.clone());
+            let Some(log) = log else { return bot::keep_running(start, RESTART_DELAY, stop).await };
+
+            // Leaving the dashboard stops the bot the way Ctrl-C does. A sender
+            // that is dropped unused asks for nothing.
+            let (leave, left) = tokio::sync::oneshot::channel::<()>();
+            let left = async {
+                if left.await.is_err() {
+                    std::future::pending::<()>().await;
+                }
+            };
+            let stop = futures::future::select(Box::pin(stop), Box::pin(left)).map(|_| ()).shared();
+            let (bot_ended, ended_for_dashboard) = tokio::sync::oneshot::channel::<()>();
+            let stop_bot = move || {
+                let _ = leave.send(());
+            };
+            let dashboard = tui::spawn_beside_bot(config.database(), stop_bot, ended_for_dashboard);
+
+            // The bot runs here exactly as it does without a dashboard.
+            let ended = bot::keep_running(start, RESTART_DELAY, stop).await;
+            let _ = bot_ended.send(());
+            // The dashboard gives the terminal back. A terminal that takes no
+            // output could keep it from doing so: the process does not wait for that.
+            let closed = tokio::task::spawn_blocking(move || dashboard.join());
+            if tokio::time::timeout(DASHBOARD_CLOSE, closed).await.is_err() {
+                warn!("the dashboard did not close in {DASHBOARD_CLOSE:?}; exiting without it");
+                std::process::exit(if ended.is_ok() { 0 } else { 1 });
+            }
+            say_how_it_ended(&store, &log).await;
+            ended
         }
         Command::Tui => tui::run(&Store::open(&config.database()).await?).await,
         Command::Status => status(&Store::open(&config.database()).await?).await,
@@ -141,6 +176,45 @@ async fn main() -> Result<()> {
     }
 }
 
+/// Sends the log to the terminal, or with the dashboard on, which has the
+/// terminal, to `papertrade.log` beside the database; returns that file's path.
+fn start_logging(config: &Config, to_file: bool) -> Result<Option<PathBuf>> {
+    if !to_file {
+        tracing_subscriber::fmt()
+            .with_writer(std::io::stderr)
+            .with_ansi(std::io::stderr().is_terminal())
+            .init();
+        return Ok(None);
+    }
+    fs::create_dir_all(&config.data_dir)
+        .with_context(|| format!("creating {}", config.data_dir.display()))?;
+    let path = config.data_dir.join("papertrade.log");
+    let file = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .with_context(|| format!("opening {}", path.display()))?;
+    tracing_subscriber::fmt().with_writer(std::sync::Mutex::new(file)).with_ansi(false).init();
+    Ok(Some(path))
+}
+
+/// The dashboard is gone and with it everything the operator could see. Says
+/// where the log is, and whether positions were left behind.
+async fn say_how_it_ended(store: &Store, log: &std::path::Path) {
+    println!("papertrade has stopped. Its log is in {}.", log.display());
+    let open = store.read_status().await.ok().flatten().is_some_and(|status| {
+        status
+            .legs
+            .iter()
+            .any(|leg| leg.account.as_ref().is_some_and(|account| !account.positions.is_empty()))
+    });
+    if open {
+        println!(
+            "Positions are still open and nothing is watching them now. `papertrade run` takes them over again."
+        );
+    }
+}
+
 /// Two bots on the same accounts would each open a round. The lock is held for the
 /// life of the process and released by the operating system however it ends.
 fn lock_data_dir(config: &Config) -> Result<fs::File> {
@@ -154,6 +228,9 @@ fn lock_data_dir(config: &Config) -> Result<fs::File> {
 
 /// How long to wait before starting over after the bot stopped on its own.
 const RESTART_DELAY: Duration = Duration::from_secs(5);
+
+/// How long the dashboard gets to give the terminal back once the bot has ended.
+const DASHBOARD_CLOSE: Duration = Duration::from_secs(3);
 
 /// Resolves when the operator asks the bot to stop: Ctrl-C, SIGTERM, or the
 /// terminal it runs in going away (SIGHUP). All three end the same way: the bot

@@ -3,16 +3,20 @@
 //! so they can be started and stopped at will next to a running bot.
 
 use std::fmt::Write as _;
+use std::future::Future;
+use std::path::PathBuf;
+use std::pin::Pin;
 use std::time::Duration;
 
 use anyhow::Result;
-use crossterm::event::{Event, EventStream, KeyCode, KeyEventKind, KeyModifiers};
-use futures::StreamExt;
+use crossterm::event::{Event, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use futures::{Stream, StreamExt};
+use ratatui::backend::Backend;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Stylize};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Paragraph, Wrap};
-use ratatui::{DefaultTerminal, Frame};
+use ratatui::{Frame, Terminal};
 use tokio::time::interval;
 
 use crate::status::{LegSnapshot, RoundEstimate, Snapshot};
@@ -36,6 +40,22 @@ struct Screen {
 }
 
 impl Screen {
+    /// Whether the bot whose status this is still reports.
+    fn bot_is_live(&self) -> bool {
+        self.status.as_ref().is_some_and(|status| status.is_live(self.now_ms))
+    }
+
+    /// Whether stopping the bot now could leave a position to nobody: one is
+    /// open, or an account's state is not known.
+    fn may_hold_positions(&self) -> bool {
+        self.status.as_ref().is_some_and(|status| {
+            status
+                .legs
+                .iter()
+                .any(|leg| leg.account.as_ref().is_none_or(|account| !account.positions.is_empty()))
+        })
+    }
+
     async fn load(store: &Store) -> Result<Self> {
         let status = store.read_status().await?;
         let mut wallets = Vec::new();
@@ -57,11 +77,161 @@ impl Screen {
     }
 }
 
+/// Whose terminal the dashboard is in, which decides what leaving it means.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Host {
+    /// `papertrade tui`: a viewer beside a bot that runs elsewhere. Leaving it
+    /// leaves the bot running.
+    Viewer,
+    /// `papertrade run`: the bot runs in this process and this is its terminal.
+    /// Leaving stops the bot.
+    Bot,
+}
+
+/// A question the dashboard is waiting on, shown where the key hints are.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Asking {
+    /// Leaving would stop the bot with positions open, or not known to be closed.
+    LeavePositions,
+    /// Close both sides and stop the bot?
+    Stop,
+}
+
+/// What a key press asks for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Action {
+    Nothing,
+    Ask(Asking),
+    /// Leave the dashboard. In the bot's own terminal that stops the bot, as
+    /// Ctrl-C does: the process ends and positions are left as they are.
+    Leave,
+    SetMode(Mode),
+    Say(&'static str),
+}
+
+const NO_BOT: &str = " no bot is running: there is nothing to stop";
+
+/// The keys. `asking` is the question on screen, if one is: the next key answers it.
+fn on_key(key: KeyEvent, host: Host, asking: Option<Asking>, screen: &Screen) -> Action {
+    // Ctrl-C is never a question: it leaves at once, as the signal would.
+    if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
+        return Action::Leave;
+    }
+    let stop = || if screen.bot_is_live() { Action::SetMode(Mode::Stop) } else { Action::Say(NO_BOT) };
+    match (asking, key.code) {
+        (Some(Asking::LeavePositions), KeyCode::Char('q')) => Action::Leave,
+        (Some(Asking::LeavePositions), KeyCode::Char('s')) | (Some(Asking::Stop), KeyCode::Char('y')) => {
+            stop()
+        }
+        // Any other answer is a no.
+        (Some(_), _) => Action::Nothing,
+        (None, KeyCode::Char('q') | KeyCode::Esc) => match host {
+            Host::Bot if screen.may_hold_positions() => Action::Ask(Asking::LeavePositions),
+            _ => Action::Leave,
+        },
+        (None, KeyCode::Char('p')) => {
+            Action::SetMode(if screen.mode == Mode::Run { Mode::Pause } else { Mode::Run })
+        }
+        // Closing everything is never a single keypress.
+        (None, KeyCode::Char('s')) if screen.bot_is_live() => Action::Ask(Asking::Stop),
+        (None, KeyCode::Char('s')) => Action::Say(NO_BOT),
+        (None, _) => Action::Nothing,
+    }
+}
+
+/// The line at the bottom: the keys, or what the dashboard is asking or saying.
+fn footer(host: Host, asking: Option<Asking>, notice: Option<&'static str>, leaving: bool) -> Line<'static> {
+    if leaving {
+        return Line::from(" stopping the bot after the tick it is in …").yellow();
+    }
+    match (asking, notice, host) {
+        (Some(Asking::LeavePositions), ..) => Line::from(
+            " positions open or unknown ▸ q stop, leave them · s close both sides, then stop · other key: go on",
+        )
+        .black()
+        .on_yellow(),
+        (Some(Asking::Stop), ..) => {
+            Line::from(" close both sides and stop the bot? ▸ y yes · any other key: no").black().on_yellow()
+        }
+        (None, Some(notice), _) => Line::from(notice).yellow(),
+        (None, None, Host::Viewer) => {
+            Line::from(" q close the dashboard · p pause/resume · s close both sides and stop the bot").dim()
+        }
+        (None, None, Host::Bot) => {
+            Line::from(" q stop the bot, positions stay · s close both sides, then stop · p pause/resume").dim()
+        }
+    }
+}
+
+/// How the dashboard came to an end.
+enum Left<T> {
+    /// The operator left a viewer.
+    ByOperator,
+    /// What the dashboard runs beside has ended, with this: in the bot's own
+    /// terminal, the bot.
+    Ended(T),
+    /// The dashboard itself failed: the screen could not be loaded or drawn.
+    Broken(anyhow::Error),
+}
+
+/// The dashboard beside a bot that runs elsewhere: `papertrade tui`.
 pub async fn run(store: &Store) -> Result<()> {
     let mut terminal = ratatui::init();
-    let result = event_loop(&mut terminal, store).await;
+    let never = std::pin::pin!(std::future::pending::<()>());
+    let left = event_loop(&mut terminal, store, EventStream::new(), Host::Viewer, never, || {}).await;
     ratatui::restore();
-    result
+    match left {
+        Left::ByOperator | Left::Ended(()) => Ok(()),
+        Left::Broken(error) => Err(error),
+    }
+}
+
+/// The dashboard in the terminal of the bot it shows: `papertrade run`.
+///
+/// It is only a view, and it is kept as far from the bot as a viewer in
+/// another process is: a thread of its own, a runtime of its own and its own
+/// connection to the database. A terminal that stops taking output stops this
+/// thread and nothing else; the bot's loop never waits for a screen.
+///
+/// Leaving the dashboard (`q`, Ctrl-C) calls `stop_bot`; the dashboard then
+/// stays until `bot_ended` resolves, which is also how it learns that the bot
+/// ended by itself. If the dashboard fails it gives the terminal back, says
+/// so, and the bot runs on without it.
+pub fn spawn_beside_bot(
+    database: PathBuf,
+    stop_bot: impl FnOnce() + Send + 'static,
+    bot_ended: tokio::sync::oneshot::Receiver<()>,
+) -> std::thread::JoinHandle<()> {
+    std::thread::spawn(move || {
+        let failed = |error: anyhow::Error| {
+            tracing::warn!("the dashboard failed and is closed; the bot runs on without it: {error:#}");
+            eprintln!("The dashboard failed ({error:#}). The bot runs on without it; Ctrl-C stops it.");
+        };
+        let runtime = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
+            Ok(runtime) => runtime,
+            Err(error) => return failed(error.into()),
+        };
+        runtime.block_on(async {
+            let store = match Store::open(&database).await {
+                Ok(store) => store,
+                Err(error) => return failed(error),
+            };
+            let mut stop_bot = Some(stop_bot);
+            let stop_bot = || {
+                if let Some(stop) = stop_bot.take() {
+                    stop();
+                }
+            };
+            let mut terminal = ratatui::init();
+            let ended = std::pin::pin!(bot_ended);
+            let left =
+                event_loop(&mut terminal, &store, EventStream::new(), Host::Bot, ended, stop_bot).await;
+            ratatui::restore();
+            if let Left::Broken(error) = left {
+                failed(error);
+            }
+        });
+    })
 }
 
 /// Everything the dashboard shows, once, as plain text.
@@ -69,43 +239,84 @@ pub async fn report(store: &Store) -> Result<String> {
     Ok(text(&Screen::load(store).await?))
 }
 
-async fn event_loop(terminal: &mut DefaultTerminal, store: &Store) -> Result<()> {
-    let mut keys = EventStream::new();
+async fn event_loop<B, T>(
+    terminal: &mut Terminal<B>,
+    store: &Store,
+    mut keys: impl Stream<Item = std::io::Result<Event>> + Unpin,
+    host: Host,
+    mut beside: Pin<&mut impl Future<Output = T>>,
+    mut stop_bot: impl FnMut(),
+) -> Left<T>
+where
+    B: Backend,
+    B::Error: std::error::Error + Send + Sync + 'static,
+{
     let mut refresh = interval(REFRESH);
+    let (mut asking, mut notice, mut leaving, mut keys_open) = (None, None, false, true);
     loop {
-        let screen = Screen::load(store).await?;
-        terminal.draw(|frame| draw(frame, &screen))?;
+        let screen = match Screen::load(store).await {
+            Ok(screen) => screen,
+            Err(error) => return Left::Broken(error),
+        };
+        let foot = footer(host, asking, notice, leaving);
+        if let Err(error) = terminal.draw(|frame| draw(frame, &screen, host, foot)) {
+            return Left::Broken(error.into());
+        }
         tokio::select! {
+            ended = &mut beside => return Left::Ended(ended),
             _ = refresh.tick() => {}
-            event = keys.next() => match event {
-                Some(Ok(Event::Key(key))) if key.kind == KeyEventKind::Press => match key.code {
-                    KeyCode::Char('q') | KeyCode::Esc => return Ok(()),
-                    KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => return Ok(()),
-                    // Flatten is deliberately not a single keypress: use `papertrade flatten`.
-                    KeyCode::Char('p') => {
-                        let next = if screen.mode == Mode::Run { Mode::Pause } else { Mode::Run };
-                        store.set_mode(next).await?;
+            event = keys.next(), if keys_open => {
+                let action = match event {
+                    Some(Ok(Event::Key(key))) if key.kind == KeyEventKind::Press && !leaving => {
+                        on_key(key, host, asking, &screen)
                     }
-                    _ => {}
-                },
-                Some(Ok(_)) => {}
-                Some(Err(error)) => return Err(error.into()),
-                None => return Ok(()),
+                    Some(Ok(_)) => continue,
+                    Some(Err(error)) => return Left::Broken(error.into()),
+                    // Nothing more will be typed: the terminal is going away.
+                    None => {
+                        keys_open = false;
+                        Action::Leave
+                    }
+                };
+                (asking, notice) = (None, None);
+                match action {
+                    Action::Nothing => {}
+                    Action::Ask(question) => asking = Some(question),
+                    Action::Say(what) => notice = Some(what),
+                    Action::SetMode(mode) => {
+                        if let Err(error) = store.set_mode(mode).await {
+                            return Left::Broken(error);
+                        }
+                    }
+                    Action::Leave if host == Host::Viewer => return Left::ByOperator,
+                    // The bot ends in its own time; the dashboard stays until it has.
+                    Action::Leave => {
+                        stop_bot();
+                        leaving = true;
+                    }
+                }
             },
         }
     }
 }
 
 const NO_STATUS: &str = "No status yet. Start the bot with `papertrade run`.";
+const STARTING: &str = "The bot is starting: it has not reported yet.";
 
-fn draw(frame: &mut Frame, screen: &Screen) {
+fn draw(frame: &mut Frame, screen: &Screen, host: Host, foot: Line<'static>) {
     let Some(status) = &screen.status else {
-        let [header, hint, timeline] =
-            Layout::vertical([Constraint::Length(4), Constraint::Length(3), Constraint::Min(4)])
-                .areas(frame.area());
+        let [header, hint, timeline, footer] = Layout::vertical([
+            Constraint::Length(4),
+            Constraint::Length(3),
+            Constraint::Min(4),
+            Constraint::Length(1),
+        ])
+        .areas(frame.area());
         draw_header(frame, header, screen);
-        frame.render_widget(Paragraph::new(NO_STATUS).block(Block::bordered()), hint);
+        let waiting = if host == Host::Bot { STARTING } else { NO_STATUS };
+        frame.render_widget(Paragraph::new(waiting).block(Block::bordered()), hint);
         panel(frame, timeline, TIMELINE, timeline_lines(&screen.events, timeline.height));
+        frame.render_widget(foot, footer);
         return;
     };
 
@@ -137,7 +348,7 @@ fn draw(frame: &mut Frame, screen: &Screen) {
     panel(frame, funds_area, " Funds ", funds);
     panel(frame, ledger, " Ledger ", ledger_lines(screen, Room::Panel));
     panel(frame, timeline, TIMELINE, timeline_lines(&screen.events, timeline.height));
-    frame.render_widget(Line::from(" q quit · p pause/resume · flatten: `papertrade flatten`").dim(), footer);
+    frame.render_widget(foot, footer);
 }
 
 const TIMELINE: &str = " Timeline (UTC, newest first) ";
@@ -738,7 +949,9 @@ mod tests {
     /// The dashboard on the smallest terminal it promises to be readable on.
     fn render(screen: &Screen) -> String {
         let mut terminal = Terminal::new(TestBackend::new(110, 40)).unwrap();
-        terminal.draw(|frame| draw(frame, screen)).unwrap();
+        terminal
+            .draw(|frame| draw(frame, screen, Host::Viewer, footer(Host::Viewer, None, None, false)))
+            .unwrap();
         let buffer = terminal.backend().buffer();
         (0..buffer.area.height)
             .map(|y| (0..buffer.area.width).map(|x| buffer[(x, y)].symbol()).collect::<String>())
@@ -1183,7 +1396,7 @@ mod tests {
             "settled positions 12",
             "long synced 10-10 08:46:39 UTC · 1s ago · fresh · complete",
             "short synced 10-10 08:46:39 UTC · 1s ago · fresh · complete",
-            "q quit · p pause/resume",
+            "q close the dashboard · p pause/resume · s close both sides and stop the bot",
         ] {
             assert!(dashboard.contains(expected), "missing {expected:?} in:\n{dashboard}");
         }
@@ -1199,6 +1412,271 @@ mod tests {
             .collect();
         let report = text(&screen);
         assert!(report.contains("event 9\n") && !report.contains("event 10"), "{report}");
+    }
+
+    // --- keys, questions and the two terminals a dashboard can be in ------------------
+
+    fn key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    fn typed(letter: char) -> KeyEvent {
+        key(KeyCode::Char(letter))
+    }
+
+    fn ctrl_c() -> KeyEvent {
+        KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)
+    }
+
+    /// Both accounts known and holding nothing.
+    fn flat_screen() -> Screen {
+        let mut screen = hedged_screen();
+        let status = status(&mut screen);
+        status.phase = Phase::Flat;
+        for leg in &mut status.legs {
+            leg.account.as_mut().unwrap().positions.clear();
+        }
+        screen
+    }
+
+    fn render_as(screen: &Screen, host: Host, foot: Line<'static>) -> String {
+        let mut terminal = Terminal::new(TestBackend::new(110, 40)).unwrap();
+        terminal.draw(|frame| draw(frame, screen, host, foot)).unwrap();
+        let buffer = terminal.backend().buffer();
+        (0..buffer.area.height)
+            .map(|y| (0..buffer.area.width).map(|x| buffer[(x, y)].symbol()).collect::<String>())
+            .map(|line| line.trim_end().to_owned())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn in_a_viewer_q_only_closes_the_dashboard() {
+        let (hedged, viewer) = (hedged_screen(), Host::Viewer);
+        for leave in [typed('q'), key(KeyCode::Esc), ctrl_c()] {
+            assert_eq!(on_key(leave, viewer, None, &hedged), Action::Leave);
+        }
+        assert_eq!(on_key(typed('x'), viewer, None, &hedged), Action::Nothing);
+    }
+
+    #[test]
+    fn in_the_bots_own_terminal_q_asks_before_it_leaves_a_position_to_nobody() {
+        let (hedged, flat, bot) = (hedged_screen(), flat_screen(), Host::Bot);
+        assert_eq!(on_key(typed('q'), bot, None, &hedged), Action::Ask(Asking::LeavePositions));
+        assert_eq!(on_key(key(KeyCode::Esc), bot, None, &hedged), Action::Ask(Asking::LeavePositions));
+        // An account whose state is not known may hold one.
+        let mut unknown = flat_screen();
+        status(&mut unknown).legs[1].account = None;
+        assert_eq!(on_key(typed('q'), bot, None, &unknown), Action::Ask(Asking::LeavePositions));
+        // Nothing open, or a bot that has not even reported yet: nothing to ask.
+        assert_eq!(on_key(typed('q'), bot, None, &flat), Action::Leave);
+        let starting = Screen { status: None, ..flat_screen() };
+        assert_eq!(on_key(typed('q'), bot, None, &starting), Action::Leave);
+
+        // The answers: q leaves them, s closes them first, anything else goes on.
+        let asked = Some(Asking::LeavePositions);
+        assert_eq!(on_key(typed('q'), bot, asked, &hedged), Action::Leave);
+        assert_eq!(on_key(typed('s'), bot, asked, &hedged), Action::SetMode(Mode::Stop));
+        for other in [typed('y'), typed('p'), key(KeyCode::Esc), key(KeyCode::Enter)] {
+            assert_eq!(on_key(other, bot, asked, &hedged), Action::Nothing);
+        }
+        // Ctrl-C is never a question, as the signal it stands in for is not.
+        assert_eq!(on_key(ctrl_c(), bot, None, &hedged), Action::Leave);
+        assert_eq!(on_key(ctrl_c(), bot, asked, &hedged), Action::Leave);
+    }
+
+    #[test]
+    fn closing_both_sides_and_stopping_takes_s_and_then_y() {
+        let hedged = hedged_screen();
+        for host in [Host::Viewer, Host::Bot] {
+            assert_eq!(on_key(typed('s'), host, None, &hedged), Action::Ask(Asking::Stop));
+            assert_eq!(on_key(typed('y'), host, Some(Asking::Stop), &hedged), Action::SetMode(Mode::Stop));
+            for no in [typed('n'), typed('s'), typed('q'), key(KeyCode::Enter)] {
+                assert_eq!(on_key(no, host, Some(Asking::Stop), &hedged), Action::Nothing);
+            }
+        }
+        // With no bot running there is nobody to ask it of, and the dashboard says so.
+        let mut stopped = hedged_screen();
+        status(&mut stopped).at_ms = NOW - 90_000;
+        assert_eq!(on_key(typed('s'), Host::Viewer, None, &stopped), Action::Say(NO_BOT));
+        assert_eq!(on_key(typed('y'), Host::Viewer, Some(Asking::Stop), &stopped), Action::Say(NO_BOT));
+    }
+
+    #[test]
+    fn p_switches_between_running_and_paused_and_calls_a_flatten_or_a_stop_off() {
+        let mut screen = hedged_screen();
+        assert_eq!(on_key(typed('p'), Host::Bot, None, &screen), Action::SetMode(Mode::Pause));
+        for mode in [Mode::Pause, Mode::Flatten, Mode::Stop] {
+            screen.mode = mode;
+            assert_eq!(on_key(typed('p'), Host::Viewer, None, &screen), Action::SetMode(Mode::Run));
+        }
+    }
+
+    #[test]
+    fn the_bottom_line_says_what_the_keys_do_what_is_asked_and_what_is_happening() {
+        let screen = hedged_screen();
+        let shown = |host, asking, notice, leaving| {
+            let dashboard = render_as(&screen, host, footer(host, asking, notice, leaving));
+            dashboard.lines().last().unwrap().to_owned()
+        };
+        // Each fits the 110 columns the dashboard promises to be readable on.
+        assert_eq!(
+            shown(Host::Viewer, None, None, false),
+            " q close the dashboard · p pause/resume · s close both sides and stop the bot"
+        );
+        assert_eq!(
+            shown(Host::Bot, None, None, false),
+            " q stop the bot, positions stay · s close both sides, then stop · p pause/resume"
+        );
+        assert_eq!(
+            shown(Host::Bot, Some(Asking::LeavePositions), None, false),
+            " positions open or unknown ▸ q stop, leave them · s close both sides, then stop · other key: go on"
+        );
+        assert_eq!(
+            shown(Host::Viewer, Some(Asking::Stop), None, false),
+            " close both sides and stop the bot? ▸ y yes · any other key: no"
+        );
+        assert_eq!(shown(Host::Viewer, None, Some(NO_BOT), false), NO_BOT);
+        assert_eq!(shown(Host::Bot, None, None, true), " stopping the bot after the tick it is in …");
+    }
+
+    #[test]
+    fn before_the_first_status_each_terminal_says_what_it_is_waiting_for() {
+        let nothing = Screen { status: None, ..hedged_screen() };
+        let viewer = render_as(&nothing, Host::Viewer, footer(Host::Viewer, None, None, false));
+        assert!(viewer.contains(NO_STATUS) && viewer.contains("q close the dashboard"), "{viewer}");
+        let bot = render_as(&nothing, Host::Bot, footer(Host::Bot, None, None, false));
+        assert!(bot.contains(STARTING) && !bot.contains(NO_STATUS), "{bot}");
+        assert!(bot.contains("q stop the bot, positions stay"), "{bot}");
+    }
+
+    /// Runs the dashboard's loop on a screen nobody sees, with these keys typed
+    /// and then none, beside `bot`. Returns how the loop ended and how often
+    /// it asked the bot to stop.
+    async fn dashboard<T>(
+        store: &Store,
+        host: Host,
+        keys: &[KeyEvent],
+        bot: impl Future<Output = T>,
+    ) -> (Left<T>, usize) {
+        let typed = futures::stream::iter(keys.to_vec()).map(|key| Ok(Event::Key(key)));
+        let keys = typed.chain(futures::stream::pending());
+        let mut terminal = Terminal::new(TestBackend::new(110, 40)).unwrap();
+        let (mut stops, bot) = (0, std::pin::pin!(bot));
+        let running = event_loop(&mut terminal, store, keys, host, bot, || stops += 1);
+        let left = tokio::time::timeout(Duration::from_secs(5), running).await;
+        (left.expect("the dashboard's loop comes to an end"), stops)
+    }
+
+    /// A database whose bot reported just now.
+    async fn store_with(screen: Screen) -> Store {
+        let store = Store::in_memory().await.unwrap();
+        let mut snapshot = screen.status.unwrap();
+        snapshot.at_ms = now_ms();
+        store.write_status(&snapshot).await.unwrap();
+        store
+    }
+
+    const BRIEFLY: Duration = Duration::from_millis(300);
+
+    #[tokio::test]
+    async fn leaving_a_viewer_ends_the_dashboard_and_asks_nothing_of_the_bot() {
+        let store = store_with(hedged_screen()).await;
+        let (left, stops) =
+            dashboard(&store, Host::Viewer, &[typed('q')], std::future::pending::<()>()).await;
+        assert!(matches!(left, Left::ByOperator));
+        assert_eq!((stops, store.mode().await.unwrap()), (0, Mode::Run));
+    }
+
+    #[tokio::test]
+    async fn leaving_the_bots_own_dashboard_stops_the_bot_and_stays_until_it_has_ended() {
+        let store = store_with(flat_screen()).await;
+        // A bot that takes a moment to finish its tick once asked. Until the
+        // dashboard asks, it runs.
+        let (asked, stop) = tokio::sync::watch::channel(false);
+        let bot = async {
+            let mut stop = stop.clone();
+            stop.wait_for(|asked| *asked).await.unwrap();
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            "the bot ended"
+        };
+        let typed_keys = [typed('q')];
+        let mut terminal = Terminal::new(TestBackend::new(110, 40)).unwrap();
+        let keys = futures::stream::iter(typed_keys).map(|key| Ok(Event::Key(key)));
+        let keys = keys.chain(futures::stream::pending());
+        let bot = std::pin::pin!(bot);
+        let running = event_loop(&mut terminal, &store, keys, Host::Bot, bot, || {
+            asked.send_replace(true);
+        });
+        let left = tokio::time::timeout(Duration::from_secs(5), running).await;
+        assert!(matches!(left.expect("the bot is asked to stop and does"), Left::Ended("the bot ended")));
+        // While it waited it said so.
+        let screen = terminal.backend().buffer().clone();
+        let last: String = (0..screen.area.width).map(|x| screen[(x, 39)].symbol()).collect();
+        assert_eq!(last.trim_end(), " stopping the bot after the tick it is in …");
+    }
+
+    #[tokio::test]
+    async fn with_positions_open_one_q_stops_nothing_and_two_stop_the_bot() {
+        let store = store_with(hedged_screen()).await;
+        // q, then anything else: the question is asked and withdrawn. The bot
+        // was never asked to stop; here it ends by itself a little later.
+        let by_itself = tokio::time::sleep(BRIEFLY);
+        let (left, stops) = dashboard(&store, Host::Bot, &[typed('q'), typed('x')], by_itself).await;
+        assert!(matches!(left, Left::Ended(())));
+        assert_eq!(stops, 0);
+
+        let (_, stops) =
+            dashboard(&store, Host::Bot, &[typed('q'), typed('q')], tokio::time::sleep(BRIEFLY)).await;
+        assert_eq!(stops, 1);
+        // And Ctrl-C does not ask.
+        let (_, stops) = dashboard(&store, Host::Bot, &[ctrl_c()], tokio::time::sleep(BRIEFLY)).await;
+        assert_eq!(stops, 1);
+        assert_eq!(store.mode().await.unwrap(), Mode::Run);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn s_and_y_ask_the_bot_to_close_both_sides_and_stop_and_the_dashboard_stays() {
+        let store = store_with(hedged_screen()).await;
+        // The bot's part, played by a task of its own as the real one runs
+        // apart from the dashboard: it ends once it finds the stop asked.
+        let (ended, bot_ended) = tokio::sync::oneshot::channel::<()>();
+        let seen_by_the_bot = store.clone();
+        tokio::spawn(async move {
+            while seen_by_the_bot.mode().await.unwrap() != Mode::Stop {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            let _ = ended.send(());
+        });
+        let keys = [typed('s'), typed('y')];
+        let within =
+            tokio::time::timeout(Duration::from_secs(5), dashboard(&store, Host::Bot, &keys, bot_ended));
+        let (left, stops) = within.await.expect("the stop is asked through the database");
+        // Asked through the mode, not by leaving: the bot closes before it ends.
+        assert!(matches!(left, Left::Ended(Ok(()))));
+        assert_eq!((stops, store.mode().await.unwrap()), (0, Mode::Stop));
+
+        // s alone, or s and a no, asks nothing.
+        let store = store_with(hedged_screen()).await;
+        let keys = [typed('s'), typed('n')];
+        let (_, stops) = dashboard(&store, Host::Viewer, &keys, tokio::time::sleep(BRIEFLY)).await;
+        assert_eq!((stops, store.mode().await.unwrap()), (0, Mode::Run));
+    }
+
+    #[tokio::test]
+    async fn a_dashboard_that_fails_ends_without_having_touched_the_bot() {
+        let store = store_with(hedged_screen()).await;
+        store.close().await;
+        let mut bot = std::pin::pin!(async { "still running" });
+        let mut terminal = Terminal::new(TestBackend::new(110, 40)).unwrap();
+        let no_keys = futures::stream::pending();
+        let mut stops = 0;
+        let left = event_loop(&mut terminal, &store, no_keys, Host::Bot, bot.as_mut(), || stops += 1).await;
+        // The screen cannot be loaded. That ends the view and nothing else: the
+        // bot was neither asked to stop nor dropped, and is there to carry on.
+        assert!(matches!(left, Left::Broken(_)));
+        assert_eq!(stops, 0);
+        assert_eq!(bot.await, "still running");
     }
 
     #[tokio::test]
