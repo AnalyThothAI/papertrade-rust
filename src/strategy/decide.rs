@@ -15,7 +15,6 @@ use alloy::primitives::{Address, U256};
 use serde::{Deserialize, Serialize};
 
 use super::inflight::Awaiting;
-use super::rebalance::{Funds, funds};
 use crate::protocol::account::AccountState;
 use crate::protocol::wire::{Position, TradingState};
 
@@ -147,14 +146,6 @@ impl StrategyParams {
     }
 }
 
-/// A transfer between the two accounts that has started and not finished.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TransferState {
-    Moving,
-    /// It needs the operator; see `strategy::transfer`.
-    Stuck,
-}
-
 /// The market the bot trades; its id is fixed for the lifetime of the listing.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Market {
@@ -170,6 +161,10 @@ pub struct LegView<'a> {
     pub session_key: Address,
     /// How much the intents we sent for this account still hold the strategy back.
     pub awaiting: Awaiting,
+    /// What a transfer between the two accounts has claimed from this
+    /// account's balance and may still take: not there to open with. 18-decimal
+    /// USD; see `strategy::rebalance::reserved`.
+    pub reserved: U256,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -185,10 +180,6 @@ pub struct View<'a> {
     pub mid: Option<u64>,
     /// False right after an open attempt; see the bot loop.
     pub may_open: bool,
-    /// The transfer between the two accounts that is under way, if any.
-    pub transfer: Option<TransferState>,
-    /// Both wallets' own keys are unlocked, so a transfer can be signed.
-    pub can_rebalance: bool,
 }
 
 impl<'a> View<'a> {
@@ -229,12 +220,17 @@ pub enum Decision {
         /// In submission order.
         closes: Vec<CloseOrder>,
     },
-    /// Move whole USDC from one account to the other; see `strategy::transfer`.
-    Rebalance {
-        from: Side,
-        to: Side,
-        amount_usdc: u64,
-    },
+}
+
+impl Decision {
+    /// Whether carrying it out sends an intent for this account.
+    pub fn sends_for(&self, side: Side) -> bool {
+        match self {
+            Decision::Wait(_) => false,
+            Decision::Open { .. } => true,
+            Decision::Close { closes, .. } => closes.iter().any(|close| close.side == side),
+        }
+    }
 }
 
 /// Why the bot is not acting. Each reason is one concrete, checkable condition.
@@ -251,10 +247,6 @@ pub enum Wait {
     InsideTarget,
     OperatorPaused,
     Flattened,
-    Rebalancing,
-    TransferStuck,
-    NeedsFunding,
-    NeedsManualRebalance { from: Side, to: Side, amount_usdc: u64 },
     Settling,
     TradingStateUnavailable,
     NotListed,
@@ -289,19 +281,6 @@ impl fmt::Display for Wait {
             Wait::InsideTarget => f.write_str("hedged; price is inside the target"),
             Wait::OperatorPaused => f.write_str("flat; paused by the operator"),
             Wait::Flattened => f.write_str("flat; flatten mode opens nothing"),
-            Wait::Rebalancing => f.write_str("flat; rebalancing: funds are moving between the two accounts"),
-            Wait::TransferStuck => f.write_str(
-                "flat; the transfer between the two accounts is stuck: resolve it, then run `papertrade \
-                 rebalance abandon`",
-            ),
-            Wait::NeedsFunding => {
-                f.write_str("flat; needs funding: the two accounts together hold less than two margins")
-            }
-            Wait::NeedsManualRebalance { from, to, amount_usdc } => write!(
-                f,
-                "flat; needs a manual rebalance: move {amount_usdc} USDC from the {from} account to the {to} \
-                 account (the wallets' own keys are not both unlocked)"
-            ),
             Wait::Settling => f.write_str("flat; settling before the next open"),
             Wait::TradingStateUnavailable => f.write_str("flat; trading state unavailable"),
             Wait::NotListed => f.write_str("flat; the market is not listed"),
@@ -422,28 +401,6 @@ fn decide_open(
     if view.mode == Mode::Pause {
         return wait(Wait::OperatorPaused);
     }
-    // Funds come before every trading gate: the accounts can be levelled while
-    // the relayer has opens paused, so that they are ready when it resumes.
-    match view.transfer {
-        Some(TransferState::Moving) => return wait(Wait::Rebalancing),
-        Some(TransferState::Stuck) => return wait(Wait::TransferStuck),
-        None => {}
-    }
-    match funds(long.available_balance, short.available_balance, params.margin(), params.round_loss()) {
-        Funds::Enough => {}
-        Funds::Underfunded => return wait(Wait::NeedsFunding),
-        Funds::Rebalance { from, to, amount_usdc } => {
-            if !view.can_rebalance {
-                return wait(Wait::NeedsManualRebalance { from, to, amount_usdc });
-            }
-            // A transfer starts with a withdrawal, so the relayer has to be taking those.
-            let Some(trading) = view.trading else { return wait(Wait::TradingStateUnavailable) };
-            if trading.paused_actions.contains("withdrawToCore") {
-                return wait(Wait::ActionPaused("withdrawToCore"));
-            }
-            return Decision::Rebalance { from, to, amount_usdc };
-        }
-    }
     if !view.may_open {
         return wait(Wait::Settling);
     }
@@ -486,8 +443,10 @@ fn decide_open(
             return wait(Wait::QueueNotEmpty);
         }
     }
+    // What a transfer may still withdraw is not there to post: an open that
+    // counted on it would compete with the withdrawal, and one would be refused.
     for (side, account) in [(Side::Long, long), (Side::Short, short)] {
-        if account.available_balance < margin {
+        if account.available_balance.saturating_sub(view.leg(side).reserved) < margin {
             return wait(Wait::InsufficientBalance(side));
         }
     }
@@ -506,7 +465,8 @@ fn sole_leg<'a>(account: &'a AccountState, market: &Market, side: Side) -> Resul
     }
 }
 
-fn has_queued_trade(account: &AccountState) -> bool {
+/// Whether the relayer holds an open or a close of the account, from this run or an earlier one.
+pub fn has_queued_trade(account: &AccountState) -> bool {
     account
         .operations
         .iter()
@@ -556,8 +516,8 @@ mod tests {
         may_open: bool,
         mode: Mode,
         params: StrategyParams,
-        transfer: Option<TransferState>,
-        can_rebalance: bool,
+        /// Whole USD a transfer has claimed from one account's balance.
+        reserved: Option<(Side, u64)>,
     }
 
     impl Default for Scenario {
@@ -577,8 +537,7 @@ mod tests {
                     close_bps: 100,
                     require_empty_queue: true,
                 },
-                transfer: None,
-                can_rebalance: true,
+                reserved: None,
             }
         }
     }
@@ -602,6 +561,10 @@ mod tests {
                     Some((awaited, how)) if awaited == side => how,
                     _ => Awaiting::Nothing,
                 },
+                reserved: match self.reserved {
+                    Some((sender, amount)) if sender == side => usd(amount),
+                    _ => U256::ZERO,
+                },
             }
         }
 
@@ -615,8 +578,6 @@ mod tests {
                 queue_total: self.queue_total,
                 mid: self.mid,
                 may_open: self.may_open,
-                transfer: self.transfer,
-                can_rebalance: self.can_rebalance,
             };
             decide(&view, &self.params, &Market { id: 0, symbol: "BTC".into() })
         }
@@ -734,7 +695,6 @@ mod tests {
 
     #[test]
     fn flat_waits_when_one_account_cannot_fund_the_margin() {
-        // Too close to each other for a transfer, and one of them a little short.
         let scenario = Scenario { long: Some(funded(505)), short: Some(funded(495)), ..Default::default() };
         assert_eq!(scenario.wait(), Wait::InsufficientBalance(Side::Short));
     }
@@ -1013,161 +973,96 @@ mod tests {
     }
 
     // --- funds ----------------------------------------------------------------
+    // Moving funds between the accounts is not decided here; see
+    // `strategy::rebalance`. All that is left of it is the balance each account
+    // can post, less what a transfer may still take from it.
 
-    /// The long account has too much and the short too little: 850 USDC level them.
+    /// The long account has too much and the short too little.
     fn lopsided() -> Scenario {
         Scenario { long: Some(funded(2_000)), short: Some(funded(300)), ..Default::default() }
     }
 
-    const MOVE: Decision = Decision::Rebalance { from: Side::Long, to: Side::Short, amount_usdc: 850 };
-
     #[test]
-    fn lopsided_accounts_are_rebalanced_before_anything_is_opened() {
-        assert_eq!(lopsided().decide(), MOVE);
+    fn an_account_below_its_margin_is_the_only_thing_about_funds_that_holds_an_open_back() {
+        assert_eq!(lopsided().wait(), Wait::InsufficientBalance(Side::Short));
         let mirrored = Scenario { long: Some(funded(300)), short: Some(funded(2_000)), ..Default::default() };
-        assert_eq!(
-            mirrored.decide(),
-            Decision::Rebalance { from: Side::Short, to: Side::Long, amount_usdc: 850 }
-        );
-        // The buffer is one round's loss at the configured target: 2% of 10,000 is 200.
-        let wide = StrategyParams { close_bps: 200, ..Scenario::default().params };
-        let scenario = Scenario {
-            long: Some(funded(2_000)),
-            short: Some(funded(699)),
-            params: wide,
-            ..Default::default()
-        };
-        assert!(matches!(scenario.decide(), Decision::Rebalance { .. }));
-        let scenario = Scenario { short: Some(funded(699)), ..Default::default() };
+        assert_eq!(mirrored.wait(), Wait::InsufficientBalance(Side::Long));
+        // Together below two margins: the same reason, named for the account that is short.
+        let scenario = Scenario { long: Some(funded(600)), short: Some(funded(399)), ..Default::default() };
+        assert_eq!(scenario.wait(), Wait::InsufficientBalance(Side::Short));
+        // One unit below the margin is below it; the margin itself is enough.
+        let almost = AccountState { available_balance: usd(500) - U256::from(1), ..account() };
+        let scenario = Scenario { short: Some(almost), ..Default::default() };
+        assert_eq!(scenario.wait(), Wait::InsufficientBalance(Side::Short));
+        let scenario = Scenario { short: Some(funded(500)), ..Default::default() };
         assert!(matches!(scenario.decide(), Decision::Open { .. }));
     }
 
     #[test]
-    fn rebalancing_does_not_wait_for_trading_to_be_possible() {
-        // None of what holds back an open holds back levelling the accounts.
-        let cases = [
-            Scenario { trading: Some(trading_state(&["openPosition", "closePositions"])), ..lopsided() },
-            Scenario {
-                trading: Some(TradingState { trading_paused: true, ..trading_state(&[]) }),
-                ..lopsided()
-            },
-            Scenario { may_open: false, ..lopsided() },
-            Scenario { mid: None, ..lopsided() },
-            Scenario { queue_total: None, ..lopsided() },
-            Scenario { queue_total: Some(U256::from(1)), ..lopsided() },
-            Scenario {
-                short: Some(AccountState { session_keys: BTreeMap::new(), ..funded(300) }),
-                ..lopsided()
-            },
-        ];
-        for scenario in cases {
-            assert_eq!(scenario.decide(), MOVE);
+    fn accounts_that_can_post_the_margin_open_however_uneven_they_are() {
+        // The short account could not absorb a loss on top of its margin, and
+        // the two are far apart. Neither waits for funds to be moved.
+        for (long, short) in [(2_000, 550), (500, 50_000), (500, 500)] {
+            let scenario =
+                Scenario { long: Some(funded(long)), short: Some(funded(short)), ..Default::default() };
+            assert!(matches!(scenario.decide(), Decision::Open { .. }), "{long}/{short}");
         }
+        // Whether the relayer takes withdrawals is nothing to an open.
+        let scenario = Scenario { trading: Some(trading_state(&["withdrawToCore"])), ..Default::default() };
+        assert!(matches!(scenario.decide(), Decision::Open { .. }));
     }
 
     #[test]
-    fn nothing_is_withdrawn_while_the_relayer_refuses_withdrawals_or_its_state_is_unknown() {
-        let scenario = Scenario { trading: Some(trading_state(&["withdrawToCore"])), ..lopsided() };
-        assert_eq!(scenario.wait(), Wait::ActionPaused("withdrawToCore"));
-        let scenario = Scenario { trading: None, ..lopsided() };
-        assert_eq!(scenario.wait(), Wait::TradingStateUnavailable);
-    }
-
-    #[test]
-    fn without_both_wallet_keys_the_operator_is_told_what_to_move() {
-        let scenario = Scenario { can_rebalance: false, ..lopsided() };
-        let reason = scenario.wait();
-        assert_eq!(
-            reason,
-            Wait::NeedsManualRebalance { from: Side::Long, to: Side::Short, amount_usdc: 850 }
-        );
-        assert_eq!(
-            reason.to_string(),
-            "flat; needs a manual rebalance: move 850 USDC from the long account to the short account (the \
-             wallets' own keys are not both unlocked)"
-        );
-        // Told even while the relayer's state is unknown: the operator can still act.
-        let scenario = Scenario { can_rebalance: false, trading: None, ..lopsided() };
-        assert!(matches!(scenario.wait(), Wait::NeedsManualRebalance { .. }));
-    }
-
-    #[test]
-    fn underfunded_accounts_neither_transfer_nor_open() {
-        for can_rebalance in [true, false] {
-            let scenario = Scenario {
-                long: Some(funded(600)),
-                short: Some(funded(399)),
-                can_rebalance,
-                ..Default::default()
-            };
-            assert_eq!(scenario.wait(), Wait::NeedsFunding);
+    fn what_a_transfer_may_still_withdraw_is_not_counted_for_the_open() {
+        // 1,500 held, the margin is 500: up to 1,000 can be on its way out.
+        for side in Side::BOTH {
+            let scenario = Scenario { reserved: Some((side, 1_000)), ..Default::default() };
+            assert!(matches!(scenario.decide(), Decision::Open { .. }));
+            let scenario = Scenario { reserved: Some((side, 1_001)), ..Default::default() };
+            assert_eq!(scenario.wait(), Wait::InsufficientBalance(side));
+            // More than the account holds leaves it nothing, not a negative balance.
+            let scenario = Scenario { reserved: Some((side, 5_000)), ..Default::default() };
+            assert_eq!(scenario.wait(), Wait::InsufficientBalance(side));
         }
-    }
-
-    #[test]
-    fn nothing_opens_and_nothing_else_is_moved_while_a_transfer_is_under_way() {
-        // Whatever the balances are by now: lopsided, level, or too low.
-        for scenario in
-            [lopsided(), Scenario::default(), Scenario { long: Some(funded(1)), ..Default::default() }]
-        {
-            let moving = Scenario { transfer: Some(TransferState::Moving), ..scenario };
-            assert_eq!(moving.wait(), Wait::Rebalancing);
-            let stuck = Scenario { transfer: Some(TransferState::Stuck), ..moving };
-            assert_eq!(stuck.wait(), Wait::TransferStuck);
-        }
-    }
-
-    #[test]
-    fn funds_are_only_judged_when_flat_in_run_mode_with_nothing_in_flight() {
-        // Paused or flattened: no new transfer.
-        assert_eq!(Scenario { mode: Mode::Pause, ..lopsided() }.wait(), Wait::OperatorPaused);
-        assert_eq!(Scenario { mode: Mode::Flatten, ..lopsided() }.wait(), Wait::Flattened);
-        // An intent that could still execute: no transfer on top of it.
-        let scenario = Scenario { awaiting: Some((Side::Short, Awaiting::Doubtful)), ..lopsided() };
-        assert_eq!(scenario.wait(), Wait::IntentUnresolved);
-        let scenario = Scenario { awaiting: Some((Side::Long, Awaiting::Expected)), ..lopsided() };
-        assert_eq!(scenario.wait(), Wait::IntentPending);
-        let scenario = Scenario {
-            long: Some(AccountState { operations: queued("openPosition").operations, ..funded(2_000) }),
-            ..lopsided()
-        };
-        assert_eq!(scenario.wait(), Wait::IntentPending);
-        // A position anywhere: it is dealt with first.
-        let scenario = Scenario {
-            long: Some(AccountState { positions: vec![position(7, true)], ..funded(2_000) }),
-            ..lopsided()
-        };
-        assert!(matches!(scenario.decide(), Decision::Close { reason: CloseReason::Unhedged, .. }));
-        let scenario = Scenario {
-            long: Some(AccountState { positions: vec![position(7, false)], ..funded(2_000) }),
-            ..lopsided()
-        };
-        assert_eq!(scenario.wait(), Wait::UnexpectedPositions);
+        // It is the sender's balance that is claimed, not the other account's.
+        let scenario = Scenario { reserved: Some((Side::Long, 1_800)), ..lopsided() };
+        assert_eq!(scenario.wait(), Wait::InsufficientBalance(Side::Long));
+        let scenario =
+            Scenario { short: Some(funded(500)), reserved: Some((Side::Long, 1_500)), ..lopsided() };
+        assert!(matches!(scenario.decide(), Decision::Open { .. }));
     }
 
     #[test]
     fn closing_is_never_held_back_by_funds_or_by_a_transfer() {
         let poor = |positions| AccountState { available_balance: U256::ZERO, ..holding(positions) };
-        for transfer in [None, Some(TransferState::Moving), Some(TransferState::Stuck)] {
-            for can_rebalance in [true, false] {
-                let hedged = || Scenario {
-                    long: Some(poor(vec![position(7, true)])),
-                    short: Some(poor(vec![position(8, false)])),
-                    trading: Some(trading_state(&["withdrawToCore", "openPosition"])),
-                    transfer,
-                    can_rebalance,
-                    ..Default::default()
-                };
-                let at_target = Scenario { mid: Some(ENTRY + 8_000), ..hedged() };
-                assert!(matches!(at_target.decide(), Decision::Close { reason: CloseReason::Target, .. }));
-                let inside = Scenario { mid: Some(ENTRY), ..hedged() };
-                assert_eq!(inside.wait(), Wait::InsideTarget);
-                let lone = Scenario { short: Some(poor(Vec::new())), ..hedged() };
-                assert!(matches!(lone.decide(), Decision::Close { reason: CloseReason::Unhedged, .. }));
-                let flatten = Scenario { mode: Mode::Flatten, ..hedged() };
-                assert!(matches!(flatten.decide(), Decision::Close { reason: CloseReason::Flatten, .. }));
-            }
+        for reserved in [None, Some((Side::Long, 850)), Some((Side::Short, 850))] {
+            let hedged = || Scenario {
+                long: Some(poor(vec![position(7, true)])),
+                short: Some(poor(vec![position(8, false)])),
+                trading: Some(trading_state(&["withdrawToCore", "openPosition"])),
+                reserved,
+                ..Default::default()
+            };
+            let at_target = Scenario { mid: Some(ENTRY + 8_000), ..hedged() };
+            assert!(matches!(at_target.decide(), Decision::Close { reason: CloseReason::Target, .. }));
+            let inside = Scenario { mid: Some(ENTRY), ..hedged() };
+            assert_eq!(inside.wait(), Wait::InsideTarget);
+            let lone = Scenario { short: Some(poor(Vec::new())), ..hedged() };
+            assert!(matches!(lone.decide(), Decision::Close { reason: CloseReason::Unhedged, .. }));
+            let flatten = Scenario { mode: Mode::Flatten, ..hedged() };
+            assert!(matches!(flatten.decide(), Decision::Close { reason: CloseReason::Flatten, .. }));
         }
+    }
+
+    #[test]
+    fn a_decision_says_which_accounts_it_sends_an_intent_for() {
+        let both = |decision: &Decision| (decision.sends_for(Side::Long), decision.sends_for(Side::Short));
+        assert_eq!(both(&Scenario::default().decide()), (true, true));
+        assert_eq!(both(&Scenario::hedged(ENTRY + 8_000).decide()), (true, true));
+        assert_eq!(both(&Scenario::hedged(ENTRY).decide()), (false, false));
+        let lone = Scenario { long: Some(holding(vec![position(7, true)])), ..Default::default() };
+        assert_eq!(both(&lone.decide()), (true, false));
+        assert_eq!(both(&lopsided().decide()), (false, false));
     }
 
     // --- session key registration ---------------------------------------------
@@ -1222,14 +1117,5 @@ mod tests {
             Wait::InsufficientBalance(Side::Short).to_string(),
             "flat; the short account's balance is below the margin"
         );
-        assert_eq!(
-            Wait::Rebalancing.to_string(),
-            "flat; rebalancing: funds are moving between the two accounts"
-        );
-        assert_eq!(
-            Wait::NeedsFunding.to_string(),
-            "flat; needs funding: the two accounts together hold less than two margins"
-        );
-        assert!(Wait::TransferStuck.to_string().ends_with("then run `papertrade rebalance abandon`"));
     }
 }

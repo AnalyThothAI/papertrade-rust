@@ -346,7 +346,8 @@ pub async fn start_with(
     tasks.spawn(follow_status(store.clone(), latest_status));
 
     let funding =
-        funding::Funding::start(&mut tasks, &store, &keys, deposit_chain, hypercore, &timing.funding).await?;
+        funding::Funding::start(&mut tasks, &store, &keys, deposit_chain, hypercore, &timing.funding, config)
+            .await?;
     let ttl_ms = i64::try_from(config.intent_ttl_seconds * 1000)?;
     let bot = Bot {
         dry_run: config.dry_run,
@@ -385,6 +386,7 @@ pub async fn start_with(
         long = %bot.legs.long.wallet,
         short = %bot.legs.short.wallet,
         resumed_intents = bot.inflight.len(),
+        rebalance = config.rebalance,
         "bot started"
     );
 
@@ -456,6 +458,8 @@ impl Bot {
                 .map(|entry| awaiting(entry, accounts.get(side).as_ref(), now, grace_ms))
                 .max()
                 .unwrap_or(Awaiting::Nothing),
+            // All that `decide` learns of a transfer: what it may still take from the balance.
+            reserved: self.reserved(side),
         };
         let view = View {
             now_seconds: unix_seconds(),
@@ -466,10 +470,16 @@ impl Bot {
             queue_total,
             mid,
             may_open: now >= self.open_allowed_at_ms,
-            transfer: self.transfer_state(),
-            can_rebalance: self.can_rebalance(),
         };
         let decision = decide(&view, &self.params, &self.market);
+        // The funds are judged by themselves, whatever the legs hold and
+        // whatever was just decided about them.
+        let sending = |side: Side| !self.dry_run && decision.sends_for(side);
+        let trading_now = PerSide {
+            long: view.long.awaiting != Awaiting::Nothing || sending(Side::Long),
+            short: view.short.awaiting != Awaiting::Nothing || sending(Side::Short),
+        };
+        let funds = self.judge_funds(&accounts, &trading_now, trading.as_ref());
 
         let summary = self.describe(&decision);
         let changed = summary != self.reported;
@@ -483,10 +493,11 @@ impl Bot {
         if changed || self.status_at.elapsed() >= STATUS_INTERVAL {
             let mut snapshot =
                 self.snapshot(&decision, summary, &accounts, trading.as_ref(), queue_total, mid);
-            self.describe_funding(&mut snapshot, &accounts);
+            self.describe_funding(&mut snapshot, funds.as_ref());
             self.status.send_replace(Some(snapshot));
             self.status_at = Instant::now();
         }
+        self.report_held_transfer(funds.as_ref()).await;
 
         let open_positions = Side::BOTH
             .iter()
@@ -511,13 +522,13 @@ impl Bot {
                     self.close(closes).await;
                 }
             }
-            Decision::Rebalance { from, to, amount_usdc } => {
-                self.start_transfer(from, to, amount_usdc).await;
-            }
         }
         // After the decision, so that a close never waits behind a transfer's
-        // requests; and whatever the legs hold, because a transfer that has
-        // begun has to be seen through.
+        // requests; and whatever the legs hold, because a transfer is planned
+        // by what the accounts hold, and one that has begun has to be seen through.
+        if let Some((from, to, amount_usdc)) = funds.as_ref().and_then(funding::FundsView::to_start) {
+            self.start_transfer(from, to, amount_usdc).await;
+        }
         self.advance_transfer(&accounts).await;
         self.register_session_keys(&accounts, trading.as_ref()).await;
     }
@@ -694,9 +705,6 @@ impl Bot {
                     CloseReason::Flatten => format!("flatten: close {order}"),
                 }
             }
-            Decision::Rebalance { from, to, amount_usdc } => {
-                format!("rebalance: move {amount_usdc} USDC from the {from} account to the {to} account")
-            }
         }
     }
 
@@ -780,7 +788,6 @@ impl Bot {
                 Decision::Wait(_) => "wait",
                 Decision::Open { .. } => "open",
                 Decision::Close { .. } => "close",
-                Decision::Rebalance { .. } => "rebalance",
             }
             .to_owned(),
             summary,

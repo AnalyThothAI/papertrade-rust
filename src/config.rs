@@ -22,8 +22,9 @@ pub struct Config {
     #[arg(long, env = "PT_SHORT_ACCOUNT", global = true)]
     pub short_account: Option<Address>,
 
-    /// Where keys live: <wallet>.key as `run` reads it, and the encrypted
-    /// <wallet>.session.json and <wallet>.wallet.json that `keys init` writes.
+    /// Where the keys live, encrypted: <wallet>.session.json, and
+    /// <wallet>.wallet.json with the wallet automation on. `keys init` writes
+    /// them and `run` reads them.
     #[arg(long, env = "PT_KEYS_DIR", default_value = "./secrets", global = true)]
     pub keys_dir: PathBuf,
 
@@ -59,10 +60,17 @@ pub struct Config {
     pub dry_run: bool,
 
     /// Let the bot sign with the two wallets' own keys: register and renew
-    /// session keys, move funds between the accounts. Off, those keys are
-    /// neither asked for nor read, whatever the keys directory holds.
+    /// the session keys. Off, those keys are neither asked for nor read,
+    /// whatever the keys directory holds.
     #[arg(long, env = "PT_WALLET_AUTOMATION", default_value_t = false, action = ArgAction::Set, global = true)]
     pub wallet_automation: bool,
+
+    /// Let the bot move funds between the two accounts when one of them runs
+    /// short. A transfer is signed with the wallets' own keys, so this needs
+    /// PT_WALLET_AUTOMATION=true. Off, no transfer is started; one that has
+    /// started already is still carried to its end.
+    #[arg(long, env = "PT_REBALANCE", default_value_t = false, action = ArgAction::Set, global = true)]
+    pub rebalance: bool,
 }
 
 impl Config {
@@ -81,6 +89,11 @@ impl Config {
         ensure!(
             self.long_account.is_none() || self.long_account != self.short_account,
             "PT_LONG_ACCOUNT and PT_SHORT_ACCOUNT must be different wallets"
+        );
+        ensure!(
+            !self.rebalance || self.wallet_automation,
+            "PT_REBALANCE=true needs PT_WALLET_AUTOMATION=true: a transfer between the two accounts is signed \
+             with the wallets' own keys"
         );
         Ok(())
     }
@@ -129,7 +142,7 @@ mod tests {
     fn defaults_to_a_dry_run_of_the_minimum_size_btc_round() {
         let config = parse(&[]);
         config.validate().unwrap();
-        assert!(config.dry_run && !config.wallet_automation);
+        assert!(config.dry_run && !config.wallet_automation && !config.rebalance);
         assert_eq!((config.coin.as_str(), config.intent_ttl_seconds), ("BTC", 120));
         assert_eq!(
             config.strategy(),
@@ -153,6 +166,24 @@ mod tests {
         ]);
         assert!(!config.dry_run && !config.require_empty_queue && config.wallet_automation);
         assert_eq!(config.wallet(Side::Long).unwrap(), A.parse::<Address>().unwrap());
+    }
+
+    #[test]
+    fn rebalancing_is_a_switch_of_its_own_that_needs_the_wallet_automation() {
+        // The wallet automation alone moves no funds.
+        let keys_only = parse(&["--wallet-automation", "true"]);
+        keys_only.validate().unwrap();
+        assert!(keys_only.wallet_automation && !keys_only.rebalance);
+
+        let both = parse(&["--wallet-automation", "true", "--rebalance", "true"]);
+        both.validate().unwrap();
+        assert!(both.rebalance);
+
+        // Without the wallets' own keys nothing could sign a transfer.
+        for args in [&["--rebalance", "true"][..], &["--rebalance", "true", "--wallet-automation", "false"]] {
+            let error = parse(args).validate().unwrap_err().to_string();
+            assert!(error.contains("PT_REBALANCE=true needs PT_WALLET_AUTOMATION=true"), "{error}");
+        }
     }
 
     #[test]

@@ -96,6 +96,7 @@ pub struct RoundEstimate {
     pub usd_per_paper: Option<String>,
 }
 
+/// What the two accounts hold, the margins parked in their positions included.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FundsSnapshot {
     pub total_usd: String,
@@ -103,10 +104,24 @@ pub struct FundsSnapshot {
     pub difference_usd: String,
     /// Rounds both accounts can still fund at the current margin, before any transfer.
     pub rounds_affordable: u32,
-    /// `enough`, `rebalance` or `underfunded`.
+    /// `off` when `PT_REBALANCE` is off: nothing is judged and nothing is
+    /// moved. Otherwise `enough`, `rebalance` or `underfunded`.
     pub verdict: String,
     /// Both wallet keys are present, so a transfer can be signed without the operator.
     pub can_rebalance: bool,
+    /// The transfer the verdict calls for, while it has not started.
+    #[serde(default)]
+    pub planned: Option<PlannedTransfer>,
+}
+
+/// A transfer the bot would make and has not started.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PlannedTransfer {
+    pub from: Side,
+    pub to: Side,
+    pub amount_usd: String,
+    /// What it is waiting for. `None` when it starts at once.
+    pub held_by: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -241,6 +256,14 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(estimate.fees, None);
+
+        // And the funds as they were written before a planned transfer was shown.
+        let funds: FundsSnapshot = serde_json::from_value(serde_json::json!({
+            "total_usd": "2300.00", "difference_usd": "1700.00", "rounds_affordable": 0,
+            "verdict": "rebalance", "can_rebalance": true
+        }))
+        .unwrap();
+        assert_eq!(funds.planned, None);
     }
 
     #[test]
