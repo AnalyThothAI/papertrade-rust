@@ -388,7 +388,7 @@ PT_REBALANCE=false
 
 ### 停止与重启
 
-- **停止**：在 `run` 的终端按 `Ctrl-C`。它做完当前这一拍后退出；还有仓位时会警告 `stopping with open positions; nothing is watching them now`。
+- **停止**：在 `run` 的终端按 `Ctrl-C`。它做完当前这一拍后退出；还有仓位时会警告 `stopping with open positions; nothing is watching them now`。它只停进程，**不平仓**。还在启动或等着重新开始时按，会立刻退出；在密码提示处按，是取消这次启动，显示 `Error: interrupted`。
 - **停之前先空仓**：`run` 不在时没有任何东西看着仓位，一条腿被强平后另一条腿不会被平掉。要长时间停机，先 `pause` 等这一轮走完，或 `flatten`，看到 `legs` 为 `flat` 再停。
 - **重启**：随时可以，再次 `run` 并输入密码即可。它从账户状态、意图日志和未完成的转账记录接管，不依赖内存。
 - **升级**：`git pull --ff-only && cargo build --release`，然后停掉 `run` 再启动。数据库迁移在打开时自动执行；被新版本打开过的数据库，旧的二进制会拒绝打开。

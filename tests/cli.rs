@@ -130,3 +130,102 @@ fn keys_init_takes_a_password_from_a_terminal_only_and_writes_nothing_without_on
     assert!(output.stdout.is_empty());
     assert!(!dir.path().join("secrets").exists());
 }
+
+/// Runs `papertrade <arguments>` in a terminal of its own, presses `keys` once
+/// `prompt` shows, and returns everything that terminal showed: the program's
+/// output, then how it ended, then the terminal's settings afterwards as `stty`
+/// reports them. The terminal is made by `script` (util-linux), which every
+/// Linux has; the test has no other way to one without unsafe code.
+#[cfg(target_os = "linux")]
+fn in_a_terminal(dir: &Path, arguments: &str, prompt: &str, keys: &[u8]) -> String {
+    use std::io::{Read, Write};
+    use std::sync::{Arc, Mutex};
+
+    let program = env!("CARGO_BIN_EXE_papertrade");
+    let command = format!("{program} {arguments}; echo \"ended with $?\"; stty -a; echo settings shown");
+    let mut child = Command::new("script")
+        .args(["-qec", &command, "/dev/null"])
+        .current_dir(dir)
+        .env_clear()
+        .env("PATH", std::env::var_os("PATH").unwrap())
+        .env("PT_LONG_ACCOUNT", LONG)
+        .env("PT_SHORT_ACCOUNT", SHORT)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("`script` from util-linux is needed to give the program a terminal");
+    let shown = Arc::new(Mutex::new(String::new()));
+    let (mut output, sink) = (child.stdout.take().unwrap(), shown.clone());
+    std::thread::spawn(move || {
+        let mut chunk = [0u8; 4096];
+        while let Ok(read @ 1..) = output.read(&mut chunk) {
+            sink.lock().unwrap().push_str(&String::from_utf8_lossy(&chunk[..read]));
+        }
+    });
+    let wait_for = |text: &str| {
+        let started = Instant::now();
+        while !shown.lock().unwrap().contains(text) {
+            assert!(
+                started.elapsed() < Duration::from_secs(20),
+                "{text:?} never showed in:\n{}",
+                shown.lock().unwrap()
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    };
+    wait_for(prompt);
+    // The prompt is printed a moment before the terminal is set up to read the answer.
+    std::thread::sleep(Duration::from_millis(300));
+    let mut keyboard = child.stdin.take().unwrap();
+    keyboard.write_all(keys).unwrap();
+    keyboard.flush().unwrap();
+    wait_for("settings shown");
+    drop(keyboard);
+    let _ = child.wait();
+    shown.lock().unwrap().clone()
+}
+
+/// Whether the terminal still echoes, edits lines and turns Ctrl-C into an
+/// interrupt: what the next program started in it will find.
+#[cfg(target_os = "linux")]
+fn terminal_is_whole(shown: &str) -> bool {
+    let settings = shown.rsplit("ended with").next().unwrap();
+    let on = |flag: &str| settings.split([' ', ';', '\n', '\r']).any(|word| word == flag);
+    on("isig") && on("icanon") && on("echo")
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn ctrl_c_at_the_password_prompt_ends_run_and_leaves_the_terminal_whole() {
+    let dir = tempfile::tempdir().unwrap();
+    for wallet in [LONG, SHORT] {
+        let keys_dir = dir.path().join("secrets");
+        session_keys::create(&keys_dir, wallet.parse().unwrap(), "correct horse battery staple").unwrap();
+    }
+    let shown = in_a_terminal(dir.path(), "run", "Password for ./secrets: ", b"\x03");
+    // It ended by its own doing, saying why: not killed where it stood, which
+    // would leave the terminal without Ctrl-C for whatever runs in it next.
+    assert!(shown.contains("Error: interrupted"), "{shown}");
+    assert!(shown.contains("ended with 1"), "{shown}");
+    assert!(terminal_is_whole(&shown), "the terminal was left changed:\n{shown}");
+    assert!(!shown.contains("bot started"), "{shown}");
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn ctrl_c_at_a_prompt_of_keys_init_writes_nothing_and_leaves_the_terminal_whole() {
+    let dir = tempfile::tempdir().unwrap();
+    let shown = in_a_terminal(dir.path(), "keys init", "New password: ", b"\x03");
+    assert!(shown.contains("Error: interrupted"), "{shown}");
+    assert!(shown.contains("ended with 1"), "{shown}");
+    assert!(terminal_is_whole(&shown), "the terminal was left changed:\n{shown}");
+    assert!(!dir.path().join("secrets").exists());
+
+    // A password typed in full still goes through: the listener does not get in its way.
+    let typed = b"correct horse battery staple\rcorrect horse battery staple\r";
+    let shown = in_a_terminal(dir.path(), "keys init", "New password: ", typed);
+    assert!(shown.contains("Nothing was sent") && shown.contains("ended with 0"), "{shown}");
+    assert!(terminal_is_whole(&shown), "the terminal was left changed:\n{shown}");
+    assert!(!shown.contains("correct horse"), "the password was echoed:\n{shown}");
+}
