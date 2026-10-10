@@ -6,7 +6,8 @@ mod support;
 use std::time::Duration;
 
 use papertrade::protocol::deployment::usd;
-use papertrade::strategy::decide::Mode;
+use papertrade::status::{EstimateSnapshot, FeesSnapshot, RoundEstimate, RoundSnapshot, Snapshot};
+use papertrade::strategy::decide::{Mode, Phase};
 use support::{Behavior, ENTRY, Harness, TARGET, TTL, eventually, eventually_stored, steadily};
 
 const SOON: Duration = Duration::from_secs(5);
@@ -17,6 +18,19 @@ fn exposure(harness: &Harness, wallet: alloy::primitives::Address) -> Duration {
     let received = harness.sim.received();
     let at = |action: &str| received.iter().find(|r| r.wallet == wallet && r.action == action).unwrap().at;
     at("closePositions") - at("openPosition")
+}
+
+/// The first stored status for which `wanted` holds. The bot rewrites its status
+/// about once a second, so this can take that long.
+async fn status_when(h: &Harness, what: &str, wanted: impl Fn(&Snapshot) -> bool) -> Snapshot {
+    let started = std::time::Instant::now();
+    loop {
+        if let Some(status) = h.store.read_status().await.unwrap().filter(&wanted) {
+            return status;
+        }
+        assert!(started.elapsed() < SOON, "timed out after {SOON:?} waiting for a status with: {what}");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -369,6 +383,115 @@ async fn a_bot_that_cannot_start_the_first_time_says_so_instead_of_retrying() {
     h.start_self_healing_bot(0);
     let error = h.stop_bot().await.unwrap_err().to_string();
     assert!(error.contains("no session key"), "{error}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_status_carries_an_estimate_for_the_next_round_and_for_the_open_one() {
+    let figures = |[loser, winner, net, paper, cost]: [&str; 5]| RoundEstimate {
+        loser_usd: loser.into(),
+        winner_usd: winner.into(),
+        net_usd: net.into(),
+        paper: paper.into(),
+        usd_per_paper: Some(cost.into()),
+    };
+    // What the simulator serves is what production served on 2026-10-10: BTC's
+    // impact parameters, 2% fees, 100 PAPER per USD of mint basis, an empty queue.
+    // For 10,000 USD a leg closed 1% from an entry of 80,000.0: the loser pays 100
+    // and mints on 98 of it; the winner's 99.80 (the deadband takes 0.20) keeps
+    // 88.3% through the haircut and then pays the 2% win fee.
+    let at_target = figures(["100.00", "86.38", "-13.61", "9800.00", "0.001389"]);
+    let fees = Some(FeesSnapshot {
+        win_percent: "2.00".into(),
+        loss_percent: "2.00".into(),
+        liquidation_percent: "2.00".into(),
+    });
+
+    let mut h = Harness::prepare().await;
+    // Flat for as long as the relayer refuses opens.
+    h.sim.pause("openPosition");
+    h.start_bot();
+    let flat = status_when(&h, "an estimate while flat", |status| {
+        status.phase == Phase::Flat && status.estimate.is_some()
+    })
+    .await;
+    assert_eq!(
+        flat.estimate,
+        Some(EstimateSnapshot {
+            mint_rate: "100.00".into(),
+            at_target: at_target.clone(),
+            now: None,
+            fees: fees.clone(),
+        })
+    );
+    assert_eq!(flat.round, None);
+
+    // While winners are queued a losing close pays no loss fee, so the same loss
+    // mints on all 100 and each PAPER comes out cheaper.
+    h.sim.set_queue_total(usd(250));
+    let queued = status_when(&h, "the estimate for a queued payout", |status| {
+        status.estimate.as_ref().is_some_and(|estimate| estimate.at_target.paper == "10000.00")
+    })
+    .await;
+    assert_eq!(
+        queued.estimate.unwrap().at_target,
+        figures(["100.00", "86.38", "-13.61", "10000.00", "0.001361"])
+    );
+    h.sim.set_queue_total(usd(0));
+
+    h.sim.unpause("openPosition");
+    h.hedged().await;
+    // Half way to the target: the loser is down 50 and would mint on 49; a smaller
+    // move keeps less of the gain (86.7% of 49.80), so each PAPER costs more.
+    h.sim.set_mid(ENTRY + TARGET / 2);
+    let hedged = status_when(&h, "the round valued at the new mid", |status| {
+        status.phase == Phase::Hedged && status.mid.as_deref() == Some("80400.0") && status.estimate.is_some()
+    })
+    .await;
+    assert_eq!(
+        hedged.estimate,
+        Some(EstimateSnapshot {
+            mint_rate: "100.00".into(),
+            at_target,
+            now: Some(figures(["50.00", "42.31", "-7.68", "4900.00", "0.001568"])),
+            fees,
+        })
+    );
+    // The status also says where this round closes and since when it is held.
+    assert_eq!(
+        hedged.round,
+        Some(RoundSnapshot {
+            entry: "80000.0".into(),
+            close_below: "79200.0".into(),
+            close_above: "80800.0".into(),
+        })
+    );
+    assert!(hedged.held_since_ms().is_some());
+    // And the reported trigger is where it really closes: not one price unit earlier.
+    h.sim.set_mid(ENTRY + TARGET - 1);
+    steadily("nothing closes just inside the reported trigger", A_WHILE, || h.closes() == 0).await;
+    h.sim.set_mid(ENTRY + TARGET);
+    h.flat().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn fee_rates_that_cannot_be_read_cost_the_estimate_and_nothing_else() {
+    let mut h = Harness::prepare().await;
+    h.sim.set_fees_readable(false);
+    h.start_bot();
+    // The round opens all the same.
+    h.hedged().await;
+    let blind = status_when(&h, "the open round", |status| status.phase == Phase::Hedged).await;
+    assert_eq!(blind.estimate, None);
+
+    h.sim.set_fees_readable(true);
+    status_when(&h, "an estimate once the rates are read", |status| status.estimate.is_some()).await;
+    // Rates that can no longer be confirmed are not kept on show.
+    h.sim.set_fees_readable(false);
+    status_when(&h, "no estimate once the rates are stale", |status| status.estimate.is_none()).await;
+
+    h.sim.set_mid(ENTRY + TARGET);
+    h.flat().await;
+    assert_eq!((h.opens(), h.closes()), (2, 2));
 }
 
 #[tokio::test(flavor = "multi_thread")]

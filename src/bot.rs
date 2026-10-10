@@ -14,20 +14,20 @@ use tokio::time::{MissedTickBehavior, interval};
 use tracing::{error, info, warn};
 
 use crate::config::Config;
-use crate::economics;
+use crate::economics::{self, Leg as EstimatedLeg, Round, Terms};
 use crate::market::{Quote, follow_price, format_price, price_decimals};
 use crate::protocol::account::AccountState;
-use crate::protocol::chain::Chain;
+use crate::protocol::chain::{Chain, FeeRates};
 use crate::protocol::client::{Client, SubmitError};
 use crate::protocol::intents::{
     Close, NonceSequence, OpenPosition, SignedIntent, sign_close, sign_open_position,
 };
 use crate::protocol::stream::{StreamTiming, follow_account};
-use crate::protocol::wire::{IntentOutcome, IntentReceipt, TradingState};
+use crate::protocol::wire::{IntentOutcome, IntentReceipt, MintCurve, TradingState};
 use crate::session_keys;
 use crate::status::{
-    AccountSnapshot, LegSnapshot, PositionSnapshot, Snapshot, TradingSnapshot, format_amount,
-    format_signed_amount,
+    AccountSnapshot, EstimateSnapshot, FeesSnapshot, LegSnapshot, PositionSnapshot, RoundEstimate,
+    RoundSnapshot, Snapshot, TradingSnapshot, format_amount, format_signed_amount, format_signed_decimal,
 };
 use crate::store::{Store, now_ms};
 use crate::strategy::decide::{
@@ -45,6 +45,9 @@ pub struct Timing {
     pub tick: Duration,
     /// How often the trading state and the payout queue are fetched.
     pub state_poll: Duration,
+    /// How often the mint curve and the fee rates are fetched. Only the estimate
+    /// reads them and they move slowly, so they are asked for far less often.
+    pub estimate_poll: Duration,
     pub ledger_interval: Duration,
     /// A refused close is tried again, but not on every tick.
     pub close_retry: Duration,
@@ -61,6 +64,7 @@ impl Default for Timing {
         Self {
             tick: Duration::from_millis(250),
             state_poll: Duration::from_secs(5),
+            estimate_poll: Duration::from_secs(30),
             ledger_interval: Duration::from_secs(60),
             close_retry: Duration::from_secs(5),
             grace: Duration::from_secs(10),
@@ -96,11 +100,12 @@ impl<T> PerSide<T> {
 type Polled<T> = watch::Receiver<Option<(T, Instant)>>;
 
 /// Keeps a remote value fresh in the background.
-fn poll<T, F, Fut>(tasks: &mut JoinSet<()>, what: &'static str, every: Duration, load: F) -> Polled<T>
+fn poll<T, E, F, Fut>(tasks: &mut JoinSet<()>, what: &'static str, every: Duration, load: F) -> Polled<T>
 where
     T: Send + Sync + 'static,
+    E: std::fmt::Display,
     F: Fn() -> Fut + Send + 'static,
-    Fut: Future<Output = reqwest::Result<T>> + Send,
+    Fut: Future<Output = Result<T, E>> + Send,
 {
     let (sender, receiver) = watch::channel(None);
     tasks.spawn(async move {
@@ -110,7 +115,7 @@ where
             every.tick().await;
             match load().await {
                 Ok(value) => drop(sender.send_replace(Some((value, Instant::now())))),
-                Err(error) => warn!(%error, "{what} poll failed"),
+                Err(error) => warn!(error = %format_args!("{error:#}"), "{what} poll failed"),
             }
         }
     });
@@ -148,6 +153,9 @@ struct Bot {
     quote: watch::Receiver<Option<Quote>>,
     trading: Polled<TradingState>,
     queue_total: Polled<U256>,
+    /// Inputs of the estimate only. Nothing the bot decides depends on them.
+    mint_curve: Polled<MintCurve>,
+    fee_rates: Polled<FeeRates>,
     /// The operator's mode as last read; kept when the database cannot be read.
     mode: Mode,
     inflight: Vec<Inflight>,
@@ -241,9 +249,8 @@ pub async fn start_with(
     config: &Config,
     store: Store,
     client: Client,
-    // Read-only contract calls. Nothing uses it yet: the estimate reads fee
-    // rates through it and rebalancing reads deposit addresses.
-    _chain: Chain,
+    // Read-only contract calls: the estimate reads the fee rates through it.
+    chain: Chain,
     price: impl FnOnce(u32, &mut JoinSet<()>) -> watch::Receiver<Option<Quote>>,
     timing: Timing,
 ) -> Result<Running> {
@@ -289,6 +296,17 @@ pub async fn start_with(
             async move { client.queue_total().await }
         })
     };
+    let mint_curve = {
+        let client = client.clone();
+        poll(&mut tasks, "mint curve", timing.estimate_poll, move || {
+            let client = client.clone();
+            async move { client.mint_curve().await }
+        })
+    };
+    let fee_rates = poll(&mut tasks, "fee rates", timing.estimate_poll, move || {
+        let chain = chain.clone();
+        async move { chain.fee_rates().await }
+    });
     let ledger_wake = Arc::new(Notify::new());
     tasks.spawn(follow_ledger(
         client.clone(),
@@ -321,6 +339,8 @@ pub async fn start_with(
         quote,
         trading,
         queue_total,
+        mint_curve,
+        fee_rates,
         close_allowed_at: Instant::now(),
         reported: String::new(),
         status_at: Instant::now(),
@@ -663,6 +683,7 @@ impl Bot {
                             bust: price(position.bust_price),
                             margin_usd: format_amount(position.margin),
                             leverage: position.leverage,
+                            opened_at_ms: position.opened_at_ms,
                         })
                         .collect(),
                 }),
@@ -683,6 +704,19 @@ impl Bot {
             }
             _ => None,
         };
+        let round = match (phase, entries.as_slice()) {
+            (Phase::Hedged, [long, short]) => {
+                let entry = long.midpoint(*short);
+                economics::close_distance(entry, self.params.close_bps).and_then(|distance| {
+                    Some(RoundSnapshot {
+                        entry: price(entry),
+                        close_below: price(entry.checked_sub(distance)?),
+                        close_above: price(entry.checked_add(distance)?),
+                    })
+                })
+            }
+            _ => None,
+        };
         Snapshot {
             at_ms: now_ms(),
             dry_run: self.dry_run,
@@ -699,16 +733,81 @@ impl Bot {
             summary,
             mid: mid.map(price),
             move_bps,
+            round,
             trading: trading.map(|trading| TradingSnapshot {
                 trading_paused: trading.trading_paused,
                 paused_actions: trading.paused_actions.iter().cloned().collect(),
             }),
             queue_total_usd: queue_total.map(format_amount),
             legs: vec![leg(Side::Long), leg(Side::Short)],
-            estimate: None,
+            estimate: self.estimate(phase, accounts, trading, queue_total, mid),
             funds: None,
             transfer: None,
         }
+    }
+}
+
+impl Bot {
+    /// What the open round is expected to cost and mint, or else the round that
+    /// would be opened at the current mid. `None` while an input is unknown: the
+    /// market's impact parameters, the fee rates, the mint curve, the payout
+    /// queue, or (with nothing hedged) a price to enter at.
+    fn estimate(
+        &self,
+        phase: Phase,
+        accounts: &PerSide<Option<AccountState>>,
+        trading: Option<&TradingState>,
+        queue_total: Option<U256>,
+        mid: Option<u64>,
+    ) -> Option<EstimateSnapshot> {
+        let fees = fresh(&self.fee_rates, self.timing.estimate_poll)?;
+        let mint_rate = economics::mint_rate(&fresh(&self.mint_curve, self.timing.estimate_poll)?)?;
+        let instrument =
+            trading?.instrument(&self.market.symbol).filter(|listed| listed.id == self.market.id)?;
+        let terms =
+            Terms { impact: instrument.impact?, fees, mint_rate, queue_empty: queue_total?.is_zero() };
+
+        let open = |side: Side| {
+            let position = accounts.get(side).as_ref()?.positions.first()?;
+            Some(EstimatedLeg {
+                is_long: position.is_long,
+                entry: position.entry_price,
+                margin: position.margin,
+                leverage: position.leverage,
+                bust: Some(position.bust_price),
+            })
+        };
+        let (legs, mid) = match (phase, open(Side::Long), open(Side::Short)) {
+            (Phase::Hedged, Some(long), Some(short)) => ([long, short], mid),
+            // Nothing hedged: the next round, sized as `decide` sizes it.
+            _ => {
+                let leverage = self.params.leverage;
+                let margin = self.params.notional.div_ceil(U256::from(leverage));
+                (EstimatedLeg::pair(mid?, margin, leverage), None)
+            }
+        };
+        let estimate = economics::estimate(&legs, self.params.close_bps, mid, &terms)?;
+        let percent = |rate: U256| format_amount(rate.saturating_mul(U256::from(100)));
+        Some(EstimateSnapshot {
+            mint_rate: format_amount(mint_rate),
+            at_target: round_estimate(&estimate.at_target),
+            now: estimate.now.as_ref().map(round_estimate),
+            fees: Some(FeesSnapshot {
+                win_percent: percent(fees.win),
+                loss_percent: percent(fees.loss),
+                liquidation_percent: percent(fees.liquidation),
+            }),
+        })
+    }
+}
+
+fn round_estimate(round: &Round) -> RoundEstimate {
+    RoundEstimate {
+        loser_usd: format_amount(round.loss),
+        winner_usd: format_amount(round.win),
+        net_usd: format_signed_amount(round.net),
+        paper: format_amount(round.paper),
+        usd_per_paper: round.usd_per_paper.map(|cost| format_signed_decimal(cost, 6)),
     }
 }
 

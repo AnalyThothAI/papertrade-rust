@@ -339,6 +339,7 @@ mod tests {
             bust: if is_long { "78604.4" } else { "86795.6" }.into(),
             margin_usd: "500.00".into(),
             leverage: 20,
+            opened_at_ms: None,
         };
         Screen {
             status: Some(Snapshot {
@@ -352,6 +353,7 @@ mod tests {
                 summary: "hedged; price is inside the target".into(),
                 mid: Some("83100.5".into()),
                 move_bps: Some(48.4),
+                round: None,
                 trading: Some(TradingSnapshot { trading_paused: false, paused_actions: Vec::new() }),
                 queue_total_usd: Some("0.00".into()),
                 legs: vec![

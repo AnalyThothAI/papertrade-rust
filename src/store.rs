@@ -396,6 +396,7 @@ mod tests {
             summary: "flat; settling before the next open".into(),
             mid: Some("82754.5".into()),
             move_bps: None,
+            round: None,
             trading: None,
             queue_total_usd: None,
             legs: Vec::new(),

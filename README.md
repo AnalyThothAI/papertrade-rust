@@ -117,6 +117,40 @@ uvx datasette data/papertrade.db      # http://127.0.0.1:8001，表 events / int
 - **数据库只影响开仓**：意图日志写不进去就不开仓；平仓不依赖数据库。
 - **后台任务停了就重新开始**：行情或账户流任务停了，这一轮运行结束并在 5 秒后重新启动，而不是拿着旧数据一直等。
 
+## 预估
+
+一轮的结果由协议规则决定。机器人按这些规则先算出来，写进状态快照，面板和 `status` 都显示。它回答两个问题：这一轮走到目标时大约拿多少 PAPER、花多少钱；如果现在就平仓呢。
+
+| 输入 | 来源 | 刷新 |
+|---|---|---|
+| 盈利折扣的四个参数：`baseRate`、`rateMultiplier`、`referenceNotional`、`positionMultiplier` | `/state/trading` 的品种记录 | 5 秒 |
+| 赢利费、亏损费、强平费 | 链上 Exchange 合约的 `winFeeRate()`、`lossFeeRate()`、`liquidationFeeRate()`（只读调用） | 30 秒 |
+| 铸造曲线：`trackedLp`、`cliff`、`rate`、`decay`、`tailProgress` | `/query/protocol/summary` 的 `paper` 段 | 30 秒 |
+| 派彩队列是否为空 | `/query/protocol/queue-summary` | 5 秒 |
+| 开仓价、保证金、杠杆、强平价 | 已对冲时是两条腿的实际仓位；否则是当前中间价和配置的仓位（即下一轮） | 实时 |
+
+规则都在 [`src/economics.rs`](src/economics.rs)，纯函数、整数运算：
+
+1. **平仓估值**。死区 = 开仓价 ÷ 50000（0.2 bps）：盈利一方的平仓价先向不利方向挪一个死区，挪完不再盈利就按 0 计。盈利再乘以折扣 `(1 − baseRate) ÷ (1 + 1 ÷ (move × rateMultiplier) + referenceNotional ÷ (10⁶ × move × positionMultiplier))`，`move` 是扣掉死区后的偏离比例。亏损不打折，最多亏光保证金。这一段逐位移植自官方前端的估值函数（与合约的 `applyMarketImpact` 对应）；[`tests/fixtures/valuation-golden.json`](tests/fixtures/valuation-golden.json) 是用官方函数跑出来的对照表，测试要求每一位都相同。
+2. **赢利费**。折扣后的盈利再扣 `winFeeRate`。
+3. **铸造率**。`trackedLp < cliff`（包括为负）时每 1 USD 铸造基数铸 `rate` 枚；否则是 `rate × (decay ÷ (decay + tailProgress))²`。
+4. **铸造基数**。派彩队列为空时平仓：亏损额减去亏损费（`亏损 × lossFeeRate`）；队列非空时平仓：全额亏损；被强平：全部保证金。
+
+给出两组数字，每组都是亏方亏损、赢方到手、两边合计净额、预计 PAPER、每枚 PAPER 的成本：
+
+- **到目标时（at target）**：在开仓价上方、刚好达到平仓阈值的价格两边一起平仓。两腿等额时向下走同样的距离结果相同，只是输赢互换，所以只算一个方向。空仓时这就是下一轮的预估。
+- **现在平仓（now）**：按当前中间价平仓。只在已对冲且有新鲜报价时给出。
+
+默认配置下（BTC、每腿 10,000 USD、阈值 100 bps、三项费率 2%、铸造率 100、队列为空）：亏方亏 100.00，赢方到手 86.38（死区扣掉 0.20，剩下的 99.80 保留约 88.3%，再扣 2%），净额 −13.61，铸 9,800 PAPER，每枚约 0.00139 USD。偏离越小折扣越重：走到一半（50 bps）时每枚约 0.00157 USD。
+
+它只是预估：
+
+- **缺输入就不给数字**。任何一项读不到或连续三次没刷新，预估整段显示为缺失，不沿用旧值，也不用 0 代替。预估只用于显示，这些输入读不到不影响开仓和平仓。
+- **实际平仓价不是目标价**。平仓按落块时的中间价结算，通常比阈值再远一点。
+- **没有计入的情况**：LP 现金不够时亏损费会被免除（铸造基数变成全额亏损）；一笔铸造跨过 `cliff` 时前后两段铸造率不同；`tail` 区公式在合约里的取整顺序未核对。
+- **一处文档没说清的地方**：`tailProgress` 只增不减。LP 被质押者提走、`trackedLp` 回落到 `cliff` 以下之后，铸造率是回到 `rate` 还是保持衰减后的值，文档两种说法都有。这里按"`trackedLp < cliff` 就是 `rate`"处理；目前 `trackedLp` 和 `tailProgress` 都是 0，两种读法结果相同。
+- **估值与链上结算是否逐位一致**，要等第一笔真实平仓来对比。铸造率和铸造基数来自官方文档，不是合约代码。
+
 ## 异常场景
 
 两条腿是两个独立的意图，不是原子的。下面是每种异常下机器人的行为，以及一条腿裸露（单边持仓）的最长时间。除最后三行外，都有对应的端到端测试（[`tests/rounds.rs`](tests/rounds.rs)）。
@@ -202,10 +236,11 @@ cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test
 | `src/protocol/` | 线路协议：部署常量、EIP-712 意图、数据格式、账户状态折叠、中继客户端、账户流 |
 | `src/market.rs` | Hyperliquid 盘口行情 |
 | `src/strategy/` | 决策函数、在途意图跟踪 |
+| `src/economics.rs` | 预估：平仓估值、铸造率、铸造基数、一轮的成本与 PAPER |
 | `src/store.rs`、`migrations/` | SQLite 存储与表结构 |
 | `src/status.rs` | 写入数据库的状态快照 |
 | `src/bot.rs` | 运行循环 |
 | `src/tui.rs` | 终端面板 |
-| `tests/fixtures/` | 生产环境抓取的真实响应，以及 TypeScript 版生成的签名金标准 |
+| `tests/fixtures/` | 生产环境抓取的真实响应、TypeScript 版生成的签名金标准、官方估值函数的对照表 |
 | `tests/support/` | 模拟交易所：同样的接口，会校验签名、排队、执行，并能按脚本制造拒绝、无应答、延迟、强平、断流 |
 | `tests/rounds.rs` | 真实机器人对模拟交易所的端到端场景 |
