@@ -23,6 +23,9 @@ pub struct Snapshot {
     pub mid: Option<String>,
     /// Signed distance of the mid from the mean entry in basis points, while hedged.
     pub move_bps: Option<f64>,
+    /// The open round's entry and where it closes. `None` unless hedged.
+    #[serde(default)]
+    pub round: Option<RoundSnapshot>,
     /// `None` when the trading state could not be fetched recently.
     pub trading: Option<TradingSnapshot>,
     pub queue_total_usd: Option<String>,
@@ -38,6 +41,25 @@ pub struct Snapshot {
     pub transfer: Option<TransferSnapshot>,
 }
 
+impl Snapshot {
+    /// When the oldest open position was opened, unix milliseconds, if the accounts say.
+    pub fn held_since_ms(&self) -> Option<u64> {
+        let positions = self.legs.iter().filter_map(|leg| leg.account.as_ref()).flat_map(|a| &a.positions);
+        positions.filter_map(|position| position.opened_at_ms).min()
+    }
+}
+
+/// The hedged round the two legs hold.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RoundSnapshot {
+    /// Mean of the two entry prices: what the close distance is measured from.
+    pub entry: String,
+    /// Both legs are closed once the mid is at or below this …
+    pub close_below: String,
+    /// … or at or above this.
+    pub close_above: String,
+}
+
 /// What a round is expected to cost and mint, by the protocol's published rules.
 /// An estimate: the contract has the last word at settlement.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -48,6 +70,17 @@ pub struct EstimateSnapshot {
     pub at_target: RoundEstimate,
     /// If both legs were closed at the current mid. Only while hedged.
     pub now: Option<RoundEstimate>,
+    /// The fee rates the figures were computed with.
+    #[serde(default)]
+    pub fees: Option<FeesSnapshot>,
+}
+
+/// The Exchange's fee rates as read from the chain, in percent.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FeesSnapshot {
+    pub win_percent: String,
+    pub loss_percent: String,
+    pub liquidation_percent: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -124,18 +157,30 @@ pub struct PositionSnapshot {
     pub bust: String,
     pub margin_usd: String,
     pub leverage: u32,
+    /// Unix milliseconds; `None` when the account does not say.
+    #[serde(default)]
+    pub opened_at_ms: Option<u64>,
 }
 
 /// An 18-decimal amount with two decimal places, truncated.
 pub fn format_amount(raw: U256) -> String {
-    let unit = U256::from(10).pow(U256::from(USD_DECIMALS));
-    let cents = (raw % unit) / U256::from(10).pow(U256::from(USD_DECIMALS - 2));
-    format!("{}.{:02}", raw / unit, cents)
+    format_decimal(raw, 2)
 }
 
 pub fn format_signed_amount(raw: I256) -> String {
+    format_signed_decimal(raw, 2)
+}
+
+/// An 18-decimal number with `places` decimal places (at most 18), truncated.
+pub fn format_decimal(raw: U256, places: u8) -> String {
+    let unit = U256::from(10).pow(U256::from(USD_DECIMALS));
+    let fraction = (raw % unit) / U256::from(10).pow(U256::from(USD_DECIMALS - places));
+    format!("{}.{fraction:0width$}", raw / unit, width = usize::from(places))
+}
+
+pub fn format_signed_decimal(raw: I256, places: u8) -> String {
     let sign = if raw.is_negative() { "-" } else { "" };
-    format!("{sign}{}", format_amount(raw.unsigned_abs()))
+    format!("{sign}{}", format_decimal(raw.unsigned_abs(), places))
 }
 
 #[cfg(test)]
@@ -149,6 +194,95 @@ mod tests {
         assert_eq!(format_amount(usd(500)), "500.00");
         assert_eq!(format_amount(U256::from(673_377_893u64) * U256::from(10).pow(U256::from(12))), "673.37");
         assert_eq!(format_amount(U256::from(9_999_999_999_999_999u64)), "0.00");
+    }
+
+    #[test]
+    fn a_snapshot_written_before_the_newer_sections_still_reads() {
+        // The shape of the first release: no round, estimate, funds, transfer,
+        // wallet key or opening time anywhere.
+        let old = serde_json::json!({
+            "at_ms": 1, "dry_run": false, "mode": "run", "coin": "BTC", "close_bps": 100,
+            "phase": "hedged", "decision": "wait", "summary": "hedged; price is inside the target",
+            "mid": "83100.5", "move_bps": 48.4, "trading": null, "queue_total_usd": "0.00",
+            "legs": [{
+                "side": "long", "wallet": "0x01", "session_key": "0x02", "pending_intents": 0,
+                "account": {
+                    "available_usd": "1000.00", "queued_usd": "0.00", "session_key_expiry": 1_800_000_000u64,
+                    "positions": [{
+                        "id": "7", "is_long": true, "entry": "82700.0", "bust": "78604.4",
+                        "margin_usd": "500.00", "leverage": 20
+                    }]
+                }
+            }]
+        });
+        let snapshot: Snapshot = serde_json::from_value(old).unwrap();
+        assert_eq!(
+            (&snapshot.round, &snapshot.estimate, &snapshot.funds, &snapshot.transfer),
+            (&None, &None, &None, &None)
+        );
+        assert!(!snapshot.legs[0].has_wallet_key);
+        assert_eq!(snapshot.legs[0].account.as_ref().unwrap().positions[0].opened_at_ms, None);
+        assert_eq!(snapshot.held_since_ms(), None);
+
+        // And an estimate written before the fee rates were recorded with it.
+        let estimate: EstimateSnapshot = serde_json::from_value(serde_json::json!({
+            "mint_rate": "100.00",
+            "at_target": {
+                "loser_usd": "100.00", "winner_usd": "86.38", "net_usd": "-13.61",
+                "paper": "9800.00", "usd_per_paper": "0.001389"
+            },
+            "now": null
+        }))
+        .unwrap();
+        assert_eq!(estimate.fees, None);
+    }
+
+    #[test]
+    fn the_round_is_held_since_its_oldest_position_opened() {
+        let leg = |side: Side, opened_at_ms: Option<u64>| LegSnapshot {
+            side,
+            wallet: String::new(),
+            session_key: String::new(),
+            account: Some(AccountSnapshot {
+                available_usd: "0.00".into(),
+                queued_usd: "0.00".into(),
+                session_key_expiry: None,
+                positions: vec![PositionSnapshot {
+                    id: "1".into(),
+                    is_long: side.is_long(),
+                    entry: "80000.0".into(),
+                    bust: "76000.0".into(),
+                    margin_usd: "500.00".into(),
+                    leverage: 20,
+                    opened_at_ms,
+                }],
+            }),
+            pending_intents: 0,
+            has_wallet_key: false,
+        };
+        let held = |long, short| {
+            let mut snapshot: Snapshot = serde_json::from_value(serde_json::json!({
+                "at_ms": 1, "dry_run": false, "mode": "run", "coin": "BTC", "close_bps": 100,
+                "phase": "hedged", "decision": "wait", "summary": "", "mid": null, "move_bps": null,
+                "trading": null, "queue_total_usd": null, "legs": []
+            }))
+            .unwrap();
+            snapshot.legs = vec![leg(Side::Long, long), leg(Side::Short, short)];
+            snapshot.held_since_ms()
+        };
+        assert_eq!(held(Some(2_000), Some(1_500)), Some(1_500));
+        assert_eq!(held(None, Some(1_500)), Some(1_500));
+        assert_eq!(held(None, None), None);
+    }
+
+    #[test]
+    fn small_numbers_can_be_shown_with_more_places() {
+        // 13.616… USD for 9,800 PAPER.
+        let cost = U256::from(1_389_389_960_794_843u64);
+        assert_eq!(format_decimal(cost, 6), "0.001389");
+        assert_eq!(format_decimal(cost, 2), "0.00");
+        assert_eq!(format_decimal(usd(100), 6), "100.000000");
+        assert_eq!(format_signed_decimal(I256::try_from(cost).unwrap().wrapping_neg(), 6), "-0.001389");
     }
 
     #[test]

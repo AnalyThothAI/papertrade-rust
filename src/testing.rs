@@ -10,6 +10,7 @@ use crate::protocol::wire::{Position, TradingState};
 
 pub const TRADING_STATE: &str = include_str!("../tests/fixtures/trading-state.json");
 pub const WALLET_SNAPSHOT: &str = include_str!("../tests/fixtures/wallet-snapshot.json");
+pub const PROTOCOL_SUMMARY: &str = include_str!("../tests/fixtures/protocol-summary.json");
 
 /// The session key the test accounts have registered.
 pub const KEY: Address = address!("0x00000000000000000000000000000000000000aa");
@@ -47,6 +48,7 @@ pub fn position(id: u64, is_long: bool) -> Position {
         margin: usd(500),
         leverage: 20,
         bust_price: 760_400,
+        opened_at_ms: None,
         intent_id: None,
     }
 }

@@ -29,7 +29,7 @@ use papertrade::config::Config;
 use papertrade::market::Quote;
 use papertrade::protocol::chain::Chain;
 use papertrade::protocol::client::Client;
-use papertrade::protocol::deployment::usd;
+use papertrade::protocol::deployment::{EXCHANGE, usd};
 use papertrade::protocol::intents::{Close, OpenPosition, exchange_domain};
 use papertrade::protocol::stream::StreamTiming;
 use papertrade::session_keys;
@@ -40,6 +40,7 @@ use tokio::sync::{broadcast, oneshot, watch};
 use tokio::task::JoinHandle;
 
 const TRADING_STATE: &str = include_str!("../fixtures/trading-state.json");
+const PROTOCOL_SUMMARY: &str = include_str!("../fixtures/protocol-summary.json");
 
 /// How the simulator treats the next intent of one kind from one wallet.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -121,6 +122,10 @@ struct World {
     stream_up: bool,
     held: bool,
     execution_delay: Duration,
+    /// Whether the Exchange's fee getters answer; when not, they revert.
+    fees_readable: bool,
+    /// What the LP owes to queued winners.
+    queue_total: U256,
 }
 
 fn unix_seconds() -> u64 {
@@ -311,16 +316,18 @@ fn settle(wallet: Address, position: &Position, mid: u64, kind: &str) -> (U256, 
     let raw = notional * U256::from(mid.abs_diff(position.entry)) / U256::from(position.entry);
     let wins = (mid > position.entry) == position.is_long && mid != position.entry;
     let liquidated = kind == "Liquidated";
+    let loss = if wins { U256::ZERO } else { raw.min(position.margin) };
+    let lost = if loss.is_zero() { "0".to_owned() } else { format!("-{loss}") };
     let (credit, adjusted, fee, paper) = if liquidated {
-        (U256::ZERO, format!("-{}", position.margin), U256::ZERO, position.margin * U256::from(100))
+        // The whole margin is gone and all of it mints, but the record carries only
+        // the PnL at the price the liquidation fired at.
+        (U256::ZERO, lost, U256::ZERO, position.margin * U256::from(100))
     } else if wins {
         let adjusted = raw * U256::from(88) / U256::from(100);
         let fee = adjusted * U256::from(2) / U256::from(100);
         (position.margin + adjusted - fee, adjusted.to_string(), fee, U256::ZERO)
     } else {
-        let loss = raw.min(position.margin);
-        let adjusted = if loss.is_zero() { "0".to_owned() } else { format!("-{loss}") };
-        (position.margin - loss, adjusted, U256::ZERO, loss * U256::from(98))
+        (position.margin - loss, lost, U256::ZERO, loss * U256::from(98))
     };
     let trade = json!({
         "timestampMs": unix_millis(),
@@ -454,8 +461,15 @@ async fn trading_state(State(world): State<Shared>) -> Json<Value> {
     Json(state)
 }
 
-async fn queue_summary() -> Json<Value> {
-    Json(json!({ "ok": true, "total": "0", "count": 0, "largest": null, "front": null }))
+async fn queue_summary(State(world): State<Shared>) -> Json<Value> {
+    let total = world.lock().unwrap().queue_total;
+    let count = u8::from(!total.is_zero());
+    Json(json!({ "ok": true, "total": total.to_string(), "count": count, "largest": null, "front": null }))
+}
+
+/// The protocol summary as captured from production: nothing tracked yet, 100 PAPER per USD.
+async fn protocol_summary() -> Json<Value> {
+    Json(serde_json::from_str(PROTOCOL_SUMMARY).unwrap())
 }
 
 async fn trades(State(world): State<Shared>, Path(wallet): Path<Address>) -> Json<Value> {
@@ -464,8 +478,16 @@ async fn trades(State(world): State<Shared>, Path(wallet): Path<Address>) -> Jso
     Json(json!({ "items": items, "nextCursor": null }))
 }
 
+/// The Exchange's win, loss and liquidation fee rates: 2% each, as on mainnet.
+const FEE_RATE: u64 = 20_000_000_000_000_000;
+
 /// What a contract call returns, or `None` to revert. Add an arm per call the bot makes.
-fn eth_call(_world: &World, _to: Address, _data: &[u8]) -> Option<Vec<u8>> {
+fn eth_call(world: &World, to: Address, data: &[u8]) -> Option<Vec<u8>> {
+    let selector = |signature: &str| keccak256(signature)[..4].to_vec();
+    let fee_getters = ["winFeeRate()", "lossFeeRate()", "liquidationFeeRate()"];
+    if to == EXCHANGE && fee_getters.iter().any(|getter| data == selector(getter)) {
+        return world.fees_readable.then(|| U256::from(FEE_RATE).to_be_bytes_vec());
+    }
     None
 }
 
@@ -534,12 +556,15 @@ impl Sim {
             stream_up: true,
             held: true,
             execution_delay: Duration::from_millis(30),
+            fees_readable: true,
+            queue_total: U256::ZERO,
         }));
         let app = Router::new()
             .route("/intents", post(intents))
             .route("/state/trading", get(trading_state))
             .route("/state/user/live", get(live))
             .route("/query/protocol/queue-summary", get(queue_summary))
+            .route("/query/protocol/summary", get(protocol_summary))
             .route("/query/accounts/{wallet}/trades", get(trades))
             .route("/rpc", post(rpc))
             .with_state(world.clone());
@@ -640,6 +665,16 @@ impl Sim {
         }
     }
 
+    /// Sets what the LP owes to queued winners: the payout queue is empty at zero.
+    pub fn set_queue_total(&self, total: U256) {
+        self.world().queue_total = total;
+    }
+
+    /// Makes the Exchange's fee getters revert, or answer again.
+    pub fn set_fees_readable(&self, readable: bool) {
+        self.world().fees_readable = readable;
+    }
+
     /// Liquidates the wallet's positions: they vanish and the margin is gone.
     pub fn liquidate(&self, wallet: Address) {
         let mut world = self.world();
@@ -726,6 +761,7 @@ pub fn fast() -> Timing {
     Timing {
         tick: Duration::from_millis(15),
         state_poll: Duration::from_millis(60),
+        estimate_poll: Duration::from_millis(60),
         ledger_interval: Duration::from_millis(150),
         close_retry: Duration::from_millis(150),
         grace: Duration::from_millis(400),

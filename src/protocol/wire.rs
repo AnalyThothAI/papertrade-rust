@@ -95,7 +95,9 @@ impl Fields<'_> {
 
 /// One listed market. Tuple layout (frontend `trading_instrument_tuple`):
 /// 0 id, 1 symbol, 2 asset index, 3 price scale, 4 active, 5 paused,
-/// 14 max leverage, 15 max position notional; the rest is not used here.
+/// 12 rate multiplier, 13 position multiplier, 14 max leverage,
+/// 15 max position notional, 17 base rate, 18 reference notional; the rest is
+/// not used here.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(try_from = "Vec<Value>")]
 pub struct Instrument {
@@ -106,6 +108,20 @@ pub struct Instrument {
     pub openable: bool,
     pub max_leverage: u32,
     pub max_position_notional: U256,
+    /// `None` when the record does not carry readable impact parameters. Only
+    /// the estimate needs them, so their absence must not stop trading.
+    pub impact: Option<Impact>,
+}
+
+/// How much of its raw gain a winning close keeps: the market's parameters of
+/// the protocol's impact haircut, each a decimal scaled by 1e18.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Impact {
+    /// The share of a gain that is never paid out, however large the move.
+    pub base_rate: U256,
+    pub rate_multiplier: U256,
+    pub reference_notional: U256,
+    pub position_multiplier: U256,
 }
 
 impl TryFrom<Vec<Value>> for Instrument {
@@ -120,6 +136,18 @@ impl TryFrom<Vec<Value>> for Instrument {
             openable: f.flag(4)? && !f.flag(5)?,
             max_leverage: f.small(14)?,
             max_position_notional: f.dec(15)?,
+            impact: Impact::read(&f).ok(),
+        })
+    }
+}
+
+impl Impact {
+    fn read(f: &Fields<'_>) -> Result<Self, String> {
+        Ok(Self {
+            base_rate: f.dec(17)?,
+            rate_multiplier: f.dec(12)?,
+            reference_notional: f.dec(18)?,
+            position_multiplier: f.dec(13)?,
         })
     }
 }
@@ -193,6 +221,51 @@ pub struct QueueSummary {
     pub total: Dec,
 }
 
+// --- /query/protocol/summary ---------------------------------------------------
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct MintCurveWire {
+    tracked_lp: SignedDec,
+    cliff: Dec,
+    rate: Dec,
+    decay: Dec,
+    tail_progress: Dec,
+}
+
+/// Where the PAPER mint curve stands. Amounts are 18-decimal USD.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(from = "MintCurveWire")]
+pub struct MintCurve {
+    /// What the LP has gained so far; negative while it is underwater.
+    pub tracked_lp: I256,
+    /// The mint rate is flat while the tracked LP is below this.
+    pub cliff: U256,
+    /// PAPER minted per USD of mint basis in the flat region, 18 decimals.
+    pub rate: U256,
+    /// How slowly the rate falls beyond the cliff.
+    pub decay: U256,
+    /// How far the LP has ever been beyond the cliff. It never goes back down.
+    pub tail_progress: U256,
+}
+
+impl From<MintCurveWire> for MintCurve {
+    fn from(wire: MintCurveWire) -> Self {
+        Self {
+            tracked_lp: wire.tracked_lp.0,
+            cliff: wire.cliff.0,
+            rate: wire.rate.0,
+            decay: wire.decay.0,
+            tail_progress: wire.tail_progress.0,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ProtocolSummary {
+    pub paper: MintCurve,
+}
+
 // --- POST /intents -----------------------------------------------------------
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -235,6 +308,13 @@ pub struct Trade {
     pub paper_mint_basis_raw: Dec,
 }
 
+impl Trade {
+    /// The position was liquidated rather than closed.
+    pub fn is_liquidation(&self) -> bool {
+        self.kind == "Liquidated"
+    }
+}
+
 #[derive(Debug, Deserialize)]
 pub struct TradePage {
     pub items: Vec<Trade>,
@@ -256,6 +336,8 @@ pub struct Position {
     pub margin: U256,
     pub leverage: u32,
     pub bust_price: u64,
+    /// Unix milliseconds; `None` if the record does not say. Only shown, never decided on.
+    pub opened_at_ms: Option<u64>,
     /// The intent that opened it.
     pub intent_id: Option<B256>,
 }
@@ -273,6 +355,7 @@ impl TryFrom<Vec<Value>> for Position {
             margin: f.dec(5)?,
             leverage: f.small(6)?,
             bust_price: f.dec_u64(7)?,
+            opened_at_ms: f.number(8).ok(),
             intent_id: if f.get(9)?.is_null() { None } else { Some(f.hash(9)?) },
         })
     }
@@ -369,7 +452,7 @@ mod tests {
 
     use super::*;
     use crate::protocol::deployment::usd;
-    use crate::testing::TRADING_STATE;
+    use crate::testing::{PROTOCOL_SUMMARY, TRADING_STATE};
 
     fn trading_json() -> Value {
         serde_json::from_str(TRADING_STATE).unwrap()
@@ -388,8 +471,17 @@ mod tests {
                 openable: true,
                 max_leverage: 1000,
                 max_position_notional: usd(10_000_000),
+                // 10%, 15,000, 100,000 USD and 814.598: the figures the documentation gives for BTC.
+                impact: Some(Impact {
+                    base_rate: usd(1) / U256::from(10),
+                    rate_multiplier: usd(15_000),
+                    reference_notional: usd(100_000),
+                    position_multiplier: usd(814_598) / U256::from(1_000),
+                }),
             })
         );
+        let eth = state.instrument("ETH").unwrap().impact.unwrap();
+        assert_eq!(eth.position_multiplier, usd(483_979) / U256::from(1_000));
         assert_eq!(state.instrument("ETH").unwrap().price_scale, 100);
         assert_eq!(state.minimum_trade_size, usd(10));
         assert_eq!(state.minimum_open_notional, usd(10_000));
@@ -426,6 +518,20 @@ mod tests {
         raw["extra"] = json!(1);
         let state: TradingState = serde_json::from_value(raw).unwrap();
         assert_eq!(state.instrument("BTC").unwrap().id, 0);
+    }
+
+    #[test]
+    fn a_market_without_readable_impact_parameters_is_still_a_market() {
+        // The estimate needs them; opening and closing do not.
+        let mut raw = trading_json();
+        raw["instruments"][0][17] = json!(null);
+        raw["instruments"][1].as_array_mut().unwrap().truncate(16);
+        let state: TradingState = serde_json::from_value(raw).unwrap();
+        for symbol in ["BTC", "ETH"] {
+            let instrument = state.instrument(symbol).unwrap();
+            assert!(instrument.openable && instrument.max_leverage == 1000);
+            assert_eq!(instrument.impact, None);
+        }
     }
 
     #[test]
@@ -476,6 +582,41 @@ mod tests {
         // A rejection is not mistaken for a receipt.
         let rejection = json!({ "code": "intake_action_paused", "action": "openPosition" });
         assert!(serde_json::from_value::<IntentReceipt>(rejection).is_err());
+    }
+
+    #[test]
+    fn reads_the_production_mint_curve() {
+        let summary: ProtocolSummary = serde_json::from_str(PROTOCOL_SUMMARY).unwrap();
+        assert_eq!(
+            summary.paper,
+            MintCurve {
+                tracked_lp: I256::ZERO,
+                cliff: usd(2_000_000),
+                rate: usd(100),
+                decay: usd(120_000_000),
+                tail_progress: U256::ZERO,
+            }
+        );
+    }
+
+    #[test]
+    fn the_tracked_lp_may_be_negative() {
+        let mut raw: Value = serde_json::from_str(PROTOCOL_SUMMARY).unwrap();
+        raw["paper"]["trackedLp"] = json!("-5000000000000000000");
+        let summary: ProtocolSummary = serde_json::from_value(raw).unwrap();
+        assert_eq!(summary.paper.tracked_lp, I256::try_from(usd(5)).unwrap().wrapping_neg());
+    }
+
+    #[test]
+    fn a_position_says_when_it_was_opened_if_the_record_does() {
+        let tuple = |opened_at: Value| {
+            json!(["42", 0, true, false, "827935", "500000000000000000000", 20, "786932", opened_at, null])
+        };
+        let position: Position = serde_json::from_value(tuple(json!(1_791_620_900_000u64))).unwrap();
+        assert_eq!(position.opened_at_ms, Some(1_791_620_900_000));
+        // An unreadable timestamp costs the display its "held for", never the position.
+        let position: Position = serde_json::from_value(tuple(json!(null))).unwrap();
+        assert_eq!((position.opened_at_ms, position.entry_price), (None, 827_935));
     }
 
     #[test]

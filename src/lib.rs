@@ -1,5 +1,6 @@
 pub mod bot;
 pub mod config;
+pub mod economics;
 pub mod market;
 pub mod protocol;
 pub mod session_keys;

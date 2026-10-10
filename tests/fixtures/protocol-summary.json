@@ -1,0 +1,38 @@
+{
+  "ok": true,
+  "source": {
+    "block": "48162378",
+    "at": 1791629504000,
+    "genesis": 1791326520000
+  },
+  "balances": {
+    "tvl": "102451759386718770000000000",
+    "margin": "0",
+    "lp": "0",
+    "reserve": "0",
+    "queue": "0"
+  },
+  "activity": {
+    "volume": "0",
+    "open": 0
+  },
+  "fees": {
+    "pending": "0",
+    "lifetime": "0"
+  },
+  "paper": {
+    "supply": "0",
+    "staked": "0",
+    "trackedLp": "0",
+    "accumulator": "0",
+    "tailProgress": "0",
+    "reserve": "0",
+    "unallocated": "0",
+    "pendingRewards": "0",
+    "cliff": "2000000000000000000000000",
+    "cap": "5000000000000000000000000",
+    "excess": "0",
+    "rate": "100000000000000000000",
+    "decay": "120000000000000000000000000"
+  }
+}
