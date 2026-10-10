@@ -327,6 +327,7 @@ mod tests {
                 positions: position.into_iter().collect(),
             }),
             pending_intents: 0,
+            has_wallet_key: false,
         }
     }
 
@@ -357,6 +358,9 @@ mod tests {
                     leg(Side::Long, "0x02b439b469daedb910fdbb6d7cdc875c38161a78", Some(position(true))),
                     leg(Side::Short, "0x70997970c51812dc3a010c7d01b50e0d17dc79c8", Some(position(false))),
                 ],
+                estimate: None,
+                funds: None,
+                transfer: None,
             }),
             mode: Mode::Run,
             events: vec![EventRow {

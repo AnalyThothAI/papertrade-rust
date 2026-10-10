@@ -661,6 +661,7 @@ impl Bot {
                         .collect(),
                 }),
                 pending_intents: self.inflight.iter().filter(|entry| entry.side == side).count(),
+                has_wallet_key: false,
             }
         };
         let phase = Phase::of(accounts.long.as_ref(), accounts.short.as_ref(), &self.market);
@@ -698,6 +699,9 @@ impl Bot {
             }),
             queue_total_usd: queue_total.map(format_amount),
             legs: vec![leg(Side::Long), leg(Side::Short)],
+            estimate: None,
+            funds: None,
+            transfer: None,
         }
     }
 }
