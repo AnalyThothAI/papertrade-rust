@@ -1,0 +1,44 @@
+{
+  "address": "0x000000000000000000000000000000000000dEaD",
+  "indexedThroughBlock": 48153567,
+  "indexedThroughTimestamp": 1791620837,
+  "sessionKeys": [["0xd3d94506d082e545de3ef5d5341726514319b7bc", "1794212392"]],
+  "walletRevision": 48153144,
+  "queueRevision": "1",
+  "balance": "673377893000000000000",
+  "queued": "0",
+  "locked": "0",
+  "funds": {
+    "reservedBalance": "0",
+    "reservedQueued": "0",
+    "availableBalance": "673377893000000000000",
+    "availableQueued": "0"
+  },
+  "queueNodeCount": 0,
+  "consumableDebt": "0",
+  "paper": { "balance": "0", "staked": "0", "pendingBase": "0", "rewardDebt": "0" },
+  "lifetime": {
+    "depositedRaw": "673377893000000000000",
+    "withdrawnRaw": "0",
+    "realizedPnlRaw": "0",
+    "feesPaidRaw": "0",
+    "tradedNotionalRaw": "0",
+    "paperRewardsClaimedRaw": "0"
+  },
+  "openPositions": [],
+  "operations": [
+    [
+      "0xe2218a94cd3658636838d5af629d6c3844af3a5642058c02c7f94758ca68794b",
+      "registerSessionKey",
+      null,
+      null,
+      null,
+      null,
+      null,
+      1791620388061,
+      "1791623993",
+      null
+    ]
+  ],
+  "accountRevision": 1
+}

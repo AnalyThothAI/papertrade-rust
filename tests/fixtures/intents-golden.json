@@ -1,0 +1,56 @@
+{
+  "open": {
+    "intentId": "0x1db7f9be0cfb8a210ac2b2e43e5b5f96cc0e673bcec79ddb7c2a602d3ee2b994",
+    "body": {
+      "action": "openPosition",
+      "signed": {
+        "user": "0x70997970c51812dc3a010c7d01b50e0d17dc79c8",
+        "instrumentId": "0",
+        "isLong": true,
+        "size": "500000000000000000000",
+        "leverage": "20",
+        "useDebt": false,
+        "nonce": "3912476160",
+        "deadline": "1791621690",
+        "v": "28",
+        "r": "0x13df215e2006a96a41ae57bba049eaedf41ec08b9f07b4086536f8542d6fb963",
+        "s": "0x7f918635e41634c41981a68b1d08a5e798674311a6d1c438e963f7556896565c"
+      }
+    }
+  },
+  "close": {
+    "intentId": "0xed89acb453ffe9c2176a0acf931e16d179e53d82b0c8e7ea63ac8b83083784d2",
+    "body": {
+      "action": "closePositions",
+      "signed": {
+        "user": "0x70997970c51812dc3a010c7d01b50e0d17dc79c8",
+        "positionIds": [
+          "42",
+          "18446744073709551616"
+        ],
+        "nonce": "3912476161",
+        "deadline": "1791621690",
+        "v": "27",
+        "r": "0x47874b5cebd163561f97392e86f844ca0e649c790244493655ec307fe3099eb1",
+        "s": "0x25afc1c197556bc4efaa5942372ef548ed47e5c98bab5a544bca8e9e338bc1b3"
+      }
+    }
+  },
+  "register": {
+    "intentId": "0x9ca253c0a6ddc476fe46589eb21bc72615dbefcd01d1fee31453e6e02c75519d",
+    "body": {
+      "action": "registerSessionKey",
+      "signed": {
+        "user": "0x70997970c51812dc3a010c7d01b50e0d17dc79c8",
+        "key": "0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266",
+        "expiry": "1794212392",
+        "feeAddress": "0x0000000000000000000000000000000000000000",
+        "nonce": "256",
+        "deadline": "1791625000",
+        "v": "27",
+        "r": "0x1029bbc70330baecfcc04f5b4f1931e611eb24810fc2eb479fbae8f6f0e4e3eb",
+        "s": "0x29c7f8447bc93deb58cadb9716aa6bf28d9afc4286eb4f8c8b3a57003eb6f4ac"
+      }
+    }
+  }
+}

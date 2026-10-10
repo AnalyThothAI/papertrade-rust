@@ -1,0 +1,42 @@
+[package]
+name = "papertrade"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.98"
+description = "Two-account hedged PAPER farming bot for Papertrade (HyperEVM)"
+publish = false
+
+[dependencies]
+alloy = { version = "2", default-features = false, features = ["std", "eip712", "getrandom", "signer-local", "signers", "sol-types"] }
+anyhow = "1"
+chrono = { version = "0.4", default-features = false, features = ["std"] }
+clap = { version = "4", features = ["derive", "env"] }
+crossterm = { version = "0.29", features = ["event-stream"] }
+dotenvy = "0.15"
+eventsource-stream = "0.2"
+futures = { version = "0.3", default-features = false, features = ["std"] }
+hypersdk = "=0.2.18"
+rand = "0.9"
+ratatui = "0.30"
+rust_decimal = "1"
+reqwest = { version = "0.13", features = ["json", "stream"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "sqlite", "migrate", "macros"] }
+thiserror = "2"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "sync", "time"] }
+tracing = "0.1"
+tracing-subscriber = "0.3"
+
+[dev-dependencies]
+alloy = { version = "2", default-features = false, features = ["dyn-abi", "eip712"] }
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+
+[profile.release]
+lto = "thin"
+strip = true
