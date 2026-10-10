@@ -21,10 +21,10 @@ papertrade-rust 是 [Papertrade](https://docs.papertrade.xyz/)（HyperEVM 上的
 - **可见**：终端面板 `tui` 和纯文本 `status` 显示它看到什么、打算做什么、做过什么，以及每一轮的成本与 PAPER 预估。
 - **可干预**：`pause` / `resume` / `flatten` 随时改变它的行为，不需要停进程。
 - **密钥加密存放**：session key 和可选的主钱包私钥以密文落盘，启动时在终端输入一次密码解锁。
-- **可选的资金自动化**：主钱包私钥在场时自动注册和续期 session key；再单独打开再平衡，才会在两个账户之间自动转移资金。两者默认关闭。
+- **可选的资金自动化**：主钱包私钥在场时自动注册和续期 session key；再单独打开再平衡，才会在两个账户之间自动转移资金。变量不设时两者都关闭；示例配置 `.env.example` 打开了前者。
 
 > [!WARNING]
-> **它会用真实资金下单，风险自负。** 默认 `PT_DRY_RUN=true`：只决策和记录，不签名、不提交。
+> **它会用真实资金下单，风险自负。** 示例配置 `.env.example` 就是实盘（`PT_DRY_RUN=false`）。想先只看决定、不动真钱，把它改成 `true`：只决策和记录，不签名、不提交。
 >
 > - 协议没有公开 API。线路协议来自官方前端（`exchange.papertrade.xyz`）的实际行为，随时可能变化。
 > - 合约是可升级代理。
@@ -256,14 +256,22 @@ cargo build --release
 cp .env.example .env
 ```
 
-编辑 `.env`，填入两个钱包的地址，其余先保持默认：
+编辑 `.env`，填入两个钱包的地址。示例文件是一套**实盘**配置，其余几行是：
 
 ```dotenv
 PT_LONG_ACCOUNT=0x你的做多钱包地址
 PT_SHORT_ACCOUNT=0x你的做空钱包地址
-PT_DRY_RUN=true
-PT_WALLET_AUTOMATION=false
+PT_COIN=BTC
+PT_CLOSE_BPS=50
+PT_DRY_RUN=false
+PT_WALLET_AUTOMATION=true
+PT_REBALANCE=false
 ```
+
+- **`PT_DRY_RUN=false` 是实盘**：`run` 起来后条件一满足就会真的签名、下单。想先演练，把它改成 `true`，以后再按[第 7 步](#7-从-dry-run-到实盘)切换。
+- **`PT_WALLET_AUTOMATION=true`** 让机器人持有两个主钱包自己的私钥，自己注册和续期 session key。不想让这两把私钥进这台机器，把它改成 `false`，按[第 4 步](#register)手工注册。
+- **`PT_CLOSE_BPS=50`**：价格偏离开仓价 50 bps 就两边平仓。变量不设时是 100。
+- 这三行与变量不设时程序用的值不同，见[配置](#config)里的"默认"一列。
 
 - `.env` 里只放地址和开关。密码和私钥没有对应的变量或参数，只从终端输入。
 - 不用的变量保持注释；留空值会报错。
@@ -276,7 +284,7 @@ PT_WALLET_AUTOMATION=false
 ./target/release/papertrade keys init
 ```
 
-第一次运行时它让你设一个密码（输入两次，至少 16 个字符），然后为两个账户各生成一把 session key，加密写进 `./secrets`，并打印两把 key 的地址。全程不联网：不注册、不提现、不转账、不下单。
+第一次运行时它让你设一个密码（输入两次，至少 16 个字符），然后为两个账户各生成一把 session key，加密写进 `./secrets`，并打印两把 key 的地址。`PT_WALLET_AUTOMATION=true`（示例配置）时，它还会用不回显的输入向你要两个主钱包的私钥，核对地址后同样加密保存。全程不联网：不注册、不提现、不转账、不下单。
 
 - **密码不写进任何地方**：不在 `.env`、参数、数据库、日志里。之后每次启动 `run` 都要输入它。**忘了密码没有后门。** 16 个字符只是下限，最好用密码管理器生成的随机密码。
 - **备份就是复制 `secrets/` 目录**，密码自己另外保管。
@@ -296,7 +304,11 @@ PT_WALLET_AUTOMATION=false
 
 ### 4. 注册 session key
 
-本地生成不等于已注册。session key 要由账户的主钱包注册后才能用，有效期 30 天。对两个账户各做一遍：
+本地生成不等于已注册。session key 要由账户的主钱包注册后才能用，有效期 30 天。
+
+`PT_WALLET_AUTOMATION=true`（示例配置）并且上一步导入了两个主钱包的私钥时，**这一步不用做**：`run` 起来后机器人自己注册，到期前自己续，见[主钱包自动化](#wallet-automation)。dry run 时它不注册。
+
+关掉了主钱包自动化，或者想自己签，就对两个账户各做一遍：
 
 ```bash
 ./target/release/papertrade session-key new long
@@ -311,7 +323,6 @@ PT_WALLET_AUTOMATION=false
 - 注册请求默认 60 分钟内可提交，用 `--valid-for-minutes` 调整。
 - `session-key submit` 是**真实的写请求**，不受 `PT_DRY_RUN` 影响。
 - 想先只看不动，可以跳过这一步：没注册时机器人只会等待，面板显示 `NOT REGISTERED`。
-- 不想手工做：打开 `PT_WALLET_AUTOMATION` 并用 `keys init` 导入两个主钱包的私钥后，机器人自己注册和续期，见[主钱包自动化](#wallet-automation)。
 
 ### 5. 启动
 
@@ -319,7 +330,7 @@ PT_WALLET_AUTOMATION=false
 ./target/release/papertrade run
 ```
 
-输入一次密码。`PT_DRY_RUN=true` 时它只决策和记录，不签名、不提交。日志写到标准错误，出现 `bot started` 就是起来了。
+输入一次密码。示例配置是实盘：条件一满足它就会真的开仓。`PT_DRY_RUN=true` 时它只决策和记录，不签名、不提交。日志写到标准错误，出现 `bot started` 就是起来了。
 
 - **它是一个普通的前台程序。** `Ctrl-C`、`SIGTERM` 或所在终端关闭都会让它做完当前这一拍后退出。想让它在你断开连接后继续运行，要自己让它所在的终端会话保持存在；这部分不归本工具管。
 - **密码只在启动时输入一次，而且只从终端输入。** 没有终端（管道、重定向的标准输入）时 `run` 直接拒绝启动。
@@ -350,7 +361,7 @@ PT_WALLET_AUTOMATION=false
 
 ### 7. 从 dry run 到实盘
 
-dry run 的决定和实盘用的是同一个函数：条件全部满足时，决定会显示为 `open both legs: margin 500.00 USD at 20x`，只是不发出。确认面板上的账户、余额、session key 和预估都符合预期之后：
+如果你在第 2 步把 `PT_DRY_RUN` 改成了 `true`，这一步把它切回实盘。dry run 的决定和实盘用的是同一个函数：条件全部满足时，决定会显示为 `open both legs: margin 500.00 USD at 20x`，只是不发出。确认面板上的账户、余额、session key 和预估都符合预期之后：
 
 1. 在运行 `run` 的终端按 `Ctrl-C` 停掉它。
 2. 把 `.env` 里的 `PT_DRY_RUN` 改成 `false`。
@@ -532,6 +543,8 @@ flowchart LR
 
 命令行参数或环境变量，`.env` 会被自动读取。每个变量都有对应的命令行参数（例如 `PT_CLOSE_BPS` 对应 `--close-bps`），见 `papertrade --help`。开关类变量要写明 `true` 或 `false`。
 
+下表的"默认"是变量没有设置时程序用的值。`.env.example` 是一套实盘配置，有三处与它不同：`PT_CLOSE_BPS=50`、`PT_DRY_RUN=false`、`PT_WALLET_AUTOMATION=true`。
+
 | 变量 | 默认 | 含义 |
 | :--- | :--- | :--- |
 | `PT_LONG_ACCOUNT` / `PT_SHORT_ACCOUNT` | — | 做多 / 做空账户的主钱包地址，必须是两个不同的钱包 |
@@ -567,7 +580,7 @@ flowchart LR
 
 `PT_WALLET_AUTOMATION=true` 让机器人持有两个主钱包自己的私钥。打开后再运行一次 `keys init`，它会用不回显的输入向你要这两把私钥。
 
-| | `PT_WALLET_AUTOMATION=false`（默认） | `PT_WALLET_AUTOMATION=true` |
+| | `PT_WALLET_AUTOMATION=false`（变量不设时） | `PT_WALLET_AUTOMATION=true`（示例配置） |
 | :--- | :--- | :--- |
 | 这台机器上的密钥 | 两把 session key | 再加两个主钱包的私钥 |
 | 泄露的最坏情况 | 交易余额被恶意交易亏掉；不能提现 | 钱包能做的一切 |
