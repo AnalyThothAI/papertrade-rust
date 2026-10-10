@@ -788,6 +788,41 @@ impl Harness {
         bot::run_with(&self.config, self.store.clone(), client, price, fast(), std::future::pending()).await
     }
 
+    /// Removes the session key files, as on a machine that was never set up.
+    pub fn forget_session_keys(&self) {
+        std::fs::remove_dir_all(&self.config.keys_dir).unwrap();
+    }
+
+    /// Starts the bot the way the CLI does: restarted in-process when it cannot go on.
+    /// Its first `dead_feeds` starts get a price feed that ends at once.
+    pub fn start_self_healing_bot(&mut self, dead_feeds: usize) {
+        let (stop, stopped) = oneshot::channel::<()>();
+        let (config, store, sim) = (self.config.clone(), self.store.clone(), self.sim.clone());
+        let bot = tokio::spawn(async move {
+            let stop = futures::FutureExt::shared(async {
+                let _ = stopped.await;
+            });
+            let mut starts = 0;
+            let start = || {
+                starts += 1;
+                let dead = starts <= dead_feeds;
+                let (config, store, quote) = (config.clone(), store.clone(), sim.quote());
+                let client = Client::with_origin(&sim.url).unwrap();
+                async move {
+                    let price = move |_, tasks: &mut tokio::task::JoinSet<()>| {
+                        if dead {
+                            tasks.spawn(async {});
+                        }
+                        quote
+                    };
+                    bot::start_with(&config, store, client, price, fast()).await
+                }
+            };
+            bot::keep_running(start, Duration::from_millis(100), stop).await
+        });
+        self.bot = Some((stop, bot));
+    }
+
     /// Stops the bot gracefully and returns how it ended.
     pub async fn stop_bot(&mut self) -> Result<()> {
         let (stop, bot) = self.bot.take().expect("the bot is running");

@@ -4,7 +4,7 @@ papertrade-rust 是 [Papertrade](https://docs.papertrade.xyz/) 的双账户对�
 
 ## 工作区：主 checkout 永远在 main
 
-主 checkout（克隆下来的那个目录）有两个用途：跟随 `origin/main`，以及运行。常驻服务用的就是它的 `target/release/papertrade`、`.env`、`data/`、`secrets/`。所以：
+主 checkout（克隆下来的那个目录）有两个用途：跟随 `origin/main`，以及运行。实际在跑的 `papertrade run` 用的就是它的 `target/release/papertrade`、`.env`、`data/`、`secrets/`。所以：
 
 - **不在主 checkout 切分支、提交、改文件。** 它只做 `git pull --ff-only`。
 - **每个任务一个 worktree**，从最新的 `origin/main` 开出，分支名即任务名：
@@ -34,11 +34,11 @@ papertrade-rust 是 [Papertrade](https://docs.papertrade.xyz/) 的双账户对�
 ```bash
 git pull --ff-only
 cargo build --release
-systemctl --user restart papertrade
-papertrade status
 ```
 
-不从 worktree 或未合并的分支运行会下单的进程。常驻运行用 systemd 用户服务（[`deploy/papertrade.service`](deploy/papertrade.service)），不靠某个终端会话活着；看面板用 zellij 布局（[`deploy/dashboard.kdl`](deploy/dashboard.kdl)）。同一个数据目录只允许一个 `run` 进程。
+然后在运行它的那个终端里停掉 `papertrade run`（`Ctrl-C`）再启动。不从 worktree 或未合并的分支运行会下单的进程。
+
+本工具是一个普通的命令行程序加面板。它在哪个终端、哪个复用器里跑，要不要开机自启，都由使用者自己决定：仓库里不放 systemd 单元、tmux 或 zellij 配置，代码也不依赖它们。需要长期在线的能力（断线重连、任务失败后重新开始）做在程序自己里面。
 
 需要用户明确同意的事：把 `PT_DRY_RUN` 改成 `false`、调整仓位或杠杆、注册或更换 session key、动用任何资金、删除 `data/` 或 `secrets/`。
 

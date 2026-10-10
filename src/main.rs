@@ -1,11 +1,12 @@
 use std::fmt::Write as _;
 use std::fs;
 use std::io::{IsTerminal, Write as _};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use alloy::primitives::{Address, Signature};
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
+use futures::FutureExt;
 use papertrade::config::Config;
 use papertrade::protocol::client::Client;
 use papertrade::protocol::deployment::SESSION_KEY_TTL_SECONDS;
@@ -79,7 +80,8 @@ async fn main() -> Result<()> {
                 .init();
             let store = Store::open(&config.database()).await?;
             let _only_one = lock_data_dir(&config)?;
-            bot::run(&config, store, shutdown_signal()).await
+            let stop = shutdown_signal().shared();
+            bot::keep_running(|| bot::start(&config, store.clone()), RESTART_DELAY, stop).await
         }
         Command::Tui => tui::run(&Store::open(&config.database()).await?).await,
         Command::Status => status(&Store::open(&config.database()).await?).await,
@@ -105,6 +107,9 @@ fn lock_data_dir(config: &Config) -> Result<fs::File> {
     }
     Ok(lock)
 }
+
+/// How long to wait before starting over after the bot stopped on its own.
+const RESTART_DELAY: Duration = Duration::from_secs(5);
 
 /// Resolves on Ctrl-C or SIGTERM.
 async fn shutdown_signal() {
