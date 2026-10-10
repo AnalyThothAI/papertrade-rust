@@ -9,6 +9,7 @@ pub mod status;
 pub mod store;
 pub mod strategy;
 pub mod tui;
+pub mod wallet;
 
 #[cfg(test)]
 mod testing;

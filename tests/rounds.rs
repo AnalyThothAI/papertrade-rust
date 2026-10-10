@@ -596,3 +596,899 @@ async fn a_contract_call_that_reverts_is_an_error() {
         h.sim.chain().call(h.long, alloy::primitives::Bytes::from_static(&[0x12, 0x34, 0x56, 0x78])).await;
     assert!(reply.unwrap_err().to_string().contains("execution reverted"));
 }
+
+/// Funds moving between the two accounts, and the wallet keys that make it possible.
+mod funding {
+    use std::time::Duration;
+
+    use std::sync::Arc;
+
+    use alloy::primitives::{Address, U256};
+    use alloy::signers::local::PrivateKeySigner;
+    use papertrade::keystore::WalletKey;
+    use papertrade::protocol::deployment::usd;
+    use papertrade::status::Snapshot;
+    use papertrade::store::Abandoned;
+    use papertrade::strategy::decide::Mode;
+    use papertrade::strategy::transfer::Stage;
+
+    use super::support::{
+        Behavior, ENTRY, Harness, Received, SendBehavior, Setup, Sweep, TARGET, TTL, eventually,
+        eventually_stored, steadily,
+    };
+    use super::{A_WHILE, SOON};
+
+    /// The long account holds 2,000 and the short 300. Half the difference
+    /// levels them at 1,150 each; the round that opens then takes 500 from both.
+    const MOVED: u64 = 850;
+    const LEVELLED: u64 = 1_150;
+    const AFTER_OPENING: u64 = 650;
+    /// The bot counts in whole milliseconds, and the simulator sees a request a
+    /// moment after the bot looked at its clock.
+    const SLACK: Duration = Duration::from_millis(50);
+    /// The settle time of the scenarios in which an attempt is repeated.
+    const SETTLE: Duration = Duration::from_millis(600);
+
+    /// The wallet automation is on and both wallets' own keys were unlocked.
+    fn automated() -> Setup {
+        Setup { wallet_keys: true, ..Setup::default() }
+    }
+
+    fn lopsided() -> Setup {
+        Setup { long_usd: 2_000, short_usd: 300, ..automated() }
+    }
+
+    /// A harness whose bot gives an attempt only a short settle time.
+    async fn repeating(setup: Setup) -> Harness {
+        let mut h = Harness::prepare_with(setup).await;
+        h.timing.funding.transfer.settle = SETTLE;
+        h
+    }
+
+    fn withdrawals(h: &Harness) -> Vec<Received> {
+        h.sim.received().into_iter().filter(|r| r.action == "withdrawToCore").collect()
+    }
+
+    async fn transfer_stage(h: &Harness) -> Option<Stage> {
+        h.store.active_transfer().await.unwrap().map(|transfer| transfer.stage)
+    }
+
+    async fn in_stage(h: &Harness, stage: Stage) {
+        in_stage_within(h, stage, SOON).await;
+    }
+
+    async fn in_stage_within(h: &Harness, stage: Stage, within: Duration) {
+        let what = format!("the transfer is in {stage}");
+        eventually_stored(&what, within, || async { transfer_stage(h).await == Some(stage) }).await;
+    }
+
+    /// The transfer's steps on the timeline, oldest first.
+    async fn timeline(h: &Harness) -> Vec<String> {
+        let mut events = h.store.recent_events(200).await.unwrap();
+        events.reverse();
+        events.into_iter().filter(|event| event.kind == "transfer").map(|event| event.summary).collect()
+    }
+
+    async fn status_when(h: &Harness, what: &str, wanted: impl Fn(&Snapshot) -> bool) -> Snapshot {
+        let started = std::time::Instant::now();
+        loop {
+            if let Some(status) = h.store.read_status().await.unwrap().filter(&wanted) {
+                return status;
+            }
+            assert!(started.elapsed() < SOON, "timed out after {SOON:?} waiting for: {what}");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    /// The round opened on level accounts, and nothing is left anywhere on the way.
+    fn assert_levelled_and_trading(h: &Harness) {
+        assert_eq!((h.sim.balance(h.long), h.sim.balance(h.short)), (usd(AFTER_OPENING), usd(AFTER_OPENING)));
+        for wallet in [h.long, h.short] {
+            assert_eq!(h.sim.core_usdc(wallet), U256::ZERO);
+            assert_eq!(h.sim.core_usdc(h.sim.deposit_address(wallet)), U256::ZERO);
+        }
+        assert_eq!(h.opens(), 2);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn lopsided_accounts_are_levelled_through_hypercore_and_then_trade() {
+        let mut h = Harness::prepare_with(lopsided()).await;
+        // The relayer credits a deposit only when asked to look, and when it answers
+        // it names an address that is not the short account's deposit address.
+        let decoy = Address::repeat_byte(0xde);
+        h.sim.set_sweep(Sweep::OnCheck);
+        h.sim.answer_deposit_checks_with(decoy);
+        h.start_bot();
+        h.hedged().await;
+
+        // One withdrawal, by the richer account. One send, to the poorer account's
+        // deposit address as the chain derives it.
+        assert_eq!((h.sim.count(h.long, "withdrawToCore"), h.sim.count(h.short, "withdrawToCore")), (1, 0));
+        let sends = h.sim.sends();
+        assert_eq!(sends.len(), 1);
+        assert_eq!(
+            (sends[0].from, sends[0].destination, sends[0].amount_usdc),
+            (h.long, h.sim.deposit_address(h.short), MOVED)
+        );
+        assert!(h.sim.deposit_checks(h.short) >= 1);
+        assert_eq!(h.sim.deposit_checks(h.long), 0);
+        assert_eq!(h.sim.core_usdc(decoy), U256::ZERO);
+        assert_levelled_and_trading(&h);
+        // The sender's HyperCore balance was followed while the transfer needed it, and no longer.
+        let reads = h.sim.hypercore_reads();
+        assert!(reads > 0);
+        steadily("Hyperliquid is left alone once the transfer is done", A_WHILE, || {
+            h.sim.hypercore_reads() == reads
+        })
+        .await;
+
+        let address = h.sim.deposit_address(h.short);
+        assert_eq!(
+            timeline(&h).await[..5],
+            [
+                "transfer #1 started: 850 USDC from the long account to the short account".to_owned(),
+                "transfer #1 withdrawing 850 USDC from the long account to its wallet's HyperCore account \
+                 (attempt 1)"
+                    .to_owned(),
+                "transfer #1 the withdrawal arrived: 850 USDC are in the long wallet's HyperCore account".to_owned(),
+                format!(
+                    "transfer #1 sending 850 USDC on Hyperliquid from the long wallet to the short account's \
+                     deposit address {address} (attempt 1)"
+                ),
+                "transfer #1 850 USDC left the long wallet on Hyperliquid; waiting for the short account's credit"
+                    .to_owned(),
+            ]
+        );
+        let steps = timeline(&h).await;
+        assert_eq!(steps.len(), 6, "{steps:?}");
+        assert!(steps[5].starts_with("transfer #1 done: the short account was credited"), "{steps:?}");
+        assert_eq!(h.store.active_transfer().await.unwrap(), None);
+
+        // The withdrawal went through the journal like every other intent.
+        eventually_stored("the withdrawal is settled in the journal", TTL + SOON, || async {
+            h.store.unresolved_intents().await.unwrap().is_empty()
+        })
+        .await;
+        let journal = h.store.recent_intents(10).await.unwrap();
+        let withdrawal = journal.iter().find(|row| row.action == "withdrawToCore").unwrap();
+        assert_eq!((withdrawal.side.as_str(), withdrawal.status.as_str()), ("long", "settled"));
+        // The relayer's word on how it ended is on record unless the stream was
+        // between two connections when it was sent. The transfer never needed it.
+        assert!(matches!(withdrawal.outcome.as_deref(), None | Some("succeeded")), "{withdrawal:?}");
+
+        let status = status_when(&h, "the status shows the round", |status| status.decision == "wait").await;
+        assert_eq!(status.transfer, None);
+        let funds = status.funds.unwrap();
+        assert_eq!((funds.verdict.as_str(), funds.can_rebalance), ("enough", true));
+        assert_eq!((funds.total_usd.as_str(), funds.difference_usd.as_str()), ("2300.00", "0.00"));
+        assert!(status.legs.iter().all(|leg| leg.has_wallet_key));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_status_shows_a_transfer_while_it_is_under_way() {
+        let mut h = Harness::prepare_with(lopsided()).await;
+        h.sim.set_sweep(Sweep::Never);
+        h.start_bot();
+        in_stage(&h, Stage::Credit).await;
+        let status = status_when(&h, "the status shows the transfer", |status| {
+            status
+                .transfer
+                .as_ref()
+                .is_some_and(|transfer| transfer.stage == "credit" && transfer.note.is_some())
+        })
+        .await;
+        assert_eq!(status.summary, "flat; rebalancing: funds are moving between the two accounts");
+        let transfer = status.transfer.unwrap();
+        assert_eq!((transfer.from.as_str(), transfer.to.as_str()), ("long", "short"));
+        assert_eq!(transfer.amount_usd, "850.00");
+        assert_eq!(transfer.note.as_deref(), Some("waiting for the relayer to credit the short account"));
+        // What has left one account and not reached the other is missing from the total.
+        let funds = status.funds.unwrap();
+        assert_eq!((funds.total_usd.as_str(), funds.verdict.as_str()), ("1450.00", "rebalance"));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_account_that_can_open_but_could_not_absorb_a_loss_is_topped_up_first() {
+        // 550 covers the 500 margin, but not the 100 a losing round takes on top.
+        let mut h = Harness::prepare_with(Setup { short_usd: 550, ..lopsided() }).await;
+        h.start_bot();
+        h.hedged().await;
+        assert_eq!(withdrawals(&h).len(), 1);
+        assert_eq!(h.sim.sends()[0].amount_usdc, 725);
+        // 1,275 each, less the margin of the round that opened afterwards.
+        assert_eq!((h.sim.balance(h.long), h.sim.balance(h.short)), (usd(775), usd(775)));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_difference_too_small_to_move_does_not_hold_up_the_round() {
+        // The short account is 5 short of margin plus loss, but half the difference
+        // is 7 USDC: less than the relayer would take. Both can post the margin.
+        let mut h = Harness::prepare_with(Setup { long_usd: 610, short_usd: 595, ..lopsided() }).await;
+        h.start_bot();
+        h.hedged().await;
+        assert!(withdrawals(&h).is_empty() && h.sim.sends().is_empty());
+        assert_eq!(h.store.active_transfer().await.unwrap(), None);
+    }
+
+    // --- killed in each stage ------------------------------------------------------
+    // The bot is killed where it stands, not stopped: whatever it was in the
+    // middle of does not get to finish. The next process has the record and the
+    // balances, nothing else.
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_bot_killed_while_the_withdrawal_is_queued_does_not_withdraw_twice() {
+        let mut h = Harness::prepare_with(lopsided()).await;
+        h.sim.script(h.long, "withdrawToCore", &[Behavior::Hold]);
+        h.start_bot();
+        eventually("the withdrawal is queued", SOON, || h.sim.queued(h.long) == 1).await;
+        h.kill_bot().await;
+        assert_eq!(transfer_stage(&h).await, Some(Stage::Withdraw));
+
+        // The new process finds the withdrawal in its journal and waits for it.
+        h.start_bot();
+        steadily("no second withdrawal", Duration::from_millis(400), || {
+            withdrawals(&h).len() == 1 && h.sim.sends().is_empty()
+        })
+        .await;
+        h.sim.release();
+        h.hedged().await;
+        assert_eq!((withdrawals(&h).len(), h.sim.sends().len()), (1, 1));
+        assert_levelled_and_trading(&h);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_bot_killed_while_hyperliquid_is_moving_the_funds_does_not_send_twice() {
+        let mut h = Harness::prepare_with(lopsided()).await;
+        h.sim.hold_sends();
+        h.start_bot();
+        eventually("the send is made", SOON, || h.sim.sends().len() == 1).await;
+        h.kill_bot().await;
+        assert_eq!(transfer_stage(&h).await, Some(Stage::Send));
+        assert_eq!(h.sim.core_usdc(h.long), usd(MOVED));
+
+        h.start_bot();
+        steadily("the send is not repeated", A_WHILE, || h.sim.sends().len() == 1).await;
+        h.sim.release_sends();
+        h.hedged().await;
+        assert_eq!((withdrawals(&h).len(), h.sim.sends().len()), (1, 1));
+        assert_levelled_and_trading(&h);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_bot_killed_while_the_credit_is_awaited_neither_withdraws_nor_sends_again() {
+        let mut h = Harness::prepare_with(lopsided()).await;
+        h.sim.set_sweep(Sweep::Never);
+        h.start_bot();
+        in_stage(&h, Stage::Credit).await;
+        h.kill_bot().await;
+
+        h.start_bot();
+        steadily("nothing is withdrawn or sent again", A_WHILE, || {
+            withdrawals(&h).len() == 1 && h.sim.sends().len() == 1 && h.opens() == 0
+        })
+        .await;
+        h.sim.set_sweep(Sweep::After(Duration::ZERO));
+        h.hedged().await;
+        assert_eq!((withdrawals(&h).len(), h.sim.sends().len()), (1, 1));
+        assert_levelled_and_trading(&h);
+    }
+
+    // --- the withdrawal ------------------------------------------------------------
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_refused_withdrawal_is_signed_again_once_the_balances_show_nothing_moved() {
+        let mut h = repeating(lopsided()).await;
+        h.sim.script(h.long, "withdrawToCore", &[Behavior::Reject("rate_limited", "")]);
+        h.start_bot();
+        h.hedged().await;
+        let attempts = withdrawals(&h);
+        assert_eq!(attempts.len(), 2);
+        assert_ne!(attempts[0].intent_id, attempts[1].intent_id);
+        // Not at once: the balances have to be read after the settle time first.
+        // By the bot's own journal, which is where it measures from.
+        let journal = h.store.recent_intents(10).await.unwrap();
+        let signed_at: Vec<i64> = journal
+            .iter()
+            .filter(|row| row.action == "withdrawToCore")
+            .map(|row| row.created_at_ms)
+            .collect();
+        let [second, first] = signed_at[..] else { panic!("{journal:?}") };
+        let settle = i64::try_from(h.timing.funding.transfer.settle.as_millis()).unwrap();
+        assert!(second - first >= settle, "signed again after {} ms", second - first);
+        assert_eq!(h.sim.sends().len(), 1);
+        assert_levelled_and_trading(&h);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_unanswered_withdrawal_is_not_signed_again_before_its_deadline_has_passed() {
+        let mut h = repeating(lopsided()).await;
+        h.sim.script(h.long, "withdrawToCore", &[Behavior::Drop]);
+        h.start_bot();
+        eventually("the withdrawal is sent", SOON, || withdrawals(&h).len() == 1).await;
+        // It never reached the relayer, but the bot cannot know: it may still execute.
+        steadily(
+            "no second withdrawal while the first could still execute",
+            Duration::from_millis(1_500),
+            || withdrawals(&h).len() == 1,
+        )
+        .await;
+        eventually("both legs open once it has expired and been repeated", TTL + SOON, || {
+            h.sim.positions(h.long).len() == 1 && h.sim.positions(h.short).len() == 1
+        })
+        .await;
+        let attempts = withdrawals(&h);
+        assert_eq!(attempts.len(), 2);
+        let waited = attempts[1].at - attempts[0].at;
+        assert!(waited + SLACK >= TTL, "{waited:?}");
+        assert_eq!(h.sim.sends().len(), 1);
+        assert_levelled_and_trading(&h);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_unanswered_withdrawal_that_did_execute_is_not_repeated() {
+        let mut h = Harness::prepare_with(lopsided()).await;
+        h.sim.script(h.long, "withdrawToCore", &[Behavior::AcceptSilently]);
+        h.start_bot();
+        h.hedged().await;
+        assert_eq!((withdrawals(&h).len(), h.sim.sends().len()), (1, 1));
+        assert_levelled_and_trading(&h);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_withdrawal_whose_outcome_was_never_seen_is_not_repeated_while_the_balance_shows_it_left() {
+        let mut h = repeating(lopsided()).await;
+        // The withdrawal executes while the account streams are down, so the bot
+        // never hears how it ended. It also takes long to reach HyperCore: well
+        // past its deadline and the settle time after it.
+        h.sim.hold_arrivals();
+        h.sim.script(h.long, "withdrawToCore", &[Behavior::Hold]);
+        h.start_bot();
+        eventually("the withdrawal is queued", SOON, || h.sim.queued(h.long) == 1).await;
+        h.sim.set_stream_up(false);
+        h.sim.release();
+        eventually("the withdrawal executes unseen", SOON, || h.sim.balance(h.long) == usd(LEVELLED)).await;
+        h.sim.set_stream_up(true);
+
+        // The deadline passes with nothing on HyperCore. But Papertrade no longer
+        // holds the funds, so the withdrawal happened: it is not signed again.
+        steadily("no second withdrawal", TTL + Duration::from_millis(2_000), || {
+            withdrawals(&h).len() == 1 && h.sim.core_usdc(h.long) == U256::ZERO
+        })
+        .await;
+        h.sim.release_arrivals();
+        h.hedged().await;
+        assert_eq!((withdrawals(&h).len(), h.sim.sends().len()), (1, 1));
+        assert_levelled_and_trading(&h);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_withdrawal_that_arrives_short_is_not_sent_on() {
+        let mut h = Harness::prepare_with(lopsided()).await;
+        h.timing.funding.transfer.stuck_after = Duration::from_millis(500);
+        // HyperCore keeps 1 USDC, as it does to activate an account that is new to it.
+        h.sim.set_arrival_fee(1);
+        h.start_bot();
+        // Stuck once the withdrawal can no longer execute and the time allowed is over.
+        in_stage_within(&h, Stage::Stuck, TTL + SOON).await;
+        let stuck = h.store.active_transfer().await.unwrap().unwrap();
+        assert_eq!(
+            stuck.note.as_deref(),
+            Some(
+                "stuck in withdraw: the withdrawal of 850 USDC ended, but the long wallet's HyperCore balance \
+                 did not rise by that much; compare the long account's Papertrade balance with its HyperCore \
+                 account"
+            )
+        );
+        // What arrived stays where it is: no send of an amount that is not there, no second withdrawal.
+        assert_eq!(h.sim.core_usdc(h.long), usd(MOVED - 1));
+        assert!(h.sim.sends().is_empty());
+        assert_eq!(withdrawals(&h).len(), 1);
+        assert_eq!(h.opens(), 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_withdrawal_that_is_refused_three_times_leaves_the_transfer_stuck_with_nothing_moved() {
+        let mut h = repeating(lopsided()).await;
+        h.sim.script(h.long, "withdrawToCore", &[Behavior::Reject("rate_limited", ""); 3]);
+        h.start_bot();
+        in_stage(&h, Stage::Stuck).await;
+        let stuck = h.store.active_transfer().await.unwrap().unwrap();
+        assert_eq!(
+            stuck.note.as_deref(),
+            Some(
+                "stuck in withdraw: the withdrawal did not go through in 3 attempts; nothing has left the long \
+                 account"
+            )
+        );
+        assert_eq!(withdrawals(&h).len(), 3);
+        steadily("nothing is tried a fourth time", A_WHILE, || withdrawals(&h).len() == 3).await;
+        assert_eq!((h.sim.balance(h.long), h.sim.balance(h.short)), (usd(2_000), usd(300)));
+        assert!(h.sim.sends().is_empty());
+
+        // Abandoned, the accounts are judged afresh: still lopsided, so a new transfer starts.
+        assert!(matches!(h.store.abandon_stuck_transfer().await.unwrap(), Abandoned::Ended(_)));
+        h.hedged().await;
+        assert_eq!((withdrawals(&h).len(), h.sim.sends().len()), (4, 1));
+        assert_levelled_and_trading(&h);
+        assert!(timeline(&h).await.iter().any(|step| step.starts_with("transfer #2 done")));
+    }
+
+    // --- the Hyperliquid send ------------------------------------------------------
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_send_that_never_arrived_is_repeated_after_the_settle_time() {
+        let mut h = repeating(lopsided()).await;
+        h.sim.script_sends(&[SendBehavior::Lose]);
+        h.start_bot();
+        h.hedged().await;
+        // The first was lost, the second went through. On a slow machine a third
+        // may follow before the balance is read again; it changes nothing.
+        let sends = h.sim.sends();
+        assert!(!sends[0].taken && sends[1].taken, "{sends:?}");
+        assert_eq!(sends.iter().filter(|send| send.taken).count(), 1);
+        assert!(sends.iter().all(|send| send.nonce == sends[0].nonce));
+        // Not at once. Seen from the receiving end the two are a settle time apart
+        // give or take what the bot does before each send, so the bar is half of it.
+        let waited = sends[1].at - sends[0].at;
+        assert!(waited >= h.timing.funding.transfer.settle / 2, "{waited:?}");
+        // The repeat is the same transfer: same nonce (above), same destination, same amount.
+        assert_eq!(sends[1].destination, h.sim.deposit_address(h.short));
+        assert_eq!(sends[1].amount_usdc, MOVED);
+        assert_eq!(withdrawals(&h).len(), 1);
+        assert_levelled_and_trading(&h);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_send_that_fails_three_times_leaves_the_transfer_stuck_with_the_funds_on_hypercore() {
+        let mut h = repeating(lopsided()).await;
+        h.sim.script_sends(&[SendBehavior::Refuse("Insufficient spot balance"); 3]);
+        h.start_bot();
+        in_stage(&h, Stage::Stuck).await;
+        let stuck = h.store.active_transfer().await.unwrap().unwrap();
+        assert_eq!(
+            stuck.note.as_deref(),
+            Some(
+                "stuck in send: Hyperliquid did not move the 850 USDC in 3 attempts; they are in the long \
+                 wallet's HyperCore account (last error: Insufficient spot balance)"
+            )
+        );
+        assert_eq!(h.sim.sends().len(), 3);
+        steadily("nothing is tried a fourth time", A_WHILE, || h.sim.sends().len() == 3).await;
+        // The funds are where the note says, and the withdrawal was not repeated.
+        assert_eq!(h.sim.core_usdc(h.long), usd(MOVED));
+        assert_eq!((h.sim.balance(h.long), h.sim.balance(h.short)), (usd(LEVELLED), usd(300)));
+        assert_eq!(withdrawals(&h).len(), 1);
+        assert_eq!(h.opens(), 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_send_that_went_through_unanswered_is_not_repeated() {
+        let mut h = Harness::prepare_with(lopsided()).await;
+        h.sim.script_sends(&[SendBehavior::DeliverSilently]);
+        h.start_bot();
+        h.hedged().await;
+        // The answer was an error, but the balance showed the funds leaving.
+        assert_eq!(h.sim.sends().len(), 1);
+        assert_eq!(withdrawals(&h).len(), 1);
+        assert_levelled_and_trading(&h);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_send_repeated_while_the_first_is_still_under_way_cannot_pay_twice() {
+        let mut h = repeating(lopsided()).await;
+        // Hyperliquid took the send but has not moved the funds by the settle time,
+        // so the bot repeats it. The repeat carries the same nonce and is refused.
+        h.sim.hold_sends();
+        h.start_bot();
+        eventually("the send is repeated", SOON, || h.sim.sends().len() == 2).await;
+        h.sim.release_sends();
+        h.hedged().await;
+        let sends = h.sim.sends();
+        assert!(sends[0].taken && sends[1..].iter().all(|send| !send.taken), "{sends:?}");
+        assert!(sends.iter().all(|send| send.nonce == sends[0].nonce));
+        // The short account was credited once: 300 + 850, less the margin now in its position.
+        assert_levelled_and_trading(&h);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_hypercore_balance_that_fell_by_less_than_the_amount_stops_the_transfer() {
+        let mut h = repeating(lopsided()).await;
+        h.sim.hold_sends();
+        h.start_bot();
+        eventually("the send is made", SOON, || h.sim.sends().len() == 1).await;
+        // The send has not moved anything yet, and something else takes 1 USDC.
+        h.sim.take_from_core(h.long, 1);
+        in_stage(&h, Stage::Stuck).await;
+        let stuck = h.store.active_transfer().await.unwrap().unwrap();
+        assert_eq!(
+            stuck.note.as_deref(),
+            Some(
+                "stuck in send: the long wallet's HyperCore balance fell, but by less than the 850 USDC that \
+                 were sent; check where the funds went"
+            )
+        );
+        // Neither taken for the send having gone through, nor answered with another send.
+        assert_eq!(h.sim.sends().len(), 1);
+        assert_eq!(h.sim.deposit_checks(h.short), 0);
+        assert_eq!(h.opens(), 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn nothing_is_sent_while_the_deposit_address_cannot_be_read_from_the_chain() {
+        let mut h = Harness::prepare_with(lopsided()).await;
+        h.sim.set_proxies_readable(false);
+        // The relayer would name an address. It is not asked where to send.
+        h.sim.answer_deposit_checks_with(Address::repeat_byte(0xde));
+        h.start_bot();
+        in_stage(&h, Stage::Send).await;
+        steadily("nothing is sent to an address the chain did not give", A_WHILE, || {
+            h.sim.sends().is_empty()
+        })
+        .await;
+        // Nothing was tried, so no attempt is used up.
+        assert_eq!(h.store.active_transfer().await.unwrap().unwrap().attempts, 0);
+        assert_eq!(h.sim.core_usdc(h.long), usd(MOVED));
+
+        h.sim.set_proxies_readable(true);
+        h.hedged().await;
+        let sends = h.sim.sends();
+        assert_eq!(sends.len(), 1);
+        assert_eq!(sends[0].destination, h.sim.deposit_address(h.short));
+        assert_levelled_and_trading(&h);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_transfer_the_other_way_goes_to_the_long_accounts_deposit_address() {
+        let setup = Setup { long_usd: 300, short_usd: 2_000, ..lopsided() };
+        let h = {
+            let mut h = Harness::prepare_with(setup).await;
+            h.start_bot();
+            h
+        };
+        h.hedged().await;
+        assert_eq!((h.sim.count(h.long, "withdrawToCore"), h.sim.count(h.short, "withdrawToCore")), (0, 1));
+        let sends = h.sim.sends();
+        assert_eq!(sends.len(), 1);
+        assert_eq!((sends[0].from, sends[0].destination), (h.short, h.sim.deposit_address(h.long)));
+        assert_levelled_and_trading(&h);
+    }
+
+    // --- the credit ----------------------------------------------------------------
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_late_credit_is_waited_for_and_asked_after() {
+        let mut h = Harness::prepare_with(lopsided()).await;
+        h.sim.set_sweep(Sweep::Never);
+        h.start_bot();
+        // One check on entering the stage, then one per interval for as long as nothing comes.
+        eventually("the relayer is asked again and again", SOON, || h.sim.deposit_checks(h.short) >= 3).await;
+        assert_eq!(h.opens(), 0);
+        h.sim.set_sweep(Sweep::After(Duration::ZERO));
+        h.hedged().await;
+        assert_eq!((withdrawals(&h).len(), h.sim.sends().len()), (1, 1));
+        assert_levelled_and_trading(&h);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_credit_one_usdc_short_completes_the_transfer() {
+        let mut h = Harness::prepare_with(lopsided()).await;
+        // What activating a deposit address costs.
+        h.sim.set_sweep_fee(1);
+        h.start_bot();
+        h.hedged().await;
+        assert_eq!((withdrawals(&h).len(), h.sim.sends().len()), (1, 1));
+        assert_eq!(
+            (h.sim.balance(h.long), h.sim.balance(h.short)),
+            (usd(AFTER_OPENING), usd(AFTER_OPENING - 1))
+        );
+        assert_eq!(h.store.active_transfer().await.unwrap(), None);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_credit_that_never_comes_leaves_the_transfer_stuck_until_the_operator_abandons_it() {
+        let mut h = Harness::prepare_with(lopsided()).await;
+        h.timing.funding.transfer.stuck_after = Duration::from_millis(800);
+        h.sim.set_sweep(Sweep::Never);
+        h.start_bot();
+        in_stage(&h, Stage::Stuck).await;
+        let stuck = h.store.active_transfer().await.unwrap().unwrap();
+        let note = "stuck in credit: 850 USDC left the long wallet but the short account was not credited; they \
+                    should be at the short account's deposit address on HyperCore";
+        assert_eq!(stuck.note.as_deref(), Some(note));
+        // The funds are where the note says.
+        assert_eq!(h.sim.core_usdc(h.sim.deposit_address(h.short)), usd(MOVED));
+        assert_eq!((h.sim.balance(h.long), h.sim.balance(h.short)), (usd(LEVELLED), usd(300)));
+
+        let status = status_when(&h, "the status shows it stuck", |status| {
+            status.transfer.as_ref().is_some_and(|transfer| transfer.stage == "stuck")
+        })
+        .await;
+        assert_eq!(status.transfer.unwrap().note.as_deref(), Some(note));
+        assert_eq!(
+            status.summary,
+            "flat; the transfer between the two accounts is stuck: resolve it, then run `papertrade rebalance \
+             abandon`"
+        );
+        assert!(timeline(&h).await.contains(&format!("transfer #1 {note}")));
+
+        // The operator gets the deposit credited. Even so the bot leaves everything
+        // alone until it is told that the transfer has been dealt with.
+        h.sim.set_sweep(Sweep::After(Duration::ZERO));
+        eventually("the deposit is credited", SOON, || h.sim.balance(h.short) == usd(LEVELLED)).await;
+        steadily("nothing more is moved or opened", A_WHILE, || {
+            withdrawals(&h).len() == 1 && h.sim.sends().len() == 1 && h.opens() == 0
+        })
+        .await;
+
+        assert_eq!(h.store.abandon_stuck_transfer().await.unwrap(), Abandoned::Ended(stuck));
+        h.hedged().await;
+        assert_eq!((withdrawals(&h).len(), h.sim.sends().len()), (1, 1));
+        assert_levelled_and_trading(&h);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_transfer_under_way_is_seen_through_while_the_bot_is_paused() {
+        let mut h = Harness::prepare_with(lopsided()).await;
+        h.sim.set_sweep(Sweep::Never);
+        h.start_bot();
+        in_stage(&h, Stage::Credit).await;
+        h.store.set_mode(Mode::Pause).await.unwrap();
+        h.sim.set_sweep(Sweep::After(Duration::ZERO));
+        eventually_stored("the transfer finishes", SOON, || async {
+            h.store.active_transfer().await.unwrap().is_none()
+        })
+        .await;
+        assert_eq!((h.sim.balance(h.long), h.sim.balance(h.short)), (usd(LEVELLED), usd(LEVELLED)));
+        steadily("paused: no round is opened", A_WHILE, || h.opens() == 0).await;
+    }
+
+    // --- when a transfer may start -------------------------------------------------
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn no_transfer_starts_while_a_round_is_open() {
+        let mut h = Harness::prepare_with(automated()).await;
+        h.start_bot();
+        h.hedged().await;
+        // The short account loses what it had outside its position.
+        h.sim.set_balance(h.short, 0);
+        steadily("nothing is withdrawn while both legs are open", A_WHILE, || withdrawals(&h).is_empty())
+            .await;
+
+        h.sim.set_mid(ENTRY + TARGET);
+        eventually("the accounts are levelled once the round has closed", SOON, || {
+            h.sim.count(h.long, "withdrawToCore") == 1
+        })
+        .await;
+        // Both closes went out before the withdrawal.
+        let received = h.sim.received();
+        let last_close = received.iter().rposition(|r| r.action == "closePositions").unwrap();
+        let withdrawal = received.iter().position(|r| r.action == "withdrawToCore").unwrap();
+        assert!(last_close < withdrawal, "{received:?}");
+        assert_eq!(h.closes(), 2);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn no_transfer_starts_while_an_open_could_still_execute() {
+        let mut h = Harness::prepare_with(automated()).await;
+        h.sim.script(h.long, "openPosition", &[Behavior::Drop]);
+        h.sim.script(h.short, "openPosition", &[Behavior::Drop]);
+        h.start_bot();
+        eventually("both opens are sent", SOON, || h.opens() == 2).await;
+        h.sim.set_balance(h.short, 300);
+        // Both accounts are flat and lopsided, but the unanswered opens are still in flight.
+        steadily("nothing is withdrawn from under an open", Duration::from_millis(1_200), || {
+            withdrawals(&h).is_empty()
+        })
+        .await;
+        eventually("levelled once the opens have expired", TTL + SOON, || {
+            h.sim.count(h.long, "withdrawToCore") == 1
+        })
+        .await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn underfunded_accounts_neither_transfer_nor_open() {
+        let mut h = Harness::prepare_with(Setup { long_usd: 600, short_usd: 399, ..lopsided() }).await;
+        h.start_bot();
+        let status = status_when(&h, "the status says so", |status| status.funds.is_some()).await;
+        assert_eq!(
+            status.summary,
+            "flat; needs funding: the two accounts together hold less than two margins"
+        );
+        let funds = status.funds.unwrap();
+        assert_eq!((funds.verdict.as_str(), funds.rounds_affordable), ("underfunded", 0));
+        steadily("nothing is moved or opened", A_WHILE, || {
+            withdrawals(&h).is_empty() && h.sim.sends().is_empty() && h.opens() == 0
+        })
+        .await;
+
+        // A deposit makes both accounts good for a round and its loss.
+        h.sim.set_balance(h.short, 700);
+        h.hedged().await;
+        assert!(withdrawals(&h).is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn without_wallet_keys_the_bot_only_says_what_has_to_be_moved() {
+        let mut h = Harness::prepare_with(Setup { wallet_keys: false, ..lopsided() }).await;
+        h.start_bot();
+        let status = status_when(&h, "the status says what to move", |status| status.funds.is_some()).await;
+        assert_eq!(
+            status.summary,
+            "flat; needs a manual rebalance: move 850 USDC from the long account to the short account (the \
+             wallets' own keys are not both unlocked)"
+        );
+        assert_eq!(status.decision, "wait");
+        let funds = status.funds.unwrap();
+        assert_eq!((funds.verdict.as_str(), funds.can_rebalance), ("rebalance", false));
+        assert_eq!((funds.total_usd.as_str(), funds.difference_usd.as_str()), ("2300.00", "1700.00"));
+        assert!(status.legs.iter().all(|leg| !leg.has_wallet_key));
+        assert_eq!(status.transfer, None);
+        steadily("nothing is moved or opened", A_WHILE, || {
+            withdrawals(&h).is_empty() && h.sim.sends().is_empty() && h.opens() == 0
+        })
+        .await;
+        assert_eq!(h.store.active_transfer().await.unwrap(), None);
+        // With no transfer to watch, Hyperliquid is not asked for anything.
+        assert_eq!(h.sim.hypercore_reads(), 0);
+
+        // The operator moves the funds by hand; the bot goes on.
+        h.sim.set_balance(h.long, LEVELLED);
+        h.sim.set_balance(h.short, LEVELLED);
+        h.hedged().await;
+        assert!(withdrawals(&h).is_empty() && h.sim.sends().is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn one_wallet_key_is_not_enough_to_rebalance() {
+        let mut h = Harness::prepare_with(lopsided()).await;
+        // The sender's key was unlocked; the receiver's could not be.
+        let reason = "no encrypted wallet key";
+        Arc::get_mut(&mut h.keys).unwrap().short.wallet = WalletKey::Unavailable(reason.into());
+        h.start_bot();
+        let status = status_when(&h, "the status says what to move", |status| status.funds.is_some()).await;
+        assert!(
+            status.summary.starts_with("flat; needs a manual rebalance: move 850 USDC"),
+            "{}",
+            status.summary
+        );
+        let keys: Vec<bool> = status.legs.iter().map(|leg| leg.has_wallet_key).collect();
+        assert_eq!(keys, [true, false]);
+        assert!(!status.funds.unwrap().can_rebalance);
+        steadily("nothing is moved", A_WHILE, || withdrawals(&h).is_empty() && h.sim.sends().is_empty())
+            .await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_dry_run_only_reports_the_rebalance_it_would_make() {
+        let mut h = Harness::prepare_with(lopsided()).await;
+        h.config.dry_run = true;
+        h.start_bot();
+        let status = status_when(&h, "the status shows the decision", |status| status.funds.is_some()).await;
+        assert_eq!(status.decision, "rebalance");
+        assert_eq!(status.summary, "rebalance: move 850 USDC from the long account to the short account");
+        steadily("nothing is recorded, signed or sent", A_WHILE, || {
+            h.sim.received().is_empty() && h.sim.sends().is_empty()
+        })
+        .await;
+        assert_eq!(h.store.active_transfer().await.unwrap(), None);
+        assert!(timeline(&h).await.is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_dry_run_registers_no_session_key() {
+        let mut h = Harness::prepare_with(Setup { registered: false, ..automated() }).await;
+        h.config.dry_run = true;
+        h.start_bot();
+        status_when(&h, "the bot is running", |status| status.funds.is_some()).await;
+        steadily("nothing is submitted", A_WHILE, || h.sim.received().is_empty()).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn nothing_is_withdrawn_while_the_relayer_refuses_withdrawals() {
+        let mut h = Harness::prepare_with(lopsided()).await;
+        h.sim.pause("withdrawToCore");
+        // Opens being refused as well does not matter to a transfer.
+        h.sim.pause("openPosition");
+        h.start_bot();
+        let status = status_when(&h, "the status says why it waits", |status| status.funds.is_some()).await;
+        assert_eq!(status.summary, "flat; the relayer has withdrawToCore paused");
+        steadily("no withdrawal is sent into the pause", A_WHILE, || withdrawals(&h).is_empty()).await;
+        assert_eq!(h.store.active_transfer().await.unwrap(), None);
+
+        h.sim.unpause("withdrawToCore");
+        eventually_stored("the accounts are levelled although opens are still refused", SOON, || async {
+            h.sim.balance(h.short) == usd(LEVELLED) && h.store.active_transfer().await.unwrap().is_none()
+        })
+        .await;
+        assert_eq!(h.opens(), 0);
+        h.sim.unpause("openPosition");
+        h.hedged().await;
+        assert_levelled_and_trading(&h);
+    }
+
+    // --- wallet keys and session keys ----------------------------------------------
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_wallet_key_registers_the_session_key_by_itself() {
+        let mut h = Harness::prepare_with(Setup { registered: false, ..automated() }).await;
+        h.start_bot();
+        h.hedged().await;
+        for account in [&h.keys.long, &h.keys.short] {
+            assert_eq!(h.sim.count(account.owner, "registerSessionKey"), 1);
+            assert!(h.sim.session_key_expiry(account.owner, account.session.address()).is_some());
+        }
+        steadily("it is registered once", A_WHILE, || {
+            h.sim.count(h.long, "registerSessionKey") + h.sim.count(h.short, "registerSessionKey") == 2
+        })
+        .await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_session_key_about_to_expire_is_renewed_and_a_refused_renewal_is_not_hammered() {
+        let mut h = Harness::prepare_with(automated()).await;
+        let (key, now) = (h.keys.long.session.address(), papertrade::store::now_ms() as u64 / 1000);
+        // Two days left: enough to trade on, too little to keep.
+        h.sim.set_session_key_expiry(h.long, key, now + 2 * 86_400);
+        h.sim.script(h.long, "registerSessionKey", &[Behavior::Reject("rate_limited", "")]);
+        h.start_bot();
+        h.hedged().await;
+        eventually("the key is registered for another thirty days", SOON, || {
+            h.sim.session_key_expiry(h.long, key).is_some_and(|expiry| expiry > now + 29 * 86_400)
+        })
+        .await;
+        let attempts: Vec<Received> =
+            h.sim.received().into_iter().filter(|r| r.action == "registerSessionKey").collect();
+        assert_eq!(attempts.iter().map(|r| r.wallet).collect::<Vec<_>>(), [h.long, h.long]);
+        let waited = attempts[1].at - attempts[0].at;
+        assert!(waited + SLACK >= h.timing.funding.register_retry, "{waited:?}");
+        // The round was not held up by any of it.
+        assert_eq!(h.opens(), 2);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_transfer_whose_senders_key_is_gone_at_the_next_start_stops_as_stuck() {
+        let mut h = Harness::prepare_with(lopsided()).await;
+        h.sim.script(h.long, "withdrawToCore", &[Behavior::Hold]);
+        h.start_bot();
+        eventually("the withdrawal is queued", SOON, || h.sim.queued(h.long) == 1).await;
+        h.stop_bot().await.unwrap();
+        // The next run is started with the wallet automation off.
+        let keys = Arc::get_mut(&mut h.keys).unwrap();
+        (keys.long.wallet, keys.short.wallet) = (WalletKey::Disabled, WalletKey::Disabled);
+
+        // The withdrawal arrives, and the bot cannot sign the next step.
+        h.start_bot();
+        h.sim.release();
+        in_stage(&h, Stage::Stuck).await;
+        let stuck = h.store.active_transfer().await.unwrap().unwrap();
+        assert_eq!(
+            stuck.note.as_deref(),
+            Some("stuck in send: the long wallet's own key is not available to this run")
+        );
+        assert_eq!(h.sim.core_usdc(h.long), usd(MOVED));
+        assert!(h.sim.sends().is_empty());
+        assert_eq!(h.opens(), 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_key_that_is_not_the_wallets_own_is_never_signed_with() {
+        // The keystore refuses such a key. Should one ever be handed over all the
+        // same, the bot keeps trading on the session keys and signs nothing with it.
+        let mut h = Harness::prepare_with(Setup { registered: false, ..lopsided() }).await;
+        Arc::get_mut(&mut h.keys).unwrap().long.wallet = WalletKey::Loaded(PrivateKeySigner::random());
+        h.start_bot();
+        let status = status_when(&h, "the status says what to move", |status| status.funds.is_some()).await;
+        assert!(!status.funds.unwrap().can_rebalance);
+        // The short wallet's key is its own: its session key gets registered.
+        eventually("the short account's session key is registered", SOON, || {
+            h.sim.session_key_expiry(h.short, h.keys.short.session.address()).is_some()
+        })
+        .await;
+        steadily("nothing is signed for the long wallet, and nothing is moved", A_WHILE, || {
+            h.sim.received().iter().all(|r| r.wallet == h.short) && h.sim.sends().is_empty()
+        })
+        .await;
+        assert_eq!(h.sim.count(h.short, "registerSessionKey"), 1);
+    }
+}

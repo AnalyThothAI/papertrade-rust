@@ -641,6 +641,8 @@ mod tests {
                     queue_total: Some(U256::ZERO),
                     mid: Some(mid),
                     may_open: true,
+                    transfer: None,
+                    can_rebalance: false,
                 };
                 decide(&view, &params, &market)
             };

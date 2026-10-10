@@ -51,6 +51,9 @@ enum Command {
     /// Keep this machine's keys encrypted under one password.
     #[command(subcommand)]
     Keys(KeysCommand),
+    /// Deal with the transfer of funds between the two accounts.
+    #[command(subcommand)]
+    Rebalance(RebalanceCommand),
 }
 
 #[derive(Debug, Subcommand)]
@@ -80,6 +83,12 @@ enum SessionKeyCommand {
         #[arg(long)]
         signature: Signature,
     },
+}
+
+#[derive(Debug, Subcommand)]
+enum RebalanceCommand {
+    /// End a transfer that is stuck, once you have dealt with the funds yourself.
+    Abandon,
 }
 
 #[tokio::main]
@@ -118,6 +127,7 @@ async fn main() -> Result<()> {
             require_terminal()?;
             init_keys(&config, &mut Terminal)
         }
+        Command::Rebalance(RebalanceCommand::Abandon) => abandon_transfer(&config).await,
     }
 }
 
@@ -265,6 +275,28 @@ async fn submit_session_key(
     println!("Relayer accepted the registration: {} ({}).", receipt.state, receipt.intent_id);
     println!("This was a real request; PT_DRY_RUN applies to `run` only.");
     println!("`papertrade status` shows the key as valid once it has executed.");
+    Ok(())
+}
+
+/// Ends a stuck transfer. This moves nothing: the funds stay where the transfer
+/// left them, and the bot stops waiting for it.
+async fn abandon_transfer(config: &Config) -> Result<()> {
+    use papertrade::store::Abandoned;
+    match Store::open(&config.database()).await?.abandon_stuck_transfer().await? {
+        Abandoned::Ended(transfer) => {
+            println!(
+                "Transfer #{} abandoned: {} USDC from the {} account to the {} account.",
+                transfer.id, transfer.amount_usdc, transfer.from, transfer.to
+            );
+            println!("It was {}.", transfer.note.as_deref().unwrap_or("stuck"));
+        }
+        Abandoned::NotStuck(transfer) => bail!(
+            "transfer #{} is still under way (stage: {}); only a stuck transfer can be abandoned",
+            transfer.id,
+            transfer.stage
+        ),
+        Abandoned::Nothing => println!("There is no unfinished transfer."),
+    }
     Ok(())
 }
 

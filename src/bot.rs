@@ -1,5 +1,9 @@
 //! The loop: gather what is known, ask `decide`, carry out the answer, record it.
 
+mod funding;
+
+pub use funding::FundingTiming;
+
 use std::future::Future;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -56,6 +60,8 @@ pub struct Timing {
     /// A quote older than this is treated as unknown.
     pub quote_max_age: Duration,
     pub stream: StreamTiming,
+    /// Transfers between the two accounts and session key registration.
+    pub funding: FundingTiming,
 }
 
 impl Default for Timing {
@@ -69,6 +75,7 @@ impl Default for Timing {
             grace: Duration::from_secs(10),
             quote_max_age: Duration::from_secs(30),
             stream: StreamTiming::default(),
+            funding: FundingTiming::default(),
         }
     }
 }
@@ -172,6 +179,8 @@ struct Bot {
     /// Wakes the ledger task when a position opens or settles.
     ledger_wake: Arc<Notify>,
     open_position_count: usize,
+    /// Session key registration and the transfer between the two accounts.
+    funding: funding::Funding,
 }
 
 /// A bot that has started: its feeds are running and its state is loaded.
@@ -189,7 +198,8 @@ pub async fn start(config: &Config, store: Store, keys: Arc<UnlockedKeys>) -> Re
         tasks.spawn(follow_price(coin, price_decimals, sender));
         quote
     };
-    start_with(config, store, Client::new()?, Chain::new()?, price, Timing::default(), keys).await
+    let hypercore = Arc::new(crate::wallet::hypercore::Mainnet::new()?);
+    start_with(config, store, Client::new()?, Chain::new()?, price, Timing::default(), keys, hypercore).await
 }
 
 /// Keeps a bot running until `stop` resolves.
@@ -230,7 +240,7 @@ where
 }
 
 /// Starts the bot and runs it until `shutdown` resolves or it cannot go on.
-// One argument per outside party, plus when to stop: a struct would only rename them.
+// One argument per outside party and per thing the caller decides.
 #[allow(clippy::too_many_arguments)]
 pub async fn run_with(
     config: &Config,
@@ -240,9 +250,10 @@ pub async fn run_with(
     price: impl FnOnce(u32, &mut JoinSet<()>) -> watch::Receiver<Option<Quote>>,
     timing: Timing,
     keys: Arc<UnlockedKeys>,
+    hypercore: Arc<dyn crate::wallet::hypercore::HyperCore>,
     shutdown: impl Future<Output = ()>,
 ) -> Result<()> {
-    start_with(config, store, client, chain, price, timing, keys).await?.until(shutdown).await
+    start_with(config, store, client, chain, price, timing, keys, hypercore).await?.until(shutdown).await
 }
 
 /// Starts the bot against any relayer and price source.
@@ -250,15 +261,20 @@ pub async fn run_with(
 /// `price` is given the market's price decimals and returns the quote to follow;
 /// it may spawn its feed onto the task set so the feed is supervised with the rest.
 /// `keys` are the two accounts' keys as unlocked when the process started.
+/// `hypercore` is where a transfer between the two accounts passes through.
+// One argument per outside party and per thing the caller decides.
+#[allow(clippy::too_many_arguments)]
 pub async fn start_with(
     config: &Config,
     store: Store,
     client: Client,
-    // Read-only contract calls: the estimate reads the fee rates through it.
+    // Read-only contract calls: the estimate reads the fee rates through it, and
+    // a transfer the receiver's deposit address.
     chain: Chain,
     price: impl FnOnce(u32, &mut JoinSet<()>) -> watch::Receiver<Option<Quote>>,
     timing: Timing,
     keys: Arc<UnlockedKeys>,
+    hypercore: Arc<dyn crate::wallet::hypercore::HyperCore>,
 ) -> Result<Running> {
     for side in Side::BOTH {
         let (wallet, unlocked) = (config.wallet(side)?, keys.get(side).owner);
@@ -267,6 +283,8 @@ pub async fn start_with(
             "the {side} account is {wallet}, but its keys were unlocked for {unlocked}"
         );
     }
+    // Taken here, before anything else can claim the reader.
+    let deposit_chain = chain.clone();
     let trading_state = client.trading_state().await.context("fetching the trading state")?;
     let instrument = trading_state
         .instrument(&config.coin)
@@ -327,6 +345,8 @@ pub async fn start_with(
     let (status, latest_status) = watch::channel(None);
     tasks.spawn(follow_status(store.clone(), latest_status));
 
+    let funding =
+        funding::Funding::start(&mut tasks, &store, &keys, deposit_chain, hypercore, &timing.funding).await?;
     let ttl_ms = i64::try_from(config.intent_ttl_seconds * 1000)?;
     let bot = Bot {
         dry_run: config.dry_run,
@@ -357,6 +377,7 @@ pub async fn start_with(
         store_warned_at: None,
         ledger_wake,
         open_position_count: 0,
+        funding,
     };
     info!(
         coin = %bot.coin,
@@ -418,6 +439,7 @@ impl Bot {
         if let Some(mode) = self.best_effort("reading the operator's mode", mode) {
             self.mode = mode;
         }
+        self.notice_abandoned_transfer().await;
         let trading = fresh(&self.trading, self.timing.state_poll);
         let queue_total = fresh(&self.queue_total, self.timing.state_poll);
         let max_age = self.timing.quote_max_age;
@@ -429,7 +451,8 @@ impl Bot {
             awaiting: self
                 .inflight
                 .iter()
-                .filter(|entry| entry.side == side)
+                // Only opens and closes: a withdrawal or a registration must not hold up a close.
+                .filter(|entry| entry.side == side && entry.kind.is_trade())
                 .map(|entry| awaiting(entry, accounts.get(side).as_ref(), now, grace_ms))
                 .max()
                 .unwrap_or(Awaiting::Nothing),
@@ -443,6 +466,8 @@ impl Bot {
             queue_total,
             mid,
             may_open: now >= self.open_allowed_at_ms,
+            transfer: self.transfer_state(),
+            can_rebalance: self.can_rebalance(),
         };
         let decision = decide(&view, &self.params, &self.market);
 
@@ -456,7 +481,9 @@ impl Bot {
             self.reported.clone_from(&summary);
         }
         if changed || self.status_at.elapsed() >= STATUS_INTERVAL {
-            let snapshot = self.snapshot(&decision, summary, &accounts, trading.as_ref(), queue_total, mid);
+            let mut snapshot =
+                self.snapshot(&decision, summary, &accounts, trading.as_ref(), queue_total, mid);
+            self.describe_funding(&mut snapshot, &accounts);
             self.status.send_replace(Some(snapshot));
             self.status_at = Instant::now();
         }
@@ -484,7 +511,15 @@ impl Bot {
                     self.close(closes).await;
                 }
             }
+            Decision::Rebalance { from, to, amount_usdc } => {
+                self.start_transfer(from, to, amount_usdc).await;
+            }
         }
+        // After the decision, so that a close never waits behind a transfer's
+        // requests; and whatever the legs hold, because a transfer that has
+        // begun has to be seen through.
+        self.advance_transfer(&accounts).await;
+        self.register_session_keys(&accounts, trading.as_ref()).await;
     }
 
     /// The database makes the bot durable and visible, but it must never stand
@@ -659,6 +694,9 @@ impl Bot {
                     CloseReason::Flatten => format!("flatten: close {order}"),
                 }
             }
+            Decision::Rebalance { from, to, amount_usdc } => {
+                format!("rebalance: move {amount_usdc} USDC from the {from} account to the {to} account")
+            }
         }
     }
 
@@ -742,6 +780,7 @@ impl Bot {
                 Decision::Wait(_) => "wait",
                 Decision::Open { .. } => "open",
                 Decision::Close { .. } => "close",
+                Decision::Rebalance { .. } => "rebalance",
             }
             .to_owned(),
             summary,
