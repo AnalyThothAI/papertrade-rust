@@ -907,6 +907,14 @@ impl Harness {
         bot.await.unwrap()
     }
 
+    /// Kills the bot where it stands, as a crash or `kill -9` would: nothing it
+    /// was doing gets to finish.
+    pub async fn kill_bot(&mut self) {
+        let (_stop, bot) = self.bot.take().expect("the bot is running");
+        bot.abort();
+        let _ = bot.await;
+    }
+
     /// Both legs are open and visible on the exchange.
     pub async fn hedged(&self) {
         let (sim, long, short) = (&self.sim, self.long, self.short);
