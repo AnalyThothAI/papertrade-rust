@@ -14,6 +14,7 @@ use std::fmt;
 use alloy::primitives::{Address, U256};
 use serde::{Deserialize, Serialize};
 
+use super::inflight::Awaiting;
 use crate::protocol::account::AccountState;
 use crate::protocol::wire::{Position, TradingState};
 
@@ -72,6 +73,45 @@ impl Mode {
     }
 }
 
+/// Where the pair of legs stands, read from the positions alone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Phase {
+    /// At least one account's state is unavailable.
+    Unknown,
+    Flat,
+    Hedged,
+    /// Only this side holds a position.
+    OneLegged(Side),
+    /// Positions the strategy does not manage.
+    Unexpected,
+}
+
+impl Phase {
+    pub fn of(long: Option<&AccountState>, short: Option<&AccountState>, market: &Market) -> Self {
+        let (Some(long), Some(short)) = (long, short) else { return Phase::Unknown };
+        match (sole_leg(long, market, Side::Long), sole_leg(short, market, Side::Short)) {
+            (Ok(None), Ok(None)) => Phase::Flat,
+            (Ok(Some(_)), Ok(Some(_))) => Phase::Hedged,
+            (Ok(Some(_)), Ok(None)) => Phase::OneLegged(Side::Long),
+            (Ok(None), Ok(Some(_))) => Phase::OneLegged(Side::Short),
+            _ => Phase::Unexpected,
+        }
+    }
+}
+
+impl fmt::Display for Phase {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Phase::Unknown => f.write_str("unknown"),
+            Phase::Flat => f.write_str("flat"),
+            Phase::Hedged => f.write_str("hedged"),
+            Phase::OneLegged(side) => write!(f, "one leg ({side})"),
+            Phase::Unexpected => f.write_str("unexpected positions"),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StrategyParams {
     /// Target position value per leg, 18-decimal USD.
@@ -96,8 +136,8 @@ pub struct LegView<'a> {
     pub account: Option<&'a AccountState>,
     /// Address of the session key this bot signs with for the account.
     pub session_key: Address,
-    /// An intent we submitted for this account has not been resolved yet.
-    pub awaiting_intent: bool,
+    /// How much the intents we sent for this account still hold the strategy back.
+    pub awaiting: Awaiting,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -160,6 +200,7 @@ pub enum Decision {
 pub enum Wait {
     AccountStateUnavailable,
     IntentPending,
+    IntentUnresolved,
     UnexpectedPositions,
     ClosesPaused,
     NoSessionKey(Side),
@@ -187,6 +228,7 @@ impl fmt::Display for Wait {
         match self {
             Wait::AccountStateUnavailable => f.write_str("account state unavailable"),
             Wait::IntentPending => f.write_str("an intent is still pending"),
+            Wait::IntentUnresolved => f.write_str("flat; an intent that went unanswered could still execute"),
             Wait::UnexpectedPositions => f.write_str(
                 "accounts hold positions this bot did not expect; resolve them manually or flatten",
             ),
@@ -227,8 +269,8 @@ pub fn decide(view: &View<'_>, params: &StrategyParams, market: &Market) -> Deci
     let (Some(long), Some(short)) = (view.long.account, view.short.account) else {
         return Decision::Wait(Wait::AccountStateUnavailable);
     };
-    if view.long.awaiting_intent
-        || view.short.awaiting_intent
+    if view.long.awaiting == Awaiting::Expected
+        || view.short.awaiting == Awaiting::Expected
         || has_queued_trade(long)
         || has_queued_trade(short)
     {
@@ -314,6 +356,10 @@ fn decide_open(
     short: &AccountState,
 ) -> Decision {
     let wait = |reason: Wait| Decision::Wait(reason);
+    // An intent that may still execute must not be answered with a second open.
+    if view.long.awaiting != Awaiting::Nothing || view.short.awaiting != Awaiting::Nothing {
+        return wait(Wait::IntentUnresolved);
+    }
     if view.mode == Mode::Pause {
         return wait(Wait::OperatorPaused);
     }
@@ -409,7 +455,7 @@ mod tests {
     struct Scenario {
         long: Option<AccountState>,
         short: Option<AccountState>,
-        awaiting: Option<Side>,
+        awaiting: Option<(Side, Awaiting)>,
         trading: Option<TradingState>,
         queue_total: Option<U256>,
         mid: Option<u64>,
@@ -454,7 +500,10 @@ mod tests {
             LegView {
                 account: account.as_ref(),
                 session_key: KEY,
-                awaiting_intent: self.awaiting == Some(side),
+                awaiting: match self.awaiting {
+                    Some((awaited, how)) if awaited == side => how,
+                    _ => Awaiting::Nothing,
+                },
             }
         }
 
@@ -616,7 +665,7 @@ mod tests {
 
     #[test]
     fn waits_while_an_intent_we_sent_is_unresolved() {
-        let scenario = Scenario { awaiting: Some(Side::Short), ..Default::default() };
+        let scenario = Scenario { awaiting: Some((Side::Short, Awaiting::Expected)), ..Default::default() };
         assert_eq!(scenario.wait(), Wait::IntentPending);
     }
 
@@ -806,8 +855,11 @@ mod tests {
 
     #[test]
     fn flatten_still_waits_for_pending_intents_and_paused_closes() {
-        let scenario =
-            Scenario { mode: Mode::Flatten, awaiting: Some(Side::Long), ..Scenario::hedged(ENTRY) };
+        let scenario = Scenario {
+            mode: Mode::Flatten,
+            awaiting: Some((Side::Long, Awaiting::Expected)),
+            ..Scenario::hedged(ENTRY)
+        };
         assert_eq!(scenario.wait(), Wait::IntentPending);
         let scenario = Scenario {
             mode: Mode::Flatten,
@@ -815,6 +867,63 @@ mod tests {
             ..Scenario::hedged(ENTRY)
         };
         assert_eq!(scenario.wait(), Wait::ClosesPaused);
+    }
+
+    // --- intents that went unanswered ---------------------------------------
+
+    #[test]
+    fn a_doubtful_intent_blocks_a_new_open_but_nothing_else() {
+        let doubtful = Some((Side::Short, Awaiting::Doubtful));
+        // Flat: the unanswered open could still land, so no second open.
+        let scenario = Scenario { awaiting: doubtful, ..Default::default() };
+        assert_eq!(scenario.wait(), Wait::IntentUnresolved);
+
+        // One leg open while the other leg's open went unanswered: do not sit unhedged for it.
+        let scenario = Scenario {
+            awaiting: doubtful,
+            long: Some(holding(vec![position(7, true)])),
+            ..Default::default()
+        };
+        assert_eq!(
+            scenario.decide(),
+            Decision::Close { reason: CloseReason::Unhedged, closes: vec![close_of(Side::Long, 7)] }
+        );
+
+        // Hedged at the target while an earlier close went unanswered: close again.
+        let scenario = Scenario { awaiting: doubtful, ..Scenario::hedged(ENTRY + 8_000) };
+        assert!(matches!(scenario.decide(), Decision::Close { reason: CloseReason::Target, .. }));
+
+        // Flatten is not held up either.
+        let scenario = Scenario { awaiting: doubtful, mode: Mode::Flatten, ..Scenario::hedged(ENTRY) };
+        assert!(matches!(scenario.decide(), Decision::Close { reason: CloseReason::Flatten, .. }));
+    }
+
+    #[test]
+    fn an_expected_intent_holds_everything_even_with_one_leg_open() {
+        let scenario = Scenario {
+            awaiting: Some((Side::Short, Awaiting::Expected)),
+            long: Some(holding(vec![position(7, true)])),
+            ..Default::default()
+        };
+        assert_eq!(scenario.wait(), Wait::IntentPending);
+    }
+
+    // --- phase ----------------------------------------------------------------
+
+    #[test]
+    fn the_phase_names_where_the_two_legs_stand() {
+        let market = Market { id: 0, symbol: "BTC".into() };
+        let (flat, long, short) =
+            (account(), holding(vec![position(7, true)]), holding(vec![position(8, false)]));
+        let phase =
+            |long: Option<&AccountState>, short: Option<&AccountState>| Phase::of(long, short, &market);
+        assert_eq!(phase(None, Some(&flat)), Phase::Unknown);
+        assert_eq!(phase(Some(&flat), Some(&flat)), Phase::Flat);
+        assert_eq!(phase(Some(&long), Some(&short)), Phase::Hedged);
+        assert_eq!(phase(Some(&long), Some(&flat)), Phase::OneLegged(Side::Long));
+        assert_eq!(phase(Some(&flat), Some(&short)), Phase::OneLegged(Side::Short));
+        assert_eq!(phase(Some(&short), Some(&flat)), Phase::Unexpected);
+        assert_eq!(Phase::OneLegged(Side::Short).to_string(), "one leg (short)");
     }
 
     #[test]

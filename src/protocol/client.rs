@@ -41,8 +41,14 @@ pub struct Client {
 }
 
 impl Client {
+    /// The production deployment.
     pub fn new() -> reqwest::Result<Self> {
-        Ok(Self { http: reqwest::Client::builder().timeout(TIMEOUT).build()?, origin: ORIGIN.to_owned() })
+        Self::with_origin(ORIGIN)
+    }
+
+    /// Any server that speaks the same protocol, such as the test simulator.
+    pub fn with_origin(origin: &str) -> reqwest::Result<Self> {
+        Ok(Self { http: reqwest::Client::builder().timeout(TIMEOUT).build()?, origin: origin.to_owned() })
     }
 
     pub fn account_stream_url(&self, wallet: Address) -> String {

@@ -7,13 +7,13 @@ use alloy::primitives::{Address, B256, U256};
 use anyhow::{Context, Result};
 use serde_json::Value;
 use sqlx::SqlitePool;
-use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
+use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous};
 
 use crate::protocol::intents::SignedIntent;
 use crate::protocol::wire::Trade;
 use crate::status::Snapshot;
 use crate::strategy::decide::{Mode, Side};
-use crate::strategy::inflight::Inflight;
+use crate::strategy::inflight::{Inflight, Kind, is_failure};
 
 pub fn now_ms() -> i64 {
     let elapsed = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default();
@@ -35,6 +35,18 @@ pub struct IntentRow {
     pub status: String,
     pub outcome: Option<String>,
     pub detail: Option<String>,
+}
+
+#[derive(sqlx::FromRow)]
+struct UnresolvedRow {
+    intent_id: String,
+    side: String,
+    action: String,
+    created_at_ms: i64,
+    deadline: i64,
+    queue_revision: Option<String>,
+    seen_queued: bool,
+    outcome: Option<String>,
 }
 
 /// Ledger totals for display. Floating point: not for accounting.
@@ -67,7 +79,11 @@ impl Store {
             .filename(path)
             .create_if_missing(true)
             // WAL lets viewers read while the bot writes.
-            .journal_mode(SqliteJournalMode::Wal);
+            .journal_mode(SqliteJournalMode::Wal)
+            // No fsync per commit: on a slow disk one could stall for a second or more.
+            // A process crash still loses nothing. Only a power cut can drop the last
+            // commits, and an intent journaled that late has expired before the host is back.
+            .synchronous(SqliteSynchronous::Normal);
         Self::connect(SqlitePoolOptions::new().connect_with(options).await?).await
     }
 
@@ -80,6 +96,11 @@ impl Store {
     async fn connect(pool: SqlitePool) -> Result<Self> {
         sqlx::migrate!().run(&pool).await.context("migrating the database")?;
         Ok(Self { pool })
+    }
+
+    /// Closes the database. Every later call fails.
+    pub async fn close(&self) {
+        self.pool.close().await;
     }
 
     // --- operator intent ------------------------------------------------------
@@ -113,10 +134,13 @@ impl Store {
         Ok(())
     }
 
+    /// The latest snapshot, or `None` if there is none this version can read.
+    /// A snapshot only lives until the running bot writes the next one, so one
+    /// left behind by another version is simply not a status.
     pub async fn read_status(&self) -> Result<Option<Snapshot>> {
         let row: Option<String> =
             sqlx::query_scalar("SELECT snapshot FROM status WHERE id = 1").fetch_optional(&self.pool).await?;
-        row.map(|json| serde_json::from_str(&json).context("reading the status snapshot")).transpose()
+        Ok(row.and_then(|json| serde_json::from_str(&json).ok()))
     }
 
     // --- timeline ---------------------------------------------------------------
@@ -208,20 +232,23 @@ impl Store {
     /// Intents that could still change an account. An intent that was journaled
     /// but never confirmed as sent counts: it may have left before a crash.
     pub async fn unresolved_intents(&self) -> Result<Vec<Inflight>> {
-        let rows: Vec<(String, String, i64, Option<String>, bool)> = sqlx::query_as(
-            "SELECT intent_id, side, deadline, queue_revision, seen_queued FROM intents
-             WHERE status IN ('signed', 'accepted', 'unknown') ORDER BY created_at_ms",
+        let rows: Vec<UnresolvedRow> = sqlx::query_as(
+            "SELECT intent_id, side, action, created_at_ms, deadline, queue_revision, seen_queued, outcome
+             FROM intents WHERE status IN ('signed', 'accepted', 'unknown') ORDER BY created_at_ms",
         )
         .fetch_all(&self.pool)
         .await?;
         rows.into_iter()
-            .map(|(intent_id, side, deadline, queue_revision, seen_queued)| {
+            .map(|row| {
                 Ok(Inflight {
-                    side: serde_json::from_value(Value::String(side))?,
-                    intent_id: intent_id.parse()?,
-                    deadline: u64::try_from(deadline)?,
-                    queue_revision: queue_revision.map(|text| text.parse()).transpose()?,
-                    seen_queued,
+                    side: serde_json::from_value(Value::String(row.side))?,
+                    kind: if row.action == "openPosition" { Kind::Open } else { Kind::Close },
+                    intent_id: row.intent_id.parse()?,
+                    deadline: u64::try_from(row.deadline)?,
+                    sent_at_ms: row.created_at_ms,
+                    queue_revision: row.queue_revision.map(|text| text.parse()).transpose()?,
+                    seen_queued: row.seen_queued,
+                    failed: row.outcome.as_deref().is_some_and(is_failure),
                 })
             })
             .collect()
@@ -364,6 +391,7 @@ mod tests {
             mode: Mode::Run,
             coin: "BTC".into(),
             close_bps: 100,
+            phase: crate::strategy::decide::Phase::Flat,
             decision: "wait".into(),
             summary: "flat; settling before the next open".into(),
             mid: Some("82754.5".into()),
@@ -377,6 +405,16 @@ mod tests {
         snapshot.summary = "open both legs".into();
         store.write_status(&snapshot).await.unwrap();
         assert_eq!(store.read_status().await.unwrap(), Some(snapshot));
+    }
+
+    #[tokio::test]
+    async fn a_snapshot_left_by_another_version_is_not_a_status() {
+        let store = Store::in_memory().await.unwrap();
+        sqlx::query("INSERT INTO status (id, updated_at_ms, snapshot) VALUES (1, 1, '{\"at_ms\": 1}')")
+            .execute(&store.pool)
+            .await
+            .unwrap();
+        assert_eq!(store.read_status().await.unwrap(), None);
     }
 
     #[tokio::test]
@@ -414,17 +452,23 @@ mod tests {
             [
                 Inflight {
                     side: Side::Long,
+                    kind: Kind::Open,
                     intent_id: accepted.intent_id,
                     deadline: 1_800_000_120,
+                    sent_at_ms: unresolved[0].sent_at_ms,
                     queue_revision: Some(U256::from(7)),
                     seen_queued: true,
+                    failed: false,
                 },
                 Inflight {
                     side: Side::Short,
+                    kind: Kind::Open,
                     intent_id: lost.intent_id,
                     deadline: 1_800_000_120,
+                    sent_at_ms: unresolved[1].sent_at_ms,
                     queue_revision: None,
                     seen_queued: false,
+                    failed: false,
                 },
             ]
         );

@@ -1,5 +1,6 @@
+use std::fmt::Write as _;
 use std::fs;
-use std::io::IsTerminal;
+use std::io::{IsTerminal, Write as _};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use alloy::primitives::{Address, Signature};
@@ -77,6 +78,7 @@ async fn main() -> Result<()> {
                 .with_ansi(std::io::stderr().is_terminal())
                 .init();
             let store = Store::open(&config.database()).await?;
+            let _only_one = lock_data_dir(&config)?;
             bot::run(&config, store, shutdown_signal()).await
         }
         Command::Tui => tui::run(&Store::open(&config.database()).await?).await,
@@ -91,6 +93,17 @@ async fn main() -> Result<()> {
             submit_session_key(&config, side, signature).await
         }
     }
+}
+
+/// Two bots on the same accounts would each open a round. The lock is held for the
+/// life of the process and released by the operating system however it ends.
+fn lock_data_dir(config: &Config) -> Result<fs::File> {
+    let path = config.data_dir.join("papertrade.lock");
+    let lock = fs::File::create(&path).with_context(|| format!("creating {}", path.display()))?;
+    if lock.try_lock().is_err() {
+        bail!("another `papertrade run` is already using {}", config.data_dir.display());
+    }
+    Ok(lock)
 }
 
 /// Resolves on Ctrl-C or SIGTERM.
@@ -109,18 +122,27 @@ async fn set_mode(config: &Config, mode: Mode) -> Result<()> {
     Ok(())
 }
 
+/// Prints the bot's latest status. A closed pipe (`status | head`) is not an error.
 async fn status(store: &Store) -> Result<()> {
+    let report = status_report(store).await?;
+    let _ = std::io::stdout().write_all(report.as_bytes());
+    Ok(())
+}
+
+async fn status_report(store: &Store) -> Result<String> {
+    let mut out = String::new();
     let Some(status) = store.read_status().await? else {
-        println!("No status yet. Start the bot with `papertrade run`.");
-        return Ok(());
+        return Ok("No status yet. Start the bot with `papertrade run`.\n".to_owned());
     };
     let age_ms = now_ms() - status.at_ms;
-    println!(
+    let _ = writeln!(
+        out,
         "mode              {}{}",
         store.mode().await?.as_str(),
         if status.dry_run { " (dry run)" } else { "" }
     );
-    println!(
+    let _ = writeln!(
+        out,
         "bot               {}",
         if age_ms > 5_000 {
             format!("NOT RUNNING, last seen {} ago", tui::age(age_ms))
@@ -128,15 +150,18 @@ async fn status(store: &Store) -> Result<()> {
             "live".into()
         }
     );
-    println!("decision          {}: {}", status.decision, status.summary);
-    println!("{} mid           {}", status.coin, status.mid.as_deref().unwrap_or("no fresh quote"));
+    let _ = writeln!(out, "legs              {}", status.phase);
+    let _ = writeln!(out, "decision          {}: {}", status.decision, status.summary);
+    let _ =
+        writeln!(out, "{} mid           {}", status.coin, status.mid.as_deref().unwrap_or("no fresh quote"));
     if let Some(bps) = status.move_bps {
-        println!("move              {bps:+.1} bps of ±{} target", status.close_bps);
+        let _ = writeln!(out, "move              {bps:+.1} bps of ±{} target", status.close_bps);
     }
     match &status.trading {
         Some(trading) => {
-            println!("trading paused    {}", trading.trading_paused);
-            println!(
+            let _ = writeln!(out, "trading paused    {}", trading.trading_paused);
+            let _ = writeln!(
+                out,
                 "relayer refuses   {}",
                 if trading.paused_actions.is_empty() {
                     "nothing".into()
@@ -145,20 +170,26 @@ async fn status(store: &Store) -> Result<()> {
                 }
             );
         }
-        None => println!("trading state     unavailable"),
+        None => {
+            let _ = writeln!(out, "trading state     unavailable");
+        }
     }
-    println!(
+    let _ = writeln!(
+        out,
         "payout queue      {}",
         status.queue_total_usd.as_ref().map_or("unknown".into(), |usd| format!("{usd} USD"))
     );
     for leg in &status.legs {
-        println!("\n{} account     {}", leg.side, leg.wallet);
+        let _ = writeln!(out, "\n{} account     {}", leg.side, leg.wallet);
         match &leg.account {
-            None => println!("  state           unavailable"),
+            None => {
+                let _ = writeln!(out, "  state           unavailable");
+            }
             Some(account) => {
-                println!("  available       {} USD", account.available_usd);
-                println!("  queued payout   {} USD", account.queued_usd);
-                println!(
+                let _ = writeln!(out, "  available       {} USD", account.available_usd);
+                let _ = writeln!(out, "  queued payout   {} USD", account.queued_usd);
+                let _ = writeln!(
+                    out,
                     "  session key     {} ({})",
                     leg.session_key,
                     match account.session_key_expiry {
@@ -170,7 +201,8 @@ async fn status(store: &Store) -> Result<()> {
                     }
                 );
                 for position in &account.positions {
-                    println!(
+                    let _ = writeln!(
+                        out,
                         "  position {}: {} {} USD × {} @ {}, bust {}",
                         position.id,
                         if position.is_long { "long" } else { "short" },
@@ -183,22 +215,23 @@ async fn status(store: &Store) -> Result<()> {
             }
         }
         if leg.pending_intents > 0 {
-            println!("  in flight       {} intent(s)", leg.pending_intents);
+            let _ = writeln!(out, "  in flight       {} intent(s)", leg.pending_intents);
         }
     }
     let totals = store.totals().await?;
-    println!(
+    let _ = writeln!(
+        out,
         "\nledger            {} settled, net {:+.2} USD, {:.0} PAPER, cost {}",
         totals.trades,
         totals.net_pnl_usd,
         totals.paper_minted,
         totals.cost_per_paper().map_or("n/a".into(), |cost| format!("{cost:.5} USD/PAPER")),
     );
-    println!("\nrecent events (UTC)");
+    let _ = writeln!(out, "\nrecent events (UTC)");
     for event in store.recent_events(10).await? {
-        println!("  {} {:8} {}", tui::clock(event.at_ms), event.kind, event.summary);
+        let _ = writeln!(out, "  {} {:8} {}", tui::clock(event.at_ms), event.kind, event.summary);
     }
-    Ok(())
+    Ok(out)
 }
 
 fn registration_path(config: &Config, wallet: Address) -> std::path::PathBuf {
